@@ -1,0 +1,322 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Perfectto</title>
+  <style>
+    *, *::before, *::after {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, sans-serif;
+      background: #0f1117;
+      color: #e2e8f0;
+      min-height: 100vh;
+    }
+
+    /* ── Splash screen ── */
+    #splash {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      min-height: 100vh;
+      padding: 2rem;
+    }
+
+    h1 {
+      font-size: 2.5rem;
+      font-weight: 700;
+      margin-bottom: 0.5rem;
+      background: linear-gradient(135deg, #667eea, #764ba2);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+    }
+
+    .subtitle {
+      font-size: 1rem;
+      color: #718096;
+      margin-bottom: 3rem;
+    }
+
+    #drop-zone {
+      width: 100%;
+      max-width: 640px;
+      min-height: 320px;
+      border: 3px dashed #4a5568;
+      border-radius: 1rem;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 1.25rem;
+      cursor: pointer;
+      transition: border-color 0.2s, background 0.2s;
+      padding: 2.5rem;
+      text-align: center;
+    }
+
+    #drop-zone:hover,
+    #drop-zone.drag-over {
+      border-color: #667eea;
+      background: rgba(102, 126, 234, 0.07);
+    }
+
+    #drop-zone svg {
+      width: 64px;
+      height: 64px;
+      opacity: 0.5;
+    }
+
+    #drop-zone.drag-over svg {
+      opacity: 0.9;
+    }
+
+    .drop-label {
+      font-size: 1.25rem;
+      font-weight: 600;
+      color: #a0aec0;
+    }
+
+    .drop-hint {
+      font-size: 0.875rem;
+      color: #718096;
+    }
+
+    #file-input {
+      display: none;
+    }
+
+    .browse-btn {
+      margin-top: 0.5rem;
+      padding: 0.6rem 1.4rem;
+      border-radius: 0.5rem;
+      border: none;
+      background: #667eea;
+      color: #fff;
+      font-size: 0.9rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background 0.2s;
+    }
+
+    .browse-btn:hover {
+      background: #5a67d8;
+    }
+
+    /* ── Viewer ── */
+    #viewer {
+      display: none;
+      flex-direction: column;
+      min-height: 100vh;
+    }
+
+    #viewer.visible {
+      display: flex;
+    }
+
+    #viewer-header {
+      display: flex;
+      align-items: center;
+      gap: 1rem;
+      padding: 1rem 1.5rem;
+      background: #1a202c;
+      border-bottom: 1px solid #2d3748;
+    }
+
+    #viewer-header h2 {
+      font-size: 1.1rem;
+      font-weight: 600;
+      color: #e2e8f0;
+      flex: 1;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    #viewer-header .meta {
+      font-size: 0.8rem;
+      color: #718096;
+      white-space: nowrap;
+    }
+
+    .back-btn {
+      padding: 0.4rem 1rem;
+      border-radius: 0.5rem;
+      border: 1px solid #4a5568;
+      background: transparent;
+      color: #a0aec0;
+      font-size: 0.85rem;
+      cursor: pointer;
+      transition: border-color 0.2s, color 0.2s;
+    }
+
+    .back-btn:hover {
+      border-color: #667eea;
+      color: #667eea;
+    }
+
+    #trace-output {
+      flex: 1;
+      margin: 1.5rem;
+      padding: 1.25rem;
+      background: #1a202c;
+      border-radius: 0.75rem;
+      overflow: auto;
+      font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace;
+      font-size: 0.8rem;
+      line-height: 1.6;
+      color: #a8d8a8;
+      white-space: pre;
+      word-break: break-all;
+    }
+
+    .truncation-notice {
+      display: none;
+      margin: 0 1.5rem 1.5rem;
+      padding: 0.75rem 1rem;
+      background: rgba(237, 137, 54, 0.15);
+      border: 1px solid rgba(237, 137, 54, 0.4);
+      border-radius: 0.5rem;
+      font-size: 0.85rem;
+      color: #ed8936;
+    }
+
+    .truncation-notice.visible {
+      display: block;
+    }
+  </style>
+</head>
+<body>
+
+  <!-- Splash screen -->
+  <div id="splash">
+    <h1>Perfectto</h1>
+    <p class="subtitle">Perfetto perfected.</p>
+
+    <div id="drop-zone" role="button" aria-label="Drop a trace file here or click to browse">
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none"
+           stroke="#667eea" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+        <polyline points="17 8 12 3 7 8"/>
+        <line x1="12" y1="3" x2="12" y2="15"/>
+      </svg>
+      <p class="drop-label">Drop your trace file here</p>
+      <p class="drop-hint">Supports any text-based performance trace format</p>
+      <button class="browse-btn" id="browse-btn">Browse files…</button>
+    </div>
+
+    <input type="file" id="file-input" />
+  </div>
+
+  <!-- Viewer -->
+  <div id="viewer">
+    <div id="viewer-header">
+      <button class="back-btn" id="back-btn">← Back</button>
+      <h2 id="file-name">trace.json</h2>
+      <span class="meta" id="file-meta"></span>
+    </div>
+    <div class="truncation-notice" id="truncation-notice"></div>
+    <pre id="trace-output"></pre>
+  </div>
+
+  <script>
+    const PREVIEW_CHARS = 10000;
+
+    const splash = document.getElementById('splash');
+    const viewer = document.getElementById('viewer');
+    const dropZone = document.getElementById('drop-zone');
+    const fileInput = document.getElementById('file-input');
+    const browseBtn = document.getElementById('browse-btn');
+    const backBtn = document.getElementById('back-btn');
+    const fileNameEl = document.getElementById('file-name');
+    const fileMetaEl = document.getElementById('file-meta');
+    const traceOutput = document.getElementById('trace-output');
+    const truncationNotice = document.getElementById('truncation-notice');
+
+    // ── Drag-and-drop events ──────────────────────────────────────────────────
+
+    dropZone.addEventListener('dragover', (e) => {
+      e.preventDefault();
+      dropZone.classList.add('drag-over');
+    });
+
+    dropZone.addEventListener('dragleave', (e) => {
+      if (!dropZone.contains(e.relatedTarget)) {
+        dropZone.classList.remove('drag-over');
+      }
+    });
+
+    dropZone.addEventListener('drop', (e) => {
+      e.preventDefault();
+      dropZone.classList.remove('drag-over');
+      const file = e.dataTransfer.files[0];
+      if (file) loadFile(file);
+    });
+
+    // Clicking anywhere in the drop zone opens the file picker;
+    // the browse button has its own handler and stops propagation.
+    dropZone.addEventListener('click', (e) => {
+      if (!browseBtn.contains(e.target)) fileInput.click();
+    });
+
+    browseBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      fileInput.click();
+    });
+
+    fileInput.addEventListener('change', () => {
+      const file = fileInput.files[0];
+      if (file) loadFile(file);
+    });
+
+    // ── Back button ───────────────────────────────────────────────────────────
+
+    backBtn.addEventListener('click', () => {
+      viewer.classList.remove('visible');
+      splash.style.display = 'flex';
+      traceOutput.textContent = '';
+      truncationNotice.classList.remove('visible');
+    });
+
+    // ── File loading ──────────────────────────────────────────────────────────
+
+    function formatBytes(bytes) {
+      if (bytes < 1024) return bytes + ' B';
+      if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+      return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+    }
+
+    function loadFile(file) {
+      const reader = new FileReader();
+      reader.onload = (e) => {
+        const text = e.target.result;
+        const preview = text.slice(0, PREVIEW_CHARS);
+        const truncated = text.length > PREVIEW_CHARS;
+
+        fileNameEl.textContent = file.name;
+        fileMetaEl.textContent = formatBytes(file.size);
+        traceOutput.textContent = preview;
+
+        if (truncated) {
+          truncationNotice.textContent =
+            `Showing first ${PREVIEW_CHARS.toLocaleString()} of ${text.length.toLocaleString()} characters.`;
+          truncationNotice.classList.add('visible');
+        } else {
+          truncationNotice.classList.remove('visible');
+        }
+
+        splash.style.display = 'none';
+        viewer.classList.add('visible');
+        fileInput.value = '';
+      };
+      reader.readAsText(file);
+    }
+  </script>
+</body>
+</html>
