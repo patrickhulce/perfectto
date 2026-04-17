@@ -1,5 +1,5 @@
 import { render, screen, fireEvent } from '@testing-library/react'
-import Splash from '../components/Splash.jsx'
+import Splash from '../components/Splash'
 
 describe('Splash', () => {
   it('renders drop prompt and browse button', () => {
@@ -10,7 +10,7 @@ describe('Splash', () => {
 
   it('clicking browse triggers the hidden file input', () => {
     render(<Splash onFileSelected={() => {}} />)
-    const input = screen.getByTestId('file-input')
+    const input = screen.getByTestId('file-input') as HTMLInputElement
     const clickSpy = jest.spyOn(input, 'click')
     fireEvent.click(screen.getByRole('button', { name: /browse files/i }))
     expect(clickSpy).toHaveBeenCalledTimes(1)

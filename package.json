@@ -13,19 +13,19 @@
   "jest": {
     "testEnvironment": "jsdom",
     "setupFilesAfterEnv": [
-      "<rootDir>/jest.setup.js"
+      "<rootDir>/jest.setup.ts"
     ],
     "moduleNameMapper": {
       "\\.css$": "identity-obj-proxy"
     },
     "transform": {
-      "^.+\\.jsx?$": [
+      "^.+\\.(t|j)sx?$": [
         "@swc/jest",
         {
           "jsc": {
             "parser": {
-              "syntax": "ecmascript",
-              "jsx": true
+              "syntax": "typescript",
+              "tsx": true
             },
             "transform": {
               "react": {
@@ -46,11 +46,15 @@
     "@tailwindcss/vite": "^4.2.2",
     "@testing-library/jest-dom": "^6.9.1",
     "@testing-library/react": "^16.3.2",
+    "@types/jest": "^30.0.0",
+    "@types/react": "^19.2.14",
+    "@types/react-dom": "^19.2.3",
     "@vitejs/plugin-react": "^6.0.1",
     "identity-obj-proxy": "^3.0.0",
     "jest": "^30.3.0",
     "jest-environment-jsdom": "^30.3.0",
     "tailwindcss": "^4.2.2",
+    "typescript": "^6.0.3",
     "vite": "^8.0.8"
   }
 }

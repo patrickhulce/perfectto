@@ -1,34 +1,38 @@
-import { useRef, useState } from 'react'
+import { useRef, useState, type DragEvent, type MouseEvent, type ChangeEvent } from 'react'
 
-export default function Splash({ onFileSelected }) {
+interface SplashProps {
+  onFileSelected: (file: File) => void
+}
+
+export default function Splash({ onFileSelected }: SplashProps) {
   const [isDragging, setIsDragging] = useState(false)
-  const inputRef = useRef(null)
+  const inputRef = useRef<HTMLInputElement>(null)
 
-  const handleDragOver = (e) => {
+  const handleDragOver = (e: DragEvent<HTMLDivElement>) => {
     e.preventDefault()
     setIsDragging(true)
   }
 
-  const handleDragLeave = (e) => {
-    if (!e.currentTarget.contains(e.relatedTarget)) {
+  const handleDragLeave = (e: DragEvent<HTMLDivElement>) => {
+    if (!e.currentTarget.contains(e.relatedTarget as Node | null)) {
       setIsDragging(false)
     }
   }
 
-  const handleDrop = (e) => {
+  const handleDrop = (e: DragEvent<HTMLDivElement>) => {
     e.preventDefault()
     setIsDragging(false)
     const file = e.dataTransfer.files[0]
     if (file) onFileSelected(file)
   }
 
-  const handleZoneClick = (e) => {
-    if (e.target.closest('[data-browse-btn]')) return
+  const handleZoneClick = (e: MouseEvent<HTMLDivElement>) => {
+    if ((e.target as HTMLElement).closest('[data-browse-btn]')) return
     inputRef.current?.click()
   }
 
-  const handleInputChange = (e) => {
-    const file = e.target.files[0]
+  const handleInputChange = (e: ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0]
     if (file) onFileSelected(file)
     e.target.value = ''
   }
