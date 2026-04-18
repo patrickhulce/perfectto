@@ -1,8 +1,17 @@
-import type {ParsedTrace, TraceSource} from '../types'
+import type {ParseProgress, ParsedTrace, TraceSource} from '../types'
+
+export interface FinalizeOptions {
+  signal?: AbortSignal
+  onProgress?: (progress: ParseProgress) => void
+  /** Current cumulative bytes read, forwarded to `onProgress` during finalize. */
+  bytesRead?: number
+  /** Current stream index, forwarded to `onProgress` during finalize. */
+  streamIndex?: number
+}
 
 export interface TraceParser {
   write(chunk: Uint8Array): void
-  finalize(source: TraceSource): Promise<ParsedTrace>
+  finalize(source: TraceSource, options?: FinalizeOptions): Promise<ParsedTrace>
 }
 
 export interface TraceParserConstructor {

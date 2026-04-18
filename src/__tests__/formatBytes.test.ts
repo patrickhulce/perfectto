@@ -1,4 +1,4 @@
-import { formatBytes } from '../utils/formatBytes'
+import { formatBytes } from '../core/utils/formatBytes'
 
 describe('formatBytes', () => {
   it('formats bytes under 1 KB', () => {

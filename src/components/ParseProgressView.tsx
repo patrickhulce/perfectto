@@ -1,5 +1,5 @@
 import type { ParseProgress } from '../core'
-import { formatBytes } from '../utils/formatBytes'
+import { formatBytes } from '../core/utils/formatBytes'
 
 interface ParseProgressViewProps {
   name: string

@@ -2,8 +2,9 @@ import { useState } from 'react'
 import ParseProgressView from './components/ParseProgressView'
 import Splash from './components/Splash'
 import TraceViewer from './components/TraceViewer'
-import { parseTrace, type ParseProgress, type ParsedTrace } from './core'
-import { loadFile } from './utils/loadFile'
+import { type ParseProgress, type ParsedTrace } from './core'
+import { loadFile } from './core/utils/loadFile'
+import { parseTraceInWorker } from './orchestration'
 
 interface ParsingState {
   name: string
@@ -32,7 +33,7 @@ export default function App() {
     })
 
     try {
-      const parsed = await parseTrace(
+      const parsed = await parseTraceInWorker(
         loaded.stream,
         { name: loaded.name, size: loaded.size },
         {

@@ -3,6 +3,12 @@ export type RawEvent = Record<string, unknown>
 export interface TimelineContainer {
   marks: Mark[]
   measures: Measure[]
+  /**
+   * Maximum `end` time found anywhere in this container's subtree. Populated by
+   * parsers so the viewer can cheaply prune entire subtrees that fall outside
+   * the visible viewport. Optional for parsers that don't set it.
+   */
+  maxEnd?: number
 }
 
 export interface Mark {
@@ -73,7 +79,7 @@ export type TraceInput =
 export interface ParseProgress {
   streamIndex: number
   bytesRead: number
-  phase: 'parsing' | 'done'
+  phase: 'parsing' | 'finalizing' | 'done'
 }
 
 export interface ParseOptions {

@@ -1,4 +1,4 @@
-import { formatBytes } from '../utils/formatBytes'
+import { formatBytes } from '../core/utils/formatBytes'
 import type { TraceSource } from '../core'
 
 interface MetadataProps {

@@ -1,4 +1,5 @@
 import type {ParsedTrace, ParseOptions, ParseProgress, TraceInput, TraceSource} from '../types'
+import {yieldToEventLoop} from '../utils/yieldToEventLoop'
 import {ChromeParser} from './chrome/chrome-parser'
 import type {TraceParser, TraceParserConstructor} from './types'
 
@@ -70,6 +71,9 @@ export async function parseTrace(
           }
         }
         emit('parsing', false)
+        // Yield so our host (usually a Worker) can drain its message queue:
+        // outgoing progress posts, incoming abort requests, etc.
+        await yieldToEventLoop()
       }
     } finally {
       signal?.removeEventListener('abort', cancelOnAbort)
@@ -95,7 +99,13 @@ export async function parseTrace(
     }
   }
 
-  const trace = await parser.finalize(source)
+  emit('finalizing', true)
+  const trace = await parser.finalize(source, {
+    signal,
+    onProgress,
+    bytesRead,
+    streamIndex,
+  })
   emit('done', true)
   return trace
 }

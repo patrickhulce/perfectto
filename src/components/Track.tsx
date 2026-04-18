@@ -1,19 +1,32 @@
-import type { Mark, Measure, TimelineContainer, Track as TrackModel } from '../core'
+import type {Mark, Measure, TimelineContainer, Track as TrackModel} from '../core'
+import {lowerBoundByStart, lowerBoundByTime} from './timeline/binarySearch'
+import {ROW_HEIGHT} from './timeline/trackLayout'
+import type {Viewport} from './timeline/useTimelineViewport'
 
 interface TrackProps {
   track: TrackModel
-  timeToPercent: (t: number) => number
+  viewport: Viewport
+  heightPx: number
+  labelWidthPx: number
 }
 
-const ROW_HEIGHT = 22
+/**
+ * Measures narrower than this get skipped entirely — and so do their children.
+ * At a 1px cutoff, the invisible subtree gives zero useful pixels but costs
+ * potentially thousands of DOM nodes, so pruning it saves huge amounts of work.
+ */
+const MIN_MEASURE_PX = 1
 
-export default function Track({ track, timeToPercent }: TrackProps) {
-  const depth = containerDepth(track)
-  const height = Math.max(depth, 1) * ROW_HEIGHT + 8
-
+export default function Track({track, viewport, heightPx, labelWidthPx}: TrackProps) {
   return (
-    <div className="flex border-b border-[#1a202c] bg-[#11151d]">
-      <div className="w-48 shrink-0 border-r border-[#2d3748] px-3 py-2 text-xs text-[#a0aec0]">
+    <div
+      className="flex border-b border-[#1a202c] bg-[#11151d]"
+      style={{height: heightPx}}
+    >
+      <div
+        className="shrink-0 border-r border-[#2d3748] px-3 py-2 text-xs text-[#a0aec0]"
+        style={{width: labelWidthPx}}
+      >
         <div className="truncate font-medium text-[#cbd5e0]">{track.name}</div>
         {track.category && (
           <div className="truncate text-[10px] uppercase tracking-wide text-[#718096]">
@@ -21,12 +34,8 @@ export default function Track({ track, timeToPercent }: TrackProps) {
           </div>
         )}
       </div>
-      <div className="relative flex-1" style={{ height }}>
-        <ContainerContents
-          container={track}
-          timeToPercent={timeToPercent}
-          depth={0}
-        />
+      <div className="relative flex-1 overflow-hidden">
+        <ContainerContents container={track} viewport={viewport} depth={0} />
       </div>
     </div>
   )
@@ -34,37 +43,56 @@ export default function Track({ track, timeToPercent }: TrackProps) {
 
 interface ContainerContentsProps {
   container: TimelineContainer
-  timeToPercent: (t: number) => number
+  viewport: Viewport
   depth: number
 }
 
-function ContainerContents({ container, timeToPercent, depth }: ContainerContentsProps) {
-  return (
-    <>
-      {container.measures.map((measure) => (
-        <MeasureView
-          key={measure.id}
-          measure={measure}
-          timeToPercent={timeToPercent}
-          depth={depth}
-        />
-      ))}
-      {container.marks.map((mark) => (
-        <MarkView key={mark.id} mark={mark} timeToPercent={timeToPercent} depth={depth} />
-      ))}
-    </>
-  )
+function ContainerContents({container, viewport, depth}: ContainerContentsProps) {
+  const {measures, marks} = container
+  const nodes: React.ReactNode[] = []
+
+  // ------- Measures: binary search + iterate until past the viewport. -------
+  // measures are sorted by `start` asc during parse finalize.
+  const firstIdx = measures.length
+    ? Math.max(0, lowerBoundByStart(measures, viewport.startMs) - 1)
+    : 0
+
+  for (let i = firstIdx; i < measures.length; i++) {
+    const m = measures[i]
+    if (m.start > viewport.endMs) break
+    if (m.end < viewport.startMs) continue
+    // maxEnd lets us prune whole subtrees that are technically ordered
+    // before the viewport but whose children live even further behind.
+    const subtreeEnd = m.maxEnd !== undefined ? Math.max(m.end, m.maxEnd) : m.end
+    if (subtreeEnd < viewport.startMs) continue
+
+    const widthPx = (m.end - m.start) * viewport.pxPerMs
+    if (widthPx <= MIN_MEASURE_PX) continue // skip the measure AND its subtree
+
+    nodes.push(<MeasureView key={m.id} measure={m} viewport={viewport} depth={depth} />)
+  }
+
+  // ------- Marks: same lower-bound idea. -------
+  const firstMarkIdx = marks.length ? lowerBoundByTime(marks, viewport.startMs) : 0
+  for (let i = firstMarkIdx; i < marks.length; i++) {
+    const mk = marks[i]
+    if (mk.time > viewport.endMs) break
+    nodes.push(<MarkView key={mk.id} mark={mk} viewport={viewport} depth={depth} />)
+  }
+
+  return <>{nodes}</>
 }
 
 interface MeasureViewProps {
   measure: Measure
-  timeToPercent: (t: number) => number
+  viewport: Viewport
   depth: number
 }
 
-function MeasureView({ measure, timeToPercent, depth }: MeasureViewProps) {
-  const left = timeToPercent(measure.start)
-  const width = Math.max(timeToPercent(measure.end) - left, 0.1)
+function MeasureView({measure, viewport, depth}: MeasureViewProps) {
+  const leftPx = viewport.timeToPx(measure.start)
+  const rawWidthPx = (measure.end - measure.start) * viewport.pxPerMs
+  const widthPx = Math.max(rawWidthPx, 1)
 
   return (
     <>
@@ -72,8 +100,8 @@ function MeasureView({ measure, timeToPercent, depth }: MeasureViewProps) {
         title={`${measure.name} (${measure.start.toFixed(1)}–${measure.end.toFixed(1)} ms)`}
         className="absolute overflow-hidden rounded-sm border border-black/30 px-1 text-[11px] leading-[18px] text-white/90 shadow-sm"
         style={{
-          left: `${left}%`,
-          width: `${width}%`,
+          transform: `translateX(${leftPx}px)`,
+          width: widthPx,
           top: depth * ROW_HEIGHT + 4,
           height: ROW_HEIGHT - 4,
           backgroundColor: measure.color ?? '#4a5568',
@@ -81,48 +109,33 @@ function MeasureView({ measure, timeToPercent, depth }: MeasureViewProps) {
       >
         <span className="truncate">{measure.name}</span>
       </div>
-      <ContainerContents
-        container={measure}
-        timeToPercent={timeToPercent}
-        depth={depth + 1}
-      />
+      <ContainerContents container={measure} viewport={viewport} depth={depth + 1} />
     </>
   )
 }
 
 interface MarkViewProps {
   mark: Mark
-  timeToPercent: (t: number) => number
+  viewport: Viewport
   depth: number
 }
 
-function MarkView({ mark, timeToPercent, depth }: MarkViewProps) {
-  const left = timeToPercent(mark.time)
+function MarkView({mark, viewport, depth}: MarkViewProps) {
+  const leftPx = viewport.timeToPx(mark.time)
   return (
     <div
       title={`${mark.name} @ ${mark.time.toFixed(1)} ms`}
       className="absolute flex items-start"
       style={{
-        left: `${left}%`,
+        transform: `translateX(${leftPx - 1}px)`,
         top: depth * ROW_HEIGHT + 2,
         height: ROW_HEIGHT,
-        transform: 'translateX(-1px)',
       }}
     >
       <div
         className="h-full w-[2px]"
-        style={{ backgroundColor: mark.color ?? '#ed8936' }}
+        style={{backgroundColor: mark.color ?? '#ed8936'}}
       />
     </div>
   )
-}
-
-function containerDepth(container: TimelineContainer): number {
-  let max = 0
-  for (const measure of container.measures) {
-    const childDepth = 1 + containerDepth(measure)
-    if (childDepth > max) max = childDepth
-  }
-  if (container.marks.length > 0 && max === 0) max = 1
-  return max
 }

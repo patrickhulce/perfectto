@@ -11,7 +11,8 @@ import type {
   TraceMetadata,
   TraceSource,
 } from '../../types'
-import type {TraceParser} from '../types'
+import {yieldToEventLoop} from '../../utils/yieldToEventLoop'
+import type {FinalizeOptions, TraceParser} from '../types'
 import {
   asyncKey,
   counterKey,
@@ -122,7 +123,7 @@ export class ChromeParser implements TraceParser {
     this._json_parser.write(chunk)
   }
 
-  async finalize(source: TraceSource): Promise<ParsedTrace> {
+  async finalize(source: TraceSource, options?: FinalizeOptions): Promise<ParsedTrace> {
     if (!this._json_parser.isEnded) {
       try {
         this._json_parser.end()
@@ -131,7 +132,7 @@ export class ChromeParser implements TraceParser {
       }
     }
     if (this._error) throw this._error
-    return this._buildParsedTrace(source)
+    return this._buildParsedTrace(source, options)
   }
 
   // --- ingest --------------------------------------------------------------
@@ -239,14 +240,30 @@ export class ChromeParser implements TraceParser {
 
   // --- build ---------------------------------------------------------------
 
-  private _buildParsedTrace(source: TraceSource): ParsedTrace {
+  private async _buildParsedTrace(
+    source: TraceSource,
+    options?: FinalizeOptions,
+  ): Promise<ParsedTrace> {
     const timeOrigin = Number.isFinite(this._minTs) ? this._minTs : 0
     const toMs = (ts: number): number => (ts - timeOrigin) / 1000
 
     const processes = [...this._processes.values()].sort(compareProcesses)
     const systems: System[] = []
 
+    const signal = options?.signal
+    const onProgress = options?.onProgress
+    const baseBytesRead = options?.bytesRead ?? 0
+    const streamIndex = options?.streamIndex ?? 0
+
     for (const proc of processes) {
+      throwIfAborted(signal)
+      // Yield before each process so the host event loop stays live even if we
+      // end up on a trace with one monstrous process.
+      await yieldToEventLoop()
+      if (onProgress) {
+        onProgress({streamIndex, bytesRead: baseBytesRead, phase: 'finalizing'})
+      }
+
       const tracks: Track[] = []
 
       const threads = [...proc.threads.values()].sort((a, b) =>
@@ -265,6 +282,10 @@ export class ChromeParser implements TraceParser {
       }
 
       if (tracks.length === 0) continue
+
+      for (const track of tracks) {
+        finalizeContainer(track)
+      }
 
       systems.push({
         id: `sys-${proc.pid}`,
@@ -493,6 +514,47 @@ export class ChromeParser implements TraceParser {
     this._idCounter += 1
     return `${prefix}-${this._idCounter}`
   }
+}
+
+function throwIfAborted(signal: AbortSignal | undefined): void {
+  if (!signal?.aborted) return
+  const reason = signal.reason
+  throw reason ?? new DOMException('Aborted', 'AbortError')
+}
+
+/**
+ * Recursively sort a container's measures and marks by start time and compute
+ * its `maxEnd` from its own measures' ends plus child subtrees. Viewer code
+ * relies on the sort order for O(log n) horizontal culling and on `maxEnd`
+ * to prune whole subtrees that fall outside the viewport.
+ */
+function finalizeContainer(container: TimelineContainer): number {
+  let maxEnd = Number.NEGATIVE_INFINITY
+
+  for (const measure of container.measures) {
+    const childMax = finalizeContainer(measure)
+    const end = measure.end > childMax ? measure.end : childMax
+    if (end > maxEnd) maxEnd = end
+  }
+
+  for (const mark of container.marks) {
+    if (mark.time > maxEnd) maxEnd = mark.time
+  }
+
+  container.measures.sort(compareByStart)
+  container.marks.sort(compareMarkByTime)
+
+  container.maxEnd = maxEnd === Number.NEGATIVE_INFINITY ? 0 : maxEnd
+  return container.maxEnd
+}
+
+function compareByStart(a: Measure, b: Measure): number {
+  if (a.start !== b.start) return a.start - b.start
+  return b.end - a.end
+}
+
+function compareMarkByTime(a: Mark, b: Mark): number {
+  return a.time - b.time
 }
 
 function compareProcesses(a: ProcessInfo, b: ProcessInfo): number {
