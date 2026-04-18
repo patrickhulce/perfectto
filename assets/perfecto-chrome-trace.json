@@ -22305,6 +22305,6 @@
     {"args":{},"cat":"benchmark,latencyInfo,rail,input.scrolling","id":"0x15","name":"InputLatency::MouseMove","ph":"e","pid":816,"tid":7422,"ts":284713227370},
     {"args":{},"cat":"benchmark,latencyInfo,rail,input.scrolling","id":"0x15","name":"InputLatency::MouseMove","ph":"b","pid":816,"tid":7422,"ts":284713229939},
     {"args":{},"cat":"loading","id2":{"local":"0x76"},"name":"AIPageContentGenerationMainFrame","ph":"b","pid":8197,"tid":15702979,"ts":284713235663},
-    {"args":{},"cat":"loading","id2":{"local":"0x76"},"name":"AIPageContentGenerationMainFrame","ph":"e","pid":8197,"tid":15702979,"ts":284713236031},
+    {"args":{},"cat":"loading","id2":{"local":"0x76"},"name":"AIPageContentGenerationMainFrame","ph":"e","pid":8197,"tid":15702979,"ts":284713236031}
   ]
 }

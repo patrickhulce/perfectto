@@ -9,14 +9,14 @@ async function formatTrace(tracePath: string) {
   const events = parsed.traceEvents
   parsed['traceEvents'] = EVENTS_PLACEHOLDER
 
-  const formattedEvents = events.map((event: unknown) => JSON.stringify(event) + ',')
+  const formattedEvents = events.map((event: unknown) => JSON.stringify(event))
   const formattedRoot = JSON.stringify(parsed, null, 2)
   const indent = ' '.repeat(2)
   const formatted = formattedRoot.replace(
     `"${EVENTS_PLACEHOLDER}"`,
     [
       '[\n',
-      formattedEvents.map((event: string) => `${indent.repeat(2)}${event}`).join('\n'),
+      formattedEvents.map((event: string) => `${indent.repeat(2)}${event}`).join(',\n'),
       `\n${indent}]`,
     ].join(''),
   )
