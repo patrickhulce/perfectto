@@ -13,6 +13,12 @@ const SYSTEM_HEADER_HEIGHT_PX = 37
 const SYSTEM_BORDER_HEIGHT_PX = 1
 const TRACK_BORDER_HEIGHT_PX = 1
 const VERTICAL_OVERSCAN_PX = 200
+/**
+ * Floor for any track's vertical footprint. Keeps the two-line label
+ * (name + category) from being clipped on shallow tracks, independent of
+ * how many rows of content the track actually has.
+ */
+const MIN_TRACK_HEIGHT_PX = 44
 
 export interface SystemLayout {
   system: System
@@ -27,18 +33,27 @@ export interface TrackLayout {
   track: TrackModel
   topPx: number
   heightPx: number
+  expanded: boolean
 }
 
-function trackHeightPx(track: TrackModel): number {
-  const depth = Math.max(containerDepth(track), 1)
-  return depth * ROW_HEIGHT + 8 + TRACK_BORDER_HEIGHT_PX
+function trackHeightPx(track: TrackModel, expanded: boolean): number {
+  // When collapsed we only render depth 0 (one row of direct children).
+  const depth = expanded ? Math.max(containerDepth(track), 1) : 1
+  return Math.max(depth * ROW_HEIGHT + 8 + TRACK_BORDER_HEIGHT_PX, MIN_TRACK_HEIGHT_PX)
 }
 
-function systemHeightPx(system: System, expanded: boolean): number {
+function systemHeightPx(
+  system: System,
+  systemExpanded: boolean,
+  trackExpanded: Record<string, boolean>,
+): number {
   const header = SYSTEM_HEADER_HEIGHT_PX + SYSTEM_BORDER_HEIGHT_PX
-  if (!expanded) return header
+  if (!systemExpanded) return header
   let tracksHeight = 0
-  for (const track of system.tracks) tracksHeight += trackHeightPx(track)
+  for (const track of system.tracks) {
+    const expanded = trackExpanded[track.id] ?? true
+    tracksHeight += trackHeightPx(track, expanded)
+  }
   return header + tracksHeight
 }
 
@@ -53,6 +68,11 @@ export default function Timeline({timeline}: TimelineProps) {
   const [systemExpanded, setSystemExpanded] = useState<Record<string, boolean>>({})
   const toggleSystem = useCallback((id: string) => {
     setSystemExpanded(prev => ({...prev, [id]: prev[id] === undefined ? false : !prev[id]}))
+  }, [])
+
+  const [trackExpanded, setTrackExpanded] = useState<Record<string, boolean>>({})
+  const toggleTrack = useCallback((id: string) => {
+    setTrackExpanded(prev => ({...prev, [id]: prev[id] === undefined ? false : !prev[id]}))
   }, [])
 
   useEffect(() => {
@@ -89,6 +109,7 @@ export default function Timeline({timeline}: TimelineProps) {
   const {viewport, eventTargetRef} = useTimelineViewport({
     bounds: {start: timeline.start, end: timeline.end},
     containerWidthPx: trackRegionWidthPx,
+    labelOffsetPx: LABEL_WIDTH_PX,
   })
 
   // Precompute vertical layout with current expanded state.
@@ -103,17 +124,18 @@ export default function Timeline({timeline}: TimelineProps) {
       if (expanded) {
         let ty = tracksStartY
         for (const track of system.tracks) {
-          const h = trackHeightPx(track)
-          tracks.push({track, topPx: ty, heightPx: h})
+          const trackIsExpanded = trackExpanded[track.id] ?? true
+          const h = trackHeightPx(track, trackIsExpanded)
+          tracks.push({track, topPx: ty, heightPx: h, expanded: trackIsExpanded})
           ty += h
         }
       }
-      const heightPx = systemHeightPx(system, expanded)
+      const heightPx = systemHeightPx(system, expanded, trackExpanded)
       items.push({system, topPx: y, heightPx, headerHeightPx, expanded, tracks})
       y += heightPx
     }
     return {items, totalHeightPx: y}
-  }, [timeline.systems, systemExpanded])
+  }, [timeline.systems, systemExpanded, trackExpanded])
 
   const visibleTop = scrollTop - VERTICAL_OVERSCAN_PX
   const visibleBottom = scrollTop + viewportHeight + VERTICAL_OVERSCAN_PX
@@ -126,8 +148,16 @@ export default function Timeline({timeline}: TimelineProps) {
 
   return (
     <div ref={scrollRef} className="relative flex-1 overflow-auto">
+      {/*
+        Zoom + pan gestures are captured on this inner wrapper so they work
+        anywhere over the timeline (including over measures and system
+        headers). The label gutter offset is passed into the viewport hook
+        so cursor-to-time math still anchors to the track region.
+      */}
       <div
-        className="relative"
+        ref={eventTargetRef}
+        data-testid="timeline-event-surface"
+        className="relative touch-none"
         style={{minWidth: '100%', height: layout.totalHeightPx}}
       >
         {/* Sizer row: fixed label column + flex track region the viewport measures. */}
@@ -143,17 +173,6 @@ export default function Timeline({timeline}: TimelineProps) {
           />
         </div>
 
-        {/* Event-capture overlay over the track region (for zoom + pan gestures). */}
-        <div
-          ref={eventTargetRef}
-          className="absolute top-0 bottom-0 touch-none"
-          style={{
-            left: LABEL_WIDTH_PX,
-            right: 0,
-          }}
-          data-testid="timeline-event-surface"
-        />
-
         {visibleSystems.map(item => (
           <TimelineSystem
             key={item.system.id}
@@ -162,6 +181,7 @@ export default function Timeline({timeline}: TimelineProps) {
             viewportTopPx={visibleTop}
             viewportBottomPx={visibleBottom}
             onToggle={() => toggleSystem(item.system.id)}
+            onToggleTrack={toggleTrack}
           />
         ))}
       </div>

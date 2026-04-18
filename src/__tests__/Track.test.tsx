@@ -107,4 +107,28 @@ describe('Track', () => {
     )
     expect(titles.some(t => t.startsWith('small'))).toBe(true)
   })
+
+  it('hides grandchildren (and deeper) when collapsed, but keeps one row of direct children', () => {
+    const grandchild = makeMeasure({id: 'grandchild', start: 110, end: 190})
+    const child = makeMeasure({
+      id: 'child',
+      start: 100,
+      end: 200,
+      measures: [grandchild],
+    })
+    const {container} = render(
+      <Track
+        track={makeTrack([child])}
+        viewport={viewport({startMs: 0, endMs: 1000, containerWidthPx: 1000})}
+        heightPx={40}
+        labelWidthPx={100}
+        expanded={false}
+      />,
+    )
+    const titles = Array.from(container.querySelectorAll('[title]')).map(
+      el => el.getAttribute('title') ?? '',
+    )
+    expect(titles.some(t => t.startsWith('child'))).toBe(true)
+    expect(titles.some(t => t.startsWith('grandchild'))).toBe(false)
+  })
 })

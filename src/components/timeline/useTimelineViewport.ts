@@ -25,6 +25,13 @@ export interface UseTimelineViewportOptions {
    * layout the track region sits next to a fixed-width label gutter.
    */
   containerWidthPx: number
+  /**
+   * Horizontal offset from the left edge of the event target element to the
+   * start of the track region. When the event target spans the full timeline
+   * width (including the label gutter), set this to the gutter width so the
+   * cursor-to-time math anchors correctly.
+   */
+  labelOffsetPx?: number
 }
 
 export interface UseTimelineViewportResult {
@@ -45,7 +52,7 @@ const MAX_PX_PER_MS = 1e6
 export function useTimelineViewport(
   options: UseTimelineViewportOptions,
 ): UseTimelineViewportResult {
-  const {bounds, containerWidthPx} = options
+  const {bounds, containerWidthPx, labelOffsetPx = 0} = options
 
   const [range, setRange] = useState<ViewportRange>({
     startMs: bounds.start,
@@ -58,6 +65,8 @@ export function useTimelineViewport(
   rangeRef.current = range
   const boundsRef = useRef(bounds)
   boundsRef.current = bounds
+  const labelOffsetRef = useRef(labelOffsetPx)
+  labelOffsetRef.current = labelOffsetPx
 
   const [eventEl, setEventEl] = useState<HTMLElement | null>(null)
   const eventTargetRef = useCallback((el: HTMLElement | null) => {
@@ -96,14 +105,20 @@ export function useTimelineViewport(
     }
 
     const onWheel = (e: WheelEvent): void => {
-      if (widthRef.current <= 0) return
       const zooming = e.ctrlKey || e.metaKey
       const horizontal = Math.abs(e.deltaX) > Math.abs(e.deltaY)
 
       if (zooming) {
+        // Always swallow ctrl/meta + wheel so the browser never zooms the
+        // whole page (which would change vertical layout too). Zoom is a
+        // horizontal-only affordance here.
         e.preventDefault()
+        if (widthRef.current <= 0) return
         const rect = el.getBoundingClientRect()
-        const cursorPx = Math.max(0, Math.min(e.clientX - rect.left, widthRef.current))
+        const cursorPx = Math.max(
+          0,
+          Math.min(e.clientX - rect.left - labelOffsetRef.current, widthRef.current),
+        )
         const {startMs, endMs} = rangeRef.current
         const spanMs = endMs - startMs
         const anchorMs = startMs + (cursorPx / widthRef.current) * spanMs
@@ -120,6 +135,7 @@ export function useTimelineViewport(
         return
       }
 
+      if (widthRef.current <= 0) return
       if (e.shiftKey || horizontal) {
         e.preventDefault()
         const {startMs, endMs} = rangeRef.current
@@ -131,6 +147,12 @@ export function useTimelineViewport(
           return next
         })
       }
+    }
+
+    // Safari trackpad pinch dispatches gesture events instead of ctrl+wheel;
+    // swallow them so the page can't zoom.
+    const onGesture = (e: Event): void => {
+      e.preventDefault()
     }
 
     let panning:
@@ -183,6 +205,9 @@ export function useTimelineViewport(
     el.addEventListener('pointermove', onPointerMove)
     el.addEventListener('pointerup', endPan)
     el.addEventListener('pointercancel', endPan)
+    el.addEventListener('gesturestart', onGesture as EventListener)
+    el.addEventListener('gesturechange', onGesture as EventListener)
+    el.addEventListener('gestureend', onGesture as EventListener)
 
     return () => {
       el.removeEventListener('wheel', onWheel)
@@ -190,6 +215,9 @@ export function useTimelineViewport(
       el.removeEventListener('pointermove', onPointerMove)
       el.removeEventListener('pointerup', endPan)
       el.removeEventListener('pointercancel', endPan)
+      el.removeEventListener('gesturestart', onGesture as EventListener)
+      el.removeEventListener('gesturechange', onGesture as EventListener)
+      el.removeEventListener('gestureend', onGesture as EventListener)
     }
   }, [eventEl])
 

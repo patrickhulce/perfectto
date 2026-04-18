@@ -8,6 +8,7 @@ interface TimelineSystemProps {
   viewportTopPx: number
   viewportBottomPx: number
   onToggle: () => void
+  onToggleTrack: (trackId: string) => void
 }
 
 export default function TimelineSystem({
@@ -16,6 +17,7 @@ export default function TimelineSystem({
   viewportTopPx,
   viewportBottomPx,
   onToggle,
+  onToggleTrack,
 }: TimelineSystemProps) {
   const {system, topPx, headerHeightPx, expanded, tracks} = layout
 
@@ -27,6 +29,7 @@ export default function TimelineSystem({
       <button
         type="button"
         onClick={onToggle}
+        data-no-pan
         className="flex w-full cursor-pointer items-center gap-2 bg-[#1a202c] px-4 py-2 text-left text-sm font-semibold text-[#e2e8f0] hover:bg-[#232b3a]"
         style={{height: headerHeightPx}}
       >
@@ -51,6 +54,8 @@ export default function TimelineSystem({
                 viewport={viewport}
                 heightPx={tl.heightPx}
                 labelWidthPx={LABEL_WIDTH_PX}
+                expanded={tl.expanded}
+                onToggle={() => onToggleTrack(tl.track.id)}
               />
             </div>
           )
