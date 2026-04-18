@@ -128,6 +128,142 @@ describe('parseTrace - chrome minimal', () => {
     expect(outer.measures[0].name).toBe('inner')
   })
 
+  // Regression test: real DevTools traces are almost entirely `X` (complete)
+  // events. A parser that treats `X` as flat leaves will render the whole
+  // timeline flat for those traces. These tests pin down the containment rule.
+  it('nests X events whose intervals are fully contained (no B/E involved)', async () => {
+    const trace = await parseTrace(
+      streamFromString(
+        JSON.stringify({
+          traceEvents: [
+            {ph: 'X', name: 'outer', cat: 'c', pid: 1, tid: 1, ts: 0, dur: 100},
+            {ph: 'X', name: 'middle', cat: 'c', pid: 1, tid: 1, ts: 10, dur: 50},
+            {ph: 'X', name: 'leaf', cat: 'c', pid: 1, tid: 1, ts: 20, dur: 10},
+          ],
+        }),
+      ),
+      SOURCE,
+    )
+
+    const track = trace.timeline.systems[0].tracks[0]
+    expect(track.measures).toHaveLength(1)
+    const outer = track.measures[0]
+    expect(outer.name).toBe('outer')
+    expect(outer.measures).toHaveLength(1)
+    const middle = outer.measures[0]
+    expect(middle.name).toBe('middle')
+    expect(middle.measures).toHaveLength(1)
+    expect(middle.measures[0].name).toBe('leaf')
+    expect(middle.measures[0].measures).toHaveLength(0)
+  })
+
+  it('keeps adjacent X events as siblings, not children, when they do not overlap', async () => {
+    const trace = await parseTrace(
+      streamFromString(
+        JSON.stringify({
+          traceEvents: [
+            {ph: 'X', name: 'a', cat: 'c', pid: 1, tid: 1, ts: 0, dur: 5},
+            // Starts exactly at a's end — this is a sibling, not a child.
+            {ph: 'X', name: 'b', cat: 'c', pid: 1, tid: 1, ts: 5, dur: 5},
+            {ph: 'X', name: 'c', cat: 'c', pid: 1, tid: 1, ts: 20, dur: 5},
+          ],
+        }),
+      ),
+      SOURCE,
+    )
+
+    const track = trace.timeline.systems[0].tracks[0]
+    expect(track.measures.map(m => m.name)).toEqual(['a', 'b', 'c'])
+    for (const m of track.measures) expect(m.measures).toHaveLength(0)
+  })
+
+  it('nests X siblings under a shared X parent', async () => {
+    const trace = await parseTrace(
+      streamFromString(
+        JSON.stringify({
+          traceEvents: [
+            {ph: 'X', name: 'parent', cat: 'c', pid: 1, tid: 1, ts: 0, dur: 100},
+            {ph: 'X', name: 'childA', cat: 'c', pid: 1, tid: 1, ts: 10, dur: 20},
+            {ph: 'X', name: 'childB', cat: 'c', pid: 1, tid: 1, ts: 40, dur: 20},
+            {ph: 'X', name: 'childC', cat: 'c', pid: 1, tid: 1, ts: 70, dur: 20},
+          ],
+        }),
+      ),
+      SOURCE,
+    )
+
+    const track = trace.timeline.systems[0].tracks[0]
+    expect(track.measures).toHaveLength(1)
+    const parent = track.measures[0]
+    expect(parent.name).toBe('parent')
+    expect(parent.measures.map(m => m.name)).toEqual(['childA', 'childB', 'childC'])
+    for (const c of parent.measures) expect(c.measures).toHaveLength(0)
+  })
+
+  it('nests X events that start at the same timestamp using duration as the parent-first tiebreaker', async () => {
+    // Both start at ts=0; `outer` has the larger duration so it must wrap
+    // `inner` even though the input order is reversed.
+    const trace = await parseTrace(
+      streamFromString(
+        JSON.stringify({
+          traceEvents: [
+            {ph: 'X', name: 'inner', cat: 'c', pid: 1, tid: 1, ts: 0, dur: 10},
+            {ph: 'X', name: 'outer', cat: 'c', pid: 1, tid: 1, ts: 0, dur: 100},
+          ],
+        }),
+      ),
+      SOURCE,
+    )
+
+    const track = trace.timeline.systems[0].tracks[0]
+    expect(track.measures).toHaveLength(1)
+    expect(track.measures[0].name).toBe('outer')
+    expect(track.measures[0].measures.map(m => m.name)).toEqual(['inner'])
+  })
+
+  it('does not flatten X events on the real trace asset', async () => {
+    const filePath = path.resolve(
+      __dirname,
+      '..',
+      '..',
+      'assets',
+      'perfecto-chrome-trace.json',
+    )
+    const bytes = await readFile(filePath)
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new Uint8Array(bytes))
+        controller.close()
+      },
+    })
+    const trace = await parseTrace(stream, {
+      name: 'perfecto-chrome-trace.json',
+      size: bytes.byteLength,
+    })
+
+    let totalMeasures = 0
+    let measuresWithChildren = 0
+    let maxDepth = 0
+    const walk = (m: Measure, depth: number): void => {
+      totalMeasures += 1
+      if (m.measures.length > 0) measuresWithChildren += 1
+      if (depth > maxDepth) maxDepth = depth
+      for (const c of m.measures) walk(c, depth + 1)
+    }
+    for (const system of trace.timeline.systems) {
+      for (const track of system.tracks) {
+        for (const m of track.measures) walk(m, 1)
+      }
+    }
+
+    // If the tree had collapsed to flat, measuresWithChildren would be ~0 and
+    // maxDepth would be 1. The real trace has deep renderer stacks, so we
+    // expect meaningful nesting.
+    expect(totalMeasures).toBeGreaterThan(1000)
+    expect(measuresWithChildren).toBeGreaterThan(100)
+    expect(maxDepth).toBeGreaterThanOrEqual(5)
+  }, 30000)
+
   it('uses metadata events to name processes and threads', async () => {
     const trace = await parseTrace(
       streamFromString(

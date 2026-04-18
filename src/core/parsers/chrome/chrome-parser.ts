@@ -55,6 +55,10 @@ interface Frame {
   event: ChromeEvent
   children: Measure[]
   marks: Mark[]
+  /** True when this frame came from an `X` (complete) event with a known end. */
+  isComplete: boolean
+  /** For complete frames, the pre-computed end timestamp (ev.ts + ev.dur). */
+  endTs: number
 }
 
 /**
@@ -328,15 +332,36 @@ export class ChromeParser implements TraceParser {
         : {marks: rootMarks, measures: rootMeasures}
     }
 
+    // Pops any open `X` (complete) frames whose end has been reached by `ts`,
+    // attaching them to the container that is now on top of the stack (their
+    // real parent). Must be called before touching `currentContainer()` so new
+    // events don't get misfiled into a frame that has already ended.
+    const flushCompleteFrames = (ts: number): void => {
+      while (stack.length > 0) {
+        const top = stack[stack.length - 1]
+        if (!top.isComplete || top.endTs > ts) break
+        stack.pop()
+        currentContainer().measures.push(this._makeMeasureFromFrame(top, top.endTs, null, toMs))
+      }
+    }
+
     for (const ev of sorted) {
       const ph = ev.ph
+      flushCompleteFrames(ev.ts)
 
       if (isDurationBegin(ph)) {
-        stack.push({event: ev, children: [], marks: []})
+        stack.push({event: ev, children: [], marks: [], isComplete: false, endTs: 0})
         continue
       }
 
       if (isDurationEnd(ph)) {
+        // If any complete frames are still open and extend past this E, treat
+        // them as children and clamp their end to ev.ts. Malformed but rare.
+        while (stack.length > 0 && stack[stack.length - 1].isComplete) {
+          const xf = stack.pop()!
+          const clamped = xf.endTs < ev.ts ? xf.endTs : ev.ts
+          currentContainer().measures.push(this._makeMeasureFromFrame(xf, clamped, null, toMs))
+        }
         const frame = stack.pop()
         if (!frame) continue
         currentContainer().measures.push(this._makeMeasureFromFrame(frame, ev.ts, ev, toMs))
@@ -346,9 +371,13 @@ export class ChromeParser implements TraceParser {
       if (isComplete(ph)) {
         const start = ev.ts
         const dur = typeof ev.dur === 'number' ? ev.dur : 0
-        currentContainer().measures.push(
-          this._makeMeasureFromComplete(ev, start, start + dur, toMs),
-        )
+        stack.push({
+          event: ev,
+          children: [],
+          marks: [],
+          isComplete: true,
+          endTs: start + dur,
+        })
         continue
       }
 
@@ -358,7 +387,8 @@ export class ChromeParser implements TraceParser {
       }
     }
 
-    // Close any unmatched B frames at the trace end.
+    // Close any frames left open at the trace end. Complete frames get their
+    // own computed end; unmatched B frames fall back to the overall max ts.
     const fallbackEnd = Number.isFinite(this._maxTs)
       ? this._maxTs
       : stack.length > 0
@@ -366,7 +396,8 @@ export class ChromeParser implements TraceParser {
         : 0
     while (stack.length > 0) {
       const frame = stack.pop()!
-      currentContainer().measures.push(this._makeMeasureFromFrame(frame, fallbackEnd, null, toMs))
+      const end = frame.isComplete ? frame.endTs : fallbackEnd
+      currentContainer().measures.push(this._makeMeasureFromFrame(frame, end, null, toMs))
     }
 
     return {
@@ -459,24 +490,6 @@ export class ChromeParser implements TraceParser {
       events,
       marks: frame.marks,
       measures: frame.children,
-    }
-  }
-
-  private _makeMeasureFromComplete(
-    ev: ChromeEvent,
-    startTs: number,
-    endTs: number,
-    toMs: (ts: number) => number,
-  ): Measure {
-    return {
-      id: this._nextId('m'),
-      name: ev.name,
-      start: toMs(startTs),
-      end: toMs(endTs),
-      category: ev.cat,
-      events: [toRawEvent(ev)],
-      marks: [],
-      measures: [],
     }
   }
 
