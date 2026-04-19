@@ -80,16 +80,43 @@ function Track({
           )}
         </span>
       </button>
-      <ContainerContents
-        container={track}
-        timelineStartMs={timelineStartMs}
-        pxPerMs={pxPerMs}
-        labelWidthPx={labelWidthPx}
-        visibleStartMs={visibleStartMs}
-        visibleEndMs={visibleEndMs}
-        depth={0}
-        maxDepth={maxDepth}
-      />
+      {/*
+        Content layer sits to the right of the sticky label and owns the
+        scaleX/translateX transform driven by zoom gestures. Measures/marks
+        inside position themselves relative to the layer (i.e. they do NOT
+        add `labelWidthPx` to their leftPx). Keeping the transform off the
+        label keeps the label crisp while a pinch is live.
+
+        We deliberately do NOT set `will-change: transform` here. Promoting
+        this element to its own compositor layer means the browser
+        rasterizes its contents once at 1x and then stretches the raster
+        when --zoom-scale changes. The counter-scaled measure text would
+        get baked into that raster at 1/s and then upscaled by s, yielding
+        blurry bitmap-stretched glyphs. Without promotion, Chrome repaints
+        on every transform change, so text re-rasterizes crisply at the
+        current effective scale.
+      */}
+      <div
+        data-testid="track-content-layer"
+        className="absolute inset-y-0"
+        style={{
+          left: labelWidthPx,
+          right: 0,
+          transform:
+            'translateX(var(--zoom-translate, 0px)) scaleX(var(--zoom-scale, 1))',
+          transformOrigin: '0 0',
+        }}
+      >
+        <ContainerContents
+          container={track}
+          timelineStartMs={timelineStartMs}
+          pxPerMs={pxPerMs}
+          visibleStartMs={visibleStartMs}
+          visibleEndMs={visibleEndMs}
+          depth={0}
+          maxDepth={maxDepth}
+        />
+      </div>
     </div>
   )
 }
@@ -100,7 +127,6 @@ interface ContainerContentsProps {
   container: TimelineContainer
   timelineStartMs: number
   pxPerMs: number
-  labelWidthPx: number
   visibleStartMs: number
   visibleEndMs: number
   depth: number
@@ -111,7 +137,6 @@ function ContainerContents({
   container,
   timelineStartMs,
   pxPerMs,
-  labelWidthPx,
   visibleStartMs,
   visibleEndMs,
   depth,
@@ -145,7 +170,6 @@ function ContainerContents({
         measure={m}
         timelineStartMs={timelineStartMs}
         pxPerMs={pxPerMs}
-        labelWidthPx={labelWidthPx}
         visibleStartMs={visibleStartMs}
         visibleEndMs={visibleEndMs}
         depth={depth}
@@ -165,7 +189,6 @@ function ContainerContents({
         mark={mk}
         timelineStartMs={timelineStartMs}
         pxPerMs={pxPerMs}
-        labelWidthPx={labelWidthPx}
         depth={depth}
       />,
     )
@@ -178,7 +201,6 @@ interface MeasureViewProps {
   measure: Measure
   timelineStartMs: number
   pxPerMs: number
-  labelWidthPx: number
   visibleStartMs: number
   visibleEndMs: number
   depth: number
@@ -189,13 +211,12 @@ function MeasureView({
   measure,
   timelineStartMs,
   pxPerMs,
-  labelWidthPx,
   visibleStartMs,
   visibleEndMs,
   depth,
   maxDepth,
 }: MeasureViewProps) {
-  const leftPx = labelWidthPx + (measure.start - timelineStartMs) * pxPerMs
+  const leftPx = (measure.start - timelineStartMs) * pxPerMs
   const rawWidthPx = (measure.end - measure.start) * pxPerMs
   const widthPx = Math.max(rawWidthPx, 1)
 
@@ -211,13 +232,28 @@ function MeasureView({
           backgroundColor: measure.color ?? '#4a5568',
         }}
       >
-        <span className="truncate">{measure.name}</span>
+        {/*
+          The parent's scaleX stretches everything inside — including letters.
+          We counter-scale the text span by `--zoom-inv-scale` (= 1/scale)
+          with a left-edge origin so glyphs stay at their natural pixel size
+          while the colored bar underneath continues to scale cleanly. At
+          rest `--zoom-inv-scale` is 1 so this collapses to the previous
+          rendering.
+        */}
+        <span
+          className="block truncate"
+          style={{
+            transform: 'scaleX(var(--zoom-inv-scale, 1))',
+            transformOrigin: '0 50%',
+          }}
+        >
+          {measure.name}
+        </span>
       </div>
       <ContainerContents
         container={measure}
         timelineStartMs={timelineStartMs}
         pxPerMs={pxPerMs}
-        labelWidthPx={labelWidthPx}
         visibleStartMs={visibleStartMs}
         visibleEndMs={visibleEndMs}
         depth={depth + 1}
@@ -231,12 +267,11 @@ interface MarkViewProps {
   mark: Mark
   timelineStartMs: number
   pxPerMs: number
-  labelWidthPx: number
   depth: number
 }
 
-function MarkView({mark, timelineStartMs, pxPerMs, labelWidthPx, depth}: MarkViewProps) {
-  const leftPx = labelWidthPx + (mark.time - timelineStartMs) * pxPerMs
+function MarkView({mark, timelineStartMs, pxPerMs, depth}: MarkViewProps) {
+  const leftPx = (mark.time - timelineStartMs) * pxPerMs
   return (
     <div
       title={`${mark.name} @ ${mark.time.toFixed(1)} ms`}

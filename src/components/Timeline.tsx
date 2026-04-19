@@ -8,6 +8,25 @@ interface TimelineProps {
   timeline: TimelineModel
 }
 
+export interface PerfecttoTimelineSnapshot {
+  readonly pxPerMs: number
+  readonly scrollLeft: number
+  readonly scrollTop: number
+  readonly innerWidthPx: number
+  readonly labelWidthPx: number
+  readonly timelineStart: number
+  readonly timelineEnd: number
+  readonly effectiveScale: number
+  readonly effectiveTranslatePx: number
+  readonly scrollerRect: {x: number; y: number; width: number; height: number} | null
+}
+
+declare global {
+  interface Window {
+    __perfecttoTimeline?: PerfecttoTimelineSnapshot
+  }
+}
+
 export const LABEL_WIDTH_PX = 192
 const SYSTEM_HEADER_HEIGHT_PX = 37
 const SYSTEM_BORDER_HEIGHT_PX = 1
@@ -109,11 +128,20 @@ export default function Timeline({timeline}: TimelineProps) {
     }
   }, [])
 
-  const {pxPerMs, eventTargetRef} = useTimelineZoom({
+  // Handed to the zoom hook so it can keep React's `scrollLeft` state in
+  // sync inside the same flushSync that updates `pxPerMs`. Without this,
+  // the first render after a zoom commit would cull the viewport with
+  // old scrollLeft + new pxPerMs and briefly drop measures on one side.
+  const handleCommitScrollLeft = useCallback((nextScrollLeft: number) => {
+    setScrollLeft(nextScrollLeft)
+  }, [])
+
+  const {pxPerMs, eventTargetRef, getEffectiveZoom} = useTimelineZoom({
     bounds: {start: timeline.start, end: timeline.end},
     labelWidthPx: LABEL_WIDTH_PX,
     containerWidthPx: viewportWidth,
     scrollerRef: scrollRef,
+    onCommitScrollLeft: handleCommitScrollLeft,
   })
 
   // Precompute vertical layout with current expanded state.
@@ -144,11 +172,69 @@ export default function Timeline({timeline}: TimelineProps) {
   const totalSpanMs = Math.max(timeline.end - timeline.start, MIN_SPAN_MS)
   const innerWidthPx = LABEL_WIDTH_PX + totalSpanMs * pxPerMs
 
-  // Scroll + size inputs are deferred so the scroll event thread never blocks
-  // on the expensive culling/measure-layout render. React 19 renders the new
-  // culled output as a low-priority transition while translateX keeps the
-  // already-mounted DOM moving at 60fps.
-  const deferredScrollLeft = useDeferredValue(scrollLeft)
+  // Test hook: expose a live snapshot of the viewport state so e2e tests can
+  // verify zoom anchoring and cursor math without scraping the DOM. Reads
+  // from refs/DOM each access so it always reflects the current (possibly
+  // mid-gesture) state. No-op outside the browser.
+  useEffect(() => {
+    if (typeof window === 'undefined') return
+    const labelWidthPx = LABEL_WIDTH_PX
+    const timelineStart = timeline.start
+    const timelineEnd = timeline.end
+    const snapshot: PerfecttoTimelineSnapshot = {
+      get pxPerMs() {
+        return pxPerMs
+      },
+      get scrollLeft() {
+        return scrollRef.current?.scrollLeft ?? 0
+      },
+      get scrollTop() {
+        return scrollRef.current?.scrollTop ?? 0
+      },
+      get innerWidthPx() {
+        return innerWidthPx
+      },
+      get labelWidthPx() {
+        return labelWidthPx
+      },
+      get timelineStart() {
+        return timelineStart
+      },
+      get timelineEnd() {
+        return timelineEnd
+      },
+      get effectiveScale() {
+        return getEffectiveZoom().scale
+      },
+      get effectiveTranslatePx() {
+        return getEffectiveZoom().translatePx
+      },
+      get scrollerRect() {
+        const el = scrollRef.current
+        if (!el) return null
+        const r = el.getBoundingClientRect()
+        return {x: r.x, y: r.y, width: r.width, height: r.height}
+      },
+    }
+    window.__perfecttoTimeline = snapshot
+    return () => {
+      if (window.__perfecttoTimeline === snapshot) {
+        delete window.__perfecttoTimeline
+      }
+    }
+  }, [pxPerMs, innerWidthPx, timeline.start, timeline.end, getEffectiveZoom])
+
+  // Vertical scroll + viewport size are deferred so window resizes / rapid
+  // vertical scrolling don't block on the expensive culling render. React
+  // renders the new culled output as a low-priority transition.
+  //
+  // scrollLeft is intentionally NOT deferred: horizontal scroll is already
+  // rAF-throttled upstream, and deferring it creates a visible glitch at
+  // zoom commit time — pxPerMs updates inside flushSync, but the deferred
+  // scrollLeft still returns its old value for that urgent render, so
+  // visibleStartMs/EndMs are computed with (oldScrollLeft, newPxPerMs) and
+  // most measures are culled out of frame until React's transition render
+  // catches up a beat later. That round-trip is the "big flash".
   const deferredScrollTop = useDeferredValue(scrollTop)
   const deferredViewportWidth = useDeferredValue(viewportWidth)
   const deferredViewportHeight = useDeferredValue(viewportHeight)
@@ -161,20 +247,18 @@ export default function Timeline({timeline}: TimelineProps) {
 
   const visibleStartMs = useMemo(() => {
     if (pxPerMs <= 0) return timeline.start
-    const raw =
-      timeline.start + (deferredScrollLeft - horizontalOverscanPx - LABEL_WIDTH_PX) / pxPerMs
+    const raw = timeline.start + (scrollLeft - horizontalOverscanPx - LABEL_WIDTH_PX) / pxPerMs
     return Math.max(timeline.start, raw)
-  }, [deferredScrollLeft, horizontalOverscanPx, pxPerMs, timeline.start])
+  }, [scrollLeft, horizontalOverscanPx, pxPerMs, timeline.start])
 
   const visibleEndMs = useMemo(() => {
     if (pxPerMs <= 0) return timeline.end
     const raw =
       timeline.start +
-      (deferredScrollLeft + deferredViewportWidth + horizontalOverscanPx - LABEL_WIDTH_PX) /
-        pxPerMs
+      (scrollLeft + deferredViewportWidth + horizontalOverscanPx - LABEL_WIDTH_PX) / pxPerMs
     return Math.min(timeline.end, raw)
   }, [
-    deferredScrollLeft,
+    scrollLeft,
     deferredViewportWidth,
     horizontalOverscanPx,
     pxPerMs,
