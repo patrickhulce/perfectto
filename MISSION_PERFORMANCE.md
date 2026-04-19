@@ -70,6 +70,18 @@ On scroll, apply a CSS translateX to the canvas element (compositor-only, no red
 
 Eliminates the per-frame redraw during continuous horizontal wheel/drag-pan.
 
+Phase 3.5 — UX / Accessibility restoration (canvas regressions)
+
+The canvas cutover in Phase 1 drops three things the DOM path gave us for free: the `title=` tooltip on every measure/mark, the DOM-based hover affordance, and the measure **name text** rendered inside each rect. This phase is the explicit ticket to earn those back.
+
+Slice labels (`ctx.fillText`): draw the measure's `name` inside each rect whose CSS width is above a readability threshold (~18 px — below that the glyph count is ≤ 1 and not worth the metrics cost). Set `ctx.font` / `ctx.textBaseline` once per frame, not per slice. Crop with `cropText`-style logic: measure text width with a cached `measureText` result keyed on `(name, font)`, trim with an ellipsis when `measured > rectWidth - 2*padding`. Draw after the batched `fillRect` pass so fills don't overwrite glyphs; text gets its own color pass (typically a single foreground color + optional inverse-contrast override per slice). Expect this to dominate canvas draw cost at fit-zoom, so gate it behind the same pxPerMs/LOD logic Phase 2 introduces — zoomed-out mipmap buckets don't get labels.
+
+Minimal tooltip layer: one floating `<div>` positioned over the timeline. On `pointermove`, hit-test against the track under the cursor by (1) translating cursor x into `timelineMs`, (2) `lowerBoundF32` on `maxEndsPrefix`, then a short linear scan while `starts[i] <= t && ends[i] >= t`, picking the deepest match whose `depths[i] * ROW_HEIGHT` band contains the cursor y. Back-pointer from `buffers.measures[i]` gives name + time for the tooltip body. No React re-renders per mousemove — mutate `tooltipEl.textContent` + `style.transform` directly.
+
+Keyboard / screen-reader story: the sticky label gutter stays focusable. Add `aria-label` on each Track wrapper that summarizes the row ("{trackName}, {count} measures, duration {ms}"). A future "details pane" can consume the hit-test selection model and render the rich DOM that used to live in MeasureView.
+
+Pointer semantics preserved today (so this phase is purely additive): the canvas has `pointer-events: none`, so wheel/pointerdown/etc still route through the outer event surface that the viewport hook binds to.
+
 Phase 4 — Per-track async renderer interface
 
 Replaces the monolithic ParsedTrace → render model with Perfetto's plugin-style track interface so we can grow.
@@ -98,7 +110,7 @@ The "don't promote to its own compositor layer while we're stretching" comment i
 
 Risks and open questions
 
-Accessibility: canvas tracks lose the title tooltips we get for free from DOM. Need to build a JS tooltip layer that hit-tests the buffer arrays. Not hard but worth acknowledging.
+Accessibility: canvas tracks lose the `title=` tooltips we got for free from the DOM. Tracked as Phase 3.5 above: a single floating tooltip div hit-tests the SliceBuffers / MarkBuffers on `pointermove`, no React involvement. Keyboard/screen-reader parity is also deferred to that phase.
 
 Text rendering: Perfetto draws slice labels via ctx.fillText + cropText (see slice_track.ts). We'll pay some font-metrics cost; amortizable with a width cache keyed on text+font.
 

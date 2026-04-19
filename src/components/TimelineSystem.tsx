@@ -1,29 +1,24 @@
 import {memo} from 'react'
-import Track from './Track'
+import CanvasTrackRenderer from './timeline/CanvasTrackRenderer'
 import type {SystemLayout} from './Timeline'
+import type {ViewportStore} from './timeline/viewportStore'
 
 interface TimelineSystemProps {
   layout: SystemLayout
-  timelineStartMs: number
-  pxPerMs: number
   labelWidthPx: number
-  visibleStartMs: number
-  visibleEndMs: number
   viewportTopPx: number
   viewportBottomPx: number
+  store: ViewportStore
   onToggle: () => void
   onToggleTrack: (trackId: string) => void
 }
 
 function TimelineSystem({
   layout,
-  timelineStartMs,
-  pxPerMs,
   labelWidthPx,
-  visibleStartMs,
-  visibleEndMs,
   viewportTopPx,
   viewportBottomPx,
+  store,
   onToggle,
   onToggleTrack,
 }: TimelineSystemProps) {
@@ -62,14 +57,11 @@ function TimelineSystem({
               className="absolute left-0 right-0"
               style={{top: tl.topPx - topPx, height: tl.heightPx}}
             >
-              <Track
+              <CanvasTrackRenderer
                 track={tl.track}
-                timelineStartMs={timelineStartMs}
-                pxPerMs={pxPerMs}
-                labelWidthPx={labelWidthPx}
-                visibleStartMs={visibleStartMs}
-                visibleEndMs={visibleEndMs}
                 heightPx={tl.heightPx}
+                labelWidthPx={labelWidthPx}
+                store={store}
                 expanded={tl.expanded}
                 onToggle={() => onToggleTrack(tl.track.id)}
               />

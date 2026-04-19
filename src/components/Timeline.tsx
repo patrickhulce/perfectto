@@ -1,8 +1,9 @@
-import {useCallback, useDeferredValue, useEffect, useMemo, useRef, useState} from 'react'
+import {useCallback, useEffect, useMemo, useRef, useState} from 'react'
 import type {System, Timeline as TimelineModel, Track as TrackModel} from '../core'
 import TimelineSystem from './TimelineSystem'
 import {useTimelineZoom} from './timeline/useTimelineViewport'
 import {containerDepth, ROW_HEIGHT} from './timeline/trackLayout'
+import {createViewportStore} from './timeline/viewportStore'
 
 interface TimelineProps {
   timeline: TimelineModel
@@ -16,8 +17,6 @@ export interface PerfecttoTimelineSnapshot {
   readonly labelWidthPx: number
   readonly timelineStart: number
   readonly timelineEnd: number
-  readonly effectiveScale: number
-  readonly effectiveTranslatePx: number
   readonly scrollerRect: {x: number; y: number; width: number; height: number} | null
 }
 
@@ -79,9 +78,32 @@ function systemHeightPx(
 export default function Timeline({timeline}: TimelineProps) {
   const scrollRef = useRef<HTMLDivElement | null>(null)
 
+  // The viewport store is the single source of truth for pxPerMs /
+  // scrollLeft / viewport dimensions that canvases need. It's created once
+  // per Timeline mount and fed by the zoom hook + scroll listener. Canvases
+  // subscribe directly and redraw via rAF — no React render per frame.
+  const storeRef = useRef<ReturnType<typeof createViewportStore> | null>(null)
+  if (storeRef.current === null) {
+    storeRef.current = createViewportStore({
+      pxPerMs: 0,
+      scrollLeft: 0,
+      scrollTop: 0,
+      viewportWidth: 0,
+      viewportHeight: 0,
+      labelWidthPx: LABEL_WIDTH_PX,
+      timelineStart: timeline.start,
+      timelineEnd: timeline.end,
+    })
+  }
+  const store = storeRef.current
+
+  // React-visible mirrors of a handful of store fields. Kept narrow so that
+  // only layout-relevant changes (viewport size for fit-zoom math, vertical
+  // scroll for row virtualization) force React renders. `scrollLeft` and
+  // `pxPerMs` are intentionally NOT mirrored — those change every zoom tick
+  // and canvases get them from the store directly.
   const [viewportWidth, setViewportWidth] = useState(0)
   const [viewportHeight, setViewportHeight] = useState(0)
-  const [scrollLeft, setScrollLeft] = useState(0)
   const [scrollTop, setScrollTop] = useState(0)
 
   const [systemExpanded, setSystemExpanded] = useState<Record<string, boolean>>({})
@@ -97,26 +119,34 @@ export default function Timeline({timeline}: TimelineProps) {
   useEffect(() => {
     const el = scrollRef.current
     if (!el) return
-    const updateSize = () => {
-      setViewportWidth(el.clientWidth)
-      setViewportHeight(el.clientHeight)
+    const updateSize = (): void => {
+      const w = el.clientWidth
+      const h = el.clientHeight
+      setViewportWidth(w)
+      setViewportHeight(h)
+      store.set({viewportWidth: w, viewportHeight: h})
     }
     updateSize()
     if (typeof ResizeObserver === 'undefined') return
     const ro = new ResizeObserver(updateSize)
     ro.observe(el)
     return () => ro.disconnect()
-  }, [])
+  }, [store])
 
   useEffect(() => {
     const el = scrollRef.current
     if (!el) return
     let raf: number | null = null
-    const onScroll = () => {
+    // Two update paths:
+    //  - store.set fires immediately on every scroll event so canvases see
+    //    the new scrollLeft on the very next rAF (no one-frame lag).
+    //  - React setScrollTop is rAF-throttled because it only drives row
+    //    virtualization, which doesn't need sub-frame resolution.
+    const onScroll = (): void => {
+      store.set({scrollLeft: el.scrollLeft, scrollTop: el.scrollTop})
       if (raf !== null) return
       raf = requestAnimationFrame(() => {
         raf = null
-        setScrollLeft(el.scrollLeft)
         setScrollTop(el.scrollTop)
       })
     }
@@ -126,22 +156,14 @@ export default function Timeline({timeline}: TimelineProps) {
       el.removeEventListener('scroll', onScroll)
       if (raf !== null) cancelAnimationFrame(raf)
     }
-  }, [])
+  }, [store])
 
-  // Handed to the zoom hook so it can keep React's `scrollLeft` state in
-  // sync inside the same flushSync that updates `pxPerMs`. Without this,
-  // the first render after a zoom commit would cull the viewport with
-  // old scrollLeft + new pxPerMs and briefly drop measures on one side.
-  const handleCommitScrollLeft = useCallback((nextScrollLeft: number) => {
-    setScrollLeft(nextScrollLeft)
-  }, [])
-
-  const {pxPerMs, eventTargetRef, getEffectiveZoom} = useTimelineZoom({
+  const {pxPerMs, eventTargetRef} = useTimelineZoom({
     bounds: {start: timeline.start, end: timeline.end},
     labelWidthPx: LABEL_WIDTH_PX,
     containerWidthPx: viewportWidth,
     scrollerRef: scrollRef,
-    onCommitScrollLeft: handleCommitScrollLeft,
+    store,
   })
 
   // Precompute vertical layout with current expanded state.
@@ -174,8 +196,8 @@ export default function Timeline({timeline}: TimelineProps) {
 
   // Test hook: expose a live snapshot of the viewport state so e2e tests can
   // verify zoom anchoring and cursor math without scraping the DOM. Reads
-  // from refs/DOM each access so it always reflects the current (possibly
-  // mid-gesture) state. No-op outside the browser.
+  // from refs/DOM each access so it always reflects the current state. No-op
+  // outside the browser.
   useEffect(() => {
     if (typeof window === 'undefined') return
     const labelWidthPx = LABEL_WIDTH_PX
@@ -183,7 +205,7 @@ export default function Timeline({timeline}: TimelineProps) {
     const timelineEnd = timeline.end
     const snapshot: PerfecttoTimelineSnapshot = {
       get pxPerMs() {
-        return pxPerMs
+        return store.get().pxPerMs
       },
       get scrollLeft() {
         return scrollRef.current?.scrollLeft ?? 0
@@ -203,12 +225,6 @@ export default function Timeline({timeline}: TimelineProps) {
       get timelineEnd() {
         return timelineEnd
       },
-      get effectiveScale() {
-        return getEffectiveZoom().scale
-      },
-      get effectiveTranslatePx() {
-        return getEffectiveZoom().translatePx
-      },
       get scrollerRect() {
         const el = scrollRef.current
         if (!el) return null
@@ -222,49 +238,15 @@ export default function Timeline({timeline}: TimelineProps) {
         delete window.__perfecttoTimeline
       }
     }
-  }, [pxPerMs, innerWidthPx, timeline.start, timeline.end, getEffectiveZoom])
+  }, [innerWidthPx, timeline.start, timeline.end, store])
 
-  // Vertical scroll + viewport size are deferred so window resizes / rapid
-  // vertical scrolling don't block on the expensive culling render. React
-  // renders the new culled output as a low-priority transition.
-  //
-  // scrollLeft is intentionally NOT deferred: horizontal scroll is already
-  // rAF-throttled upstream, and deferring it creates a visible glitch at
-  // zoom commit time — pxPerMs updates inside flushSync, but the deferred
-  // scrollLeft still returns its old value for that urgent render, so
-  // visibleStartMs/EndMs are computed with (oldScrollLeft, newPxPerMs) and
-  // most measures are culled out of frame until React's transition render
-  // catches up a beat later. That round-trip is the "big flash".
-  const deferredScrollTop = useDeferredValue(scrollTop)
-  const deferredViewportWidth = useDeferredValue(viewportWidth)
-  const deferredViewportHeight = useDeferredValue(viewportHeight)
-
-  const horizontalOverscanPx = Math.max(200, deferredViewportWidth * 0.5)
-  const verticalOverscanPx = Math.max(200, deferredViewportHeight * 0.5)
-
-  const visibleTop = deferredScrollTop - verticalOverscanPx
-  const visibleBottom = deferredScrollTop + deferredViewportHeight + verticalOverscanPx
-
-  const visibleStartMs = useMemo(() => {
-    if (pxPerMs <= 0) return timeline.start
-    const raw = timeline.start + (scrollLeft - horizontalOverscanPx - LABEL_WIDTH_PX) / pxPerMs
-    return Math.max(timeline.start, raw)
-  }, [scrollLeft, horizontalOverscanPx, pxPerMs, timeline.start])
-
-  const visibleEndMs = useMemo(() => {
-    if (pxPerMs <= 0) return timeline.end
-    const raw =
-      timeline.start +
-      (scrollLeft + deferredViewportWidth + horizontalOverscanPx - LABEL_WIDTH_PX) / pxPerMs
-    return Math.min(timeline.end, raw)
-  }, [
-    scrollLeft,
-    deferredViewportWidth,
-    horizontalOverscanPx,
-    pxPerMs,
-    timeline.start,
-    timeline.end,
-  ])
+  // Coarse vertical row virtualization: only mount system/track wrappers
+  // that are at least partially visible. Horizontal culling lives inside
+  // each CanvasTrackRenderer since it reads scrollLeft straight from the
+  // store.
+  const verticalOverscanPx = Math.max(200, viewportHeight * 0.5)
+  const visibleTop = scrollTop - verticalOverscanPx
+  const visibleBottom = scrollTop + viewportHeight + verticalOverscanPx
 
   const visibleSystems = useMemo(() => {
     return layout.items.filter(
@@ -284,13 +266,10 @@ export default function Timeline({timeline}: TimelineProps) {
           <TimelineSystem
             key={item.system.id}
             layout={item}
-            timelineStartMs={timeline.start}
-            pxPerMs={pxPerMs}
             labelWidthPx={LABEL_WIDTH_PX}
-            visibleStartMs={visibleStartMs}
-            visibleEndMs={visibleEndMs}
             viewportTopPx={visibleTop}
             viewportBottomPx={visibleBottom}
+            store={store}
             onToggle={() => toggleSystem(item.system.id)}
             onToggleTrack={toggleTrack}
           />

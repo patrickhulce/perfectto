@@ -2,17 +2,22 @@ import {test, expect} from './fixtures/trace'
 import {formatReport, measureInteraction} from './helpers/perfTrace'
 
 /**
- * The invariants that MUST hold regardless of machine speed are asserted
- * strictly (zero long tasks, zero Layout during scroll). Scripting budgets
- * are looser guards that catch regressions in overall work-per-frame; they
- * were sized ~2x the observed baseline on an M-series laptop so CI noise
- * doesn't flap them.
+ * Post-Phase-1 (canvas renderer) perf invariants.
  *
- * Baselines (2026-04, local, release build of perfecto-chrome-trace.json):
- *   horizontal drag:  scripting ~550ms / window ~800ms, Layout 0, longTasks 0
- *   wheel scroll:     scripting ~250ms / window ~600ms, Layout 0, longTasks 0
- *   ctrl+wheel zoom:  scripting ~345ms / window ~550ms, Layout 0, longTasks 0
- *   vertical scroll:  scripting ~340ms / window ~650ms, Layout 0, longTasks 0
+ * The canvas path repaints via `ctx.fillRect` on a per-track `<canvas>`, so
+ * scrolling/zooming never hits the React tree or the DOM layout engine. The
+ * invariants that MUST hold regardless of machine speed are asserted
+ * strictly (zero long tasks, zero Layout during interaction). Scripting
+ * budgets are looser guards that catch regressions in overall work-per-frame;
+ * they were tightened ~1.5x under the new renderer from the pre-canvas
+ * baselines.
+ *
+ * Baselines (2026-04, local, release build of perfecto-chrome-trace.json,
+ * canvas renderer):
+ *   horizontal drag:  scripting ~320ms / window ~500ms, Layout 0, longTasks 0
+ *   wheel scroll:     scripting ~120ms / window ~300ms, Layout 0, longTasks 0
+ *   ctrl+wheel zoom:  scripting ~130ms / window ~320ms, Layout 0, longTasks 0
+ *   vertical scroll:  scripting ~170ms / window ~380ms, Layout 0, longTasks 0
  */
 
 test.describe('Timeline interaction performance', () => {
@@ -53,7 +58,7 @@ test.describe('Timeline interaction performance', () => {
     expect(
       report.metrics.scripting,
       'horizontal drag scripting within budget',
-    ).toBeLessThan(1100)
+    ).toBeLessThan(700)
   })
 
   test('wheel horizontal scroll stays off the layout path', async ({
@@ -81,7 +86,7 @@ test.describe('Timeline interaction performance', () => {
     expect(
       report.metrics.scripting,
       'wheel scroll scripting within budget',
-    ).toBeLessThan(500)
+    ).toBeLessThan(300)
   })
 
   test('ctrl+wheel zoom does not block the main thread with long tasks', async ({
@@ -110,13 +115,12 @@ test.describe('Timeline interaction performance', () => {
       description: formatReport(report),
     })
 
-    // Under the transform-during-gesture model, the 12 wheel ticks should
-    // produce at most one React re-render (on the debounced commit). Layout
-    // should be essentially zero — a transform-only change doesn't touch
-    // layout. Long tasks must stay empty.
-    //
-    // Budget sized ~1.5x the observed baseline (~175ms on an M-series
-    // laptop; was ~700ms before the GPU-transform model).
+    // Canvas zoom: every tick commits pxPerMs and writes scrollLeft; no
+    // layout-touching transform exists. Long tasks must stay empty, Layout
+    // must stay effectively zero, and scripting is ~1.5x the pre-canvas
+    // baseline's budget (~175ms) because there are now 12 React renders
+    // across the burst instead of 1 debounced commit — each is cheap
+    // because CanvasTrackRenderer doesn't re-render on scroll/zoom.
     expect(report.longTasks, 'ctrl+wheel zoom produced no long tasks').toEqual([])
     expect(
       report.metrics.layout,
@@ -143,8 +147,6 @@ test.describe('Timeline interaction performance', () => {
         scrollLeft: t.scrollLeft,
         labelWidthPx: t.labelWidthPx,
         timelineStart: t.timelineStart,
-        effectiveScale: t.effectiveScale,
-        effectiveTranslatePx: t.effectiveTranslatePx,
         scrollerRect: r,
       }
     })
@@ -156,23 +158,18 @@ test.describe('Timeline interaction performance', () => {
       surfaceBox.y + Math.min(400, surfaceBox.height * 0.8)
     await page.mouse.move(cursorX, cursorY)
 
-    const cursorXInViewport = cursorX - before.scrollerRect.x
-    // Before any gesture, `effectiveScale=1` and `effectiveTranslatePx=0`, so
-    // the formula collapses to the usual scrollLeft-based one. Keep the full
-    // form here so it matches the mid-gesture derivation exactly.
+    // Canvas renderer commits every wheel tick synchronously, so the
+    // anchor math is the simple textbook form with no live-transform
+    // correction.
     const msUnderCursor = (s: {
       pxPerMs: number
       scrollLeft: number
       labelWidthPx: number
       timelineStart: number
-      effectiveScale: number
-      effectiveTranslatePx: number
       scrollerRect: {x: number}
     }) => {
       const cursorXView = cursorX - s.scrollerRect.x
-      const layerX =
-        (s.scrollLeft + cursorXView - s.labelWidthPx - s.effectiveTranslatePx) /
-        s.effectiveScale
+      const layerX = s.scrollLeft + cursorXView - s.labelWidthPx
       return s.timelineStart + layerX / s.pxPerMs
     }
     const msBefore = msUnderCursor(before)
@@ -184,35 +181,9 @@ test.describe('Timeline interaction performance', () => {
       await page.waitForTimeout(16)
     }
     await page.keyboard.up('Control')
-    // Let the last wheel tick's rAF flush, but stay well inside the 250ms
-    // debounce so we can observe the live transform.
-    await page.waitForTimeout(32)
-
-    const mid = await page.evaluate(() => {
-      const t = window.__perfecttoTimeline!
-      const r = t.scrollerRect!
-      return {
-        pxPerMs: t.pxPerMs,
-        scrollLeft: t.scrollLeft,
-        labelWidthPx: t.labelWidthPx,
-        timelineStart: t.timelineStart,
-        effectiveScale: t.effectiveScale,
-        effectiveTranslatePx: t.effectiveTranslatePx,
-        scrollerRect: r,
-      }
-    })
-    expect(
-      mid.effectiveScale,
-      'zoom transform is still live mid-gesture',
-    ).toBeGreaterThan(1.5)
-    const effectivePxPerMsMid = mid.pxPerMs * mid.effectiveScale
-    const midDriftPx =
-      Math.abs(msUnderCursor(mid) - msBefore) * effectivePxPerMsMid
-    expect(midDriftPx, 'mid-gesture anchor stays under cursor').toBeLessThan(2)
-
-    // Now wait past the debounce and verify the commit kept the anchor
-    // pinned + snapped effectiveScale back to 1.
-    await page.waitForTimeout(400)
+    // Give the last wheel tick's render + scrollLeft write a moment to
+    // reflect in the snapshot.
+    await page.waitForTimeout(48)
 
     const after = await page.evaluate(() => {
       const t = window.__perfecttoTimeline!
@@ -222,23 +193,17 @@ test.describe('Timeline interaction performance', () => {
         scrollLeft: t.scrollLeft,
         labelWidthPx: t.labelWidthPx,
         timelineStart: t.timelineStart,
-        effectiveScale: t.effectiveScale,
-        effectiveTranslatePx: t.effectiveTranslatePx,
         scrollerRect: r,
       }
     })
-    expect(after.effectiveScale, 'zoom committed (scale reset)').toBe(1)
-    expect(
-      after.effectiveTranslatePx,
-      'zoom committed (translate reset)',
-    ).toBe(0)
     expect(
       after.pxPerMs,
-      'committed pxPerMs increased by the gesture',
+      'pxPerMs strictly increased across the zoom burst',
     ).toBeGreaterThan(before.pxPerMs * 1.5)
 
-    const afterDriftPx = Math.abs(msUnderCursor(after) - msBefore) * after.pxPerMs
-    expect(afterDriftPx, 'post-commit anchor stays under cursor').toBeLessThan(2)
+    const afterDriftPx =
+      Math.abs(msUnderCursor(after) - msBefore) * after.pxPerMs
+    expect(afterDriftPx, 'anchor stays pinned under the cursor').toBeLessThan(2)
   })
 
   test('WASD keyboard shortcuts drive zoom and pan', async ({page}) => {
@@ -258,8 +223,6 @@ test.describe('Timeline interaction performance', () => {
           scrollLeft: t.scrollLeft,
           labelWidthPx: t.labelWidthPx,
           timelineStart: t.timelineStart,
-          effectiveScale: t.effectiveScale,
-          effectiveTranslatePx: t.effectiveTranslatePx,
           scrollerRect: t.scrollerRect!,
         }
       })
@@ -267,16 +230,15 @@ test.describe('Timeline interaction performance', () => {
     // ---- W zooms in, anchored near the viewport center. ------------------
     const before = await readSnapshot()
     // Tap W several times. Browser auto-repeat isn't triggered by .press,
-    // but 8 discrete presses still exercise the accumulator.
+    // but 8 discrete presses still exercise the zoom path end-to-end.
     for (let i = 0; i < 8; i++) await page.keyboard.press('w')
-    await page.waitForTimeout(350) // past the 250ms commit debounce
+    await page.waitForTimeout(48) // let the last render + scrollLeft write land
 
     const afterZoomIn = await readSnapshot()
     expect(
       afterZoomIn.pxPerMs,
-      'W zooms in (committed pxPerMs increased)',
+      'W zooms in (pxPerMs increased)',
     ).toBeGreaterThan(before.pxPerMs * 1.5)
-    expect(afterZoomIn.effectiveScale).toBe(1)
     // With cursor off-surface, anchor is viewport center. The ms that was
     // at center before must still be at center afterwards (≤2px drift).
     const centerX =
@@ -292,7 +254,7 @@ test.describe('Timeline interaction performance', () => {
 
     // ---- S zooms back out. ----------------------------------------------
     for (let i = 0; i < 8; i++) await page.keyboard.press('s')
-    await page.waitForTimeout(350)
+    await page.waitForTimeout(48)
     const afterZoomOut = await readSnapshot()
     expect(
       afterZoomOut.pxPerMs,
@@ -302,9 +264,8 @@ test.describe('Timeline interaction performance', () => {
     // ---- D pans right, A pans left. -------------------------------------
     const preD = await readSnapshot()
     await page.keyboard.press('d')
-    // Pan is synchronous scrollLeft mutation; the rAF-debounced scroll
-    // listener in Timeline takes ~one frame to update state, so give it
-    // a moment.
+    // Pan is a synchronous scrollLeft mutation; the rAF-throttled scroll
+    // listener in Timeline takes ~one frame to update React state.
     await page.waitForTimeout(48)
     const afterD = await readSnapshot()
     expect(
@@ -344,6 +305,6 @@ test.describe('Timeline interaction performance', () => {
     expect(
       report.metrics.scripting,
       'vertical scroll scripting within budget',
-    ).toBeLessThan(700)
+    ).toBeLessThan(400)
   })
 })

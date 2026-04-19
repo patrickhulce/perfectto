@@ -11,6 +11,7 @@ import type {
   TraceMetadata,
   TraceSource,
 } from '../../types'
+import {buildMarkBuffers, buildSliceBuffers} from '../../render/sliceBuffers'
 import {yieldToEventLoop} from '../../utils/yieldToEventLoop'
 import type {FinalizeOptions, TraceParser} from '../types'
 import {
@@ -289,6 +290,12 @@ export class ChromeParser implements TraceParser {
 
       for (const track of tracks) {
         finalizeContainer(track)
+        // Once containers are sorted + maxEnd-tagged, flatten the whole
+        // subtree into typed arrays. This is the data the canvas renderer
+        // actually reads; the Measure[] tree sticks around as the source of
+        // truth for the Aggregator / hover panes.
+        track.buffers = buildSliceBuffers(track)
+        track.markBuffers = buildMarkBuffers(track)
       }
 
       systems.push({

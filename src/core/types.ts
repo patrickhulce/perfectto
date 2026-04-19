@@ -42,6 +42,15 @@ export interface Track extends TimelineContainer {
   id: string
   name: string
   category?: string
+  /**
+   * Optional flat struct-of-arrays view of the track's entire subtree, built
+   * by the parser at finalize time. The canvas renderer consumes this
+   * directly — it's O(1) to hand to the GPU and amortizes all per-measure
+   * work (color packing, depth, sort) onto the parse phase.
+   */
+  buffers?: import('./render/sliceBuffers').SliceBuffers
+  /** Matching flat view for the track's marks. */
+  markBuffers?: import('./render/sliceBuffers').MarkBuffers
 }
 
 export interface System {
