@@ -1,42 +1,55 @@
+import {memo} from 'react'
 import Track from './Track'
-import {LABEL_WIDTH_PX, type SystemLayout} from './Timeline'
-import type {Viewport} from './timeline/useTimelineViewport'
+import type {SystemLayout} from './Timeline'
 
 interface TimelineSystemProps {
   layout: SystemLayout
-  viewport: Viewport
+  timelineStartMs: number
+  pxPerMs: number
+  labelWidthPx: number
+  visibleStartMs: number
+  visibleEndMs: number
   viewportTopPx: number
   viewportBottomPx: number
   onToggle: () => void
   onToggleTrack: (trackId: string) => void
 }
 
-export default function TimelineSystem({
+function TimelineSystem({
   layout,
-  viewport,
+  timelineStartMs,
+  pxPerMs,
+  labelWidthPx,
+  visibleStartMs,
+  visibleEndMs,
   viewportTopPx,
   viewportBottomPx,
   onToggle,
   onToggleTrack,
 }: TimelineSystemProps) {
-  const {system, topPx, headerHeightPx, expanded, tracks} = layout
+  const {system, topPx, headerHeightPx, heightPx, expanded, tracks} = layout
 
   return (
     <div
       className="absolute left-0 right-0 border-b border-[#2d3748]"
-      style={{top: topPx}}
+      style={{top: topPx, height: heightPx}}
     >
       <button
         type="button"
         onClick={onToggle}
         data-no-pan
-        className="flex w-full cursor-pointer items-center gap-2 bg-[#1a202c] px-4 py-2 text-left text-sm font-semibold text-[#e2e8f0] hover:bg-[#232b3a]"
-        style={{height: headerHeightPx}}
+        className="absolute left-0 right-0 top-0 flex cursor-pointer items-center bg-[#1a202c] text-left text-sm font-semibold text-[#e2e8f0] hover:bg-[#232b3a]"
+        style={{height: headerHeightPx, zIndex: 2}}
       >
-        <span className="inline-block w-3 text-[#718096]">{expanded ? '▾' : '▸'}</span>
-        <span>{system.name}</span>
-        <span className="text-xs font-normal text-[#718096]">
-          {system.tracks.length} track{system.tracks.length === 1 ? '' : 's'}
+        <span
+          className="sticky left-0 flex items-center gap-2 px-4 py-2"
+          style={{minWidth: labelWidthPx}}
+        >
+          <span className="inline-block w-3 text-[#718096]">{expanded ? '▾' : '▸'}</span>
+          <span>{system.name}</span>
+          <span className="text-xs font-normal text-[#718096]">
+            {system.tracks.length} track{system.tracks.length === 1 ? '' : 's'}
+          </span>
         </span>
       </button>
       {expanded &&
@@ -51,9 +64,12 @@ export default function TimelineSystem({
             >
               <Track
                 track={tl.track}
-                viewport={viewport}
+                timelineStartMs={timelineStartMs}
+                pxPerMs={pxPerMs}
+                labelWidthPx={labelWidthPx}
+                visibleStartMs={visibleStartMs}
+                visibleEndMs={visibleEndMs}
                 heightPx={tl.heightPx}
-                labelWidthPx={LABEL_WIDTH_PX}
                 expanded={tl.expanded}
                 onToggle={() => onToggleTrack(tl.track.id)}
               />
@@ -63,3 +79,5 @@ export default function TimelineSystem({
     </div>
   )
 }
+
+export default memo(TimelineSystem)

@@ -1,13 +1,17 @@
+import {memo} from 'react'
 import type {Mark, Measure, TimelineContainer, Track as TrackModel} from '../core'
 import {lowerBoundByStart, lowerBoundByTime} from './timeline/binarySearch'
 import {ROW_HEIGHT} from './timeline/trackLayout'
-import type {Viewport} from './timeline/useTimelineViewport'
 
 interface TrackProps {
   track: TrackModel
-  viewport: Viewport
-  heightPx: number
+  timelineStartMs: number
+  pxPerMs: number
   labelWidthPx: number
+  /** Deferred visible window (in ms). Used for binary-search culling. */
+  visibleStartMs: number
+  visibleEndMs: number
+  heightPx: number
   /**
    * When false, recursion stops at depth 1 — i.e. the track still shows a
    * single row of its direct children, but grandchildren and below are
@@ -25,11 +29,14 @@ interface TrackProps {
  */
 const MIN_MEASURE_PX = 1
 
-export default function Track({
+function Track({
   track,
-  viewport,
-  heightPx,
+  timelineStartMs,
+  pxPerMs,
   labelWidthPx,
+  visibleStartMs,
+  visibleEndMs,
+  heightPx,
   expanded = true,
   onToggle,
 }: TrackProps) {
@@ -37,8 +44,8 @@ export default function Track({
   const canToggle = !!onToggle
   return (
     <div
-      className="flex border-b border-[#1a202c] bg-[#11151d]"
-      style={{height: heightPx}}
+      className="relative border-b border-[#1a202c] bg-[#11151d]"
+      style={{height: heightPx, width: '100%'}}
     >
       <button
         type="button"
@@ -46,10 +53,17 @@ export default function Track({
         disabled={!canToggle}
         data-no-pan
         className={
-          'flex shrink-0 items-start gap-1 border-r border-[#2d3748] px-2 py-2 text-left text-xs text-[#a0aec0]' +
+          'flex items-start gap-1 border-r border-[#2d3748] bg-[#11151d] px-2 py-2 text-left text-xs text-[#a0aec0]' +
           (canToggle ? ' cursor-pointer hover:bg-[#151b25]' : ' cursor-default')
         }
-        style={{width: labelWidthPx}}
+        style={{
+          position: 'sticky',
+          left: 0,
+          top: 0,
+          zIndex: 1,
+          width: labelWidthPx,
+          height: heightPx,
+        }}
       >
         <span
           aria-hidden
@@ -66,26 +80,43 @@ export default function Track({
           )}
         </span>
       </button>
-      <div className="relative flex-1 overflow-hidden">
-        <ContainerContents
-          container={track}
-          viewport={viewport}
-          depth={0}
-          maxDepth={maxDepth}
-        />
-      </div>
+      <ContainerContents
+        container={track}
+        timelineStartMs={timelineStartMs}
+        pxPerMs={pxPerMs}
+        labelWidthPx={labelWidthPx}
+        visibleStartMs={visibleStartMs}
+        visibleEndMs={visibleEndMs}
+        depth={0}
+        maxDepth={maxDepth}
+      />
     </div>
   )
 }
 
+export default memo(Track)
+
 interface ContainerContentsProps {
   container: TimelineContainer
-  viewport: Viewport
+  timelineStartMs: number
+  pxPerMs: number
+  labelWidthPx: number
+  visibleStartMs: number
+  visibleEndMs: number
   depth: number
   maxDepth: number
 }
 
-function ContainerContents({container, viewport, depth, maxDepth}: ContainerContentsProps) {
+function ContainerContents({
+  container,
+  timelineStartMs,
+  pxPerMs,
+  labelWidthPx,
+  visibleStartMs,
+  visibleEndMs,
+  depth,
+  maxDepth,
+}: ContainerContentsProps) {
   if (depth >= maxDepth) return null
   const {measures, marks} = container
   const nodes: React.ReactNode[] = []
@@ -93,26 +124,30 @@ function ContainerContents({container, viewport, depth, maxDepth}: ContainerCont
   // ------- Measures: binary search + iterate until past the viewport. -------
   // measures are sorted by `start` asc during parse finalize.
   const firstIdx = measures.length
-    ? Math.max(0, lowerBoundByStart(measures, viewport.startMs) - 1)
+    ? Math.max(0, lowerBoundByStart(measures, visibleStartMs) - 1)
     : 0
 
   for (let i = firstIdx; i < measures.length; i++) {
     const m = measures[i]
-    if (m.start > viewport.endMs) break
-    if (m.end < viewport.startMs) continue
+    if (m.start > visibleEndMs) break
+    if (m.end < visibleStartMs) continue
     // maxEnd lets us prune whole subtrees that are technically ordered
     // before the viewport but whose children live even further behind.
     const subtreeEnd = m.maxEnd !== undefined ? Math.max(m.end, m.maxEnd) : m.end
-    if (subtreeEnd < viewport.startMs) continue
+    if (subtreeEnd < visibleStartMs) continue
 
-    const widthPx = (m.end - m.start) * viewport.pxPerMs
+    const widthPx = (m.end - m.start) * pxPerMs
     if (widthPx <= MIN_MEASURE_PX) continue // skip the measure AND its subtree
 
     nodes.push(
       <MeasureView
         key={m.id}
         measure={m}
-        viewport={viewport}
+        timelineStartMs={timelineStartMs}
+        pxPerMs={pxPerMs}
+        labelWidthPx={labelWidthPx}
+        visibleStartMs={visibleStartMs}
+        visibleEndMs={visibleEndMs}
         depth={depth}
         maxDepth={maxDepth}
       />,
@@ -120,11 +155,20 @@ function ContainerContents({container, viewport, depth, maxDepth}: ContainerCont
   }
 
   // ------- Marks: same lower-bound idea. -------
-  const firstMarkIdx = marks.length ? lowerBoundByTime(marks, viewport.startMs) : 0
+  const firstMarkIdx = marks.length ? lowerBoundByTime(marks, visibleStartMs) : 0
   for (let i = firstMarkIdx; i < marks.length; i++) {
     const mk = marks[i]
-    if (mk.time > viewport.endMs) break
-    nodes.push(<MarkView key={mk.id} mark={mk} viewport={viewport} depth={depth} />)
+    if (mk.time > visibleEndMs) break
+    nodes.push(
+      <MarkView
+        key={mk.id}
+        mark={mk}
+        timelineStartMs={timelineStartMs}
+        pxPerMs={pxPerMs}
+        labelWidthPx={labelWidthPx}
+        depth={depth}
+      />,
+    )
   }
 
   return <>{nodes}</>
@@ -132,25 +176,37 @@ function ContainerContents({container, viewport, depth, maxDepth}: ContainerCont
 
 interface MeasureViewProps {
   measure: Measure
-  viewport: Viewport
+  timelineStartMs: number
+  pxPerMs: number
+  labelWidthPx: number
+  visibleStartMs: number
+  visibleEndMs: number
   depth: number
   maxDepth: number
 }
 
-function MeasureView({measure, viewport, depth, maxDepth}: MeasureViewProps) {
-  const leftPx = viewport.timeToPx(measure.start)
-  const rawWidthPx = (measure.end - measure.start) * viewport.pxPerMs
+function MeasureView({
+  measure,
+  timelineStartMs,
+  pxPerMs,
+  labelWidthPx,
+  visibleStartMs,
+  visibleEndMs,
+  depth,
+  maxDepth,
+}: MeasureViewProps) {
+  const leftPx = labelWidthPx + (measure.start - timelineStartMs) * pxPerMs
+  const rawWidthPx = (measure.end - measure.start) * pxPerMs
   const widthPx = Math.max(rawWidthPx, 1)
 
   return (
     <>
       <div
         title={`${measure.name} (${measure.start.toFixed(1)}–${measure.end.toFixed(1)} ms)`}
-        className="absolute overflow-hidden rounded-sm border border-black/30 px-1 text-[11px] leading-[18px] text-white/90 shadow-sm"
+        className="absolute left-0 top-0 overflow-hidden rounded-sm border border-black/30 px-1 text-[11px] leading-[18px] text-white/90 shadow-sm"
         style={{
-          transform: `translateX(${leftPx}px)`,
+          transform: `translateX(${leftPx}px) translateY(${depth * ROW_HEIGHT + 4}px)`,
           width: widthPx,
-          top: depth * ROW_HEIGHT + 4,
           height: ROW_HEIGHT - 4,
           backgroundColor: measure.color ?? '#4a5568',
         }}
@@ -159,7 +215,11 @@ function MeasureView({measure, viewport, depth, maxDepth}: MeasureViewProps) {
       </div>
       <ContainerContents
         container={measure}
-        viewport={viewport}
+        timelineStartMs={timelineStartMs}
+        pxPerMs={pxPerMs}
+        labelWidthPx={labelWidthPx}
+        visibleStartMs={visibleStartMs}
+        visibleEndMs={visibleEndMs}
         depth={depth + 1}
         maxDepth={maxDepth}
       />
@@ -169,19 +229,20 @@ function MeasureView({measure, viewport, depth, maxDepth}: MeasureViewProps) {
 
 interface MarkViewProps {
   mark: Mark
-  viewport: Viewport
+  timelineStartMs: number
+  pxPerMs: number
+  labelWidthPx: number
   depth: number
 }
 
-function MarkView({mark, viewport, depth}: MarkViewProps) {
-  const leftPx = viewport.timeToPx(mark.time)
+function MarkView({mark, timelineStartMs, pxPerMs, labelWidthPx, depth}: MarkViewProps) {
+  const leftPx = labelWidthPx + (mark.time - timelineStartMs) * pxPerMs
   return (
     <div
       title={`${mark.name} @ ${mark.time.toFixed(1)} ms`}
-      className="absolute flex items-start"
+      className="absolute left-0 top-0 flex items-start"
       style={{
-        transform: `translateX(${leftPx - 1}px)`,
-        top: depth * ROW_HEIGHT + 2,
+        transform: `translateX(${leftPx - 1}px) translateY(${depth * ROW_HEIGHT + 2}px)`,
         height: ROW_HEIGHT,
       }}
     >

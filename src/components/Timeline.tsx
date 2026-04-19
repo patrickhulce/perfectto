@@ -1,7 +1,7 @@
-import {useCallback, useEffect, useMemo, useRef, useState} from 'react'
+import {useCallback, useDeferredValue, useEffect, useMemo, useRef, useState} from 'react'
 import type {System, Timeline as TimelineModel, Track as TrackModel} from '../core'
 import TimelineSystem from './TimelineSystem'
-import {useTimelineViewport, type Viewport} from './timeline/useTimelineViewport'
+import {useTimelineZoom} from './timeline/useTimelineViewport'
 import {containerDepth, ROW_HEIGHT} from './timeline/trackLayout'
 
 interface TimelineProps {
@@ -12,7 +12,7 @@ export const LABEL_WIDTH_PX = 192
 const SYSTEM_HEADER_HEIGHT_PX = 37
 const SYSTEM_BORDER_HEIGHT_PX = 1
 const TRACK_BORDER_HEIGHT_PX = 1
-const VERTICAL_OVERSCAN_PX = 200
+const MIN_SPAN_MS = 0.01
 /**
  * Floor for any track's vertical footprint. Keeps the two-line label
  * (name + category) from being clipped on shallow tracks, independent of
@@ -59,11 +59,11 @@ function systemHeightPx(
 
 export default function Timeline({timeline}: TimelineProps) {
   const scrollRef = useRef<HTMLDivElement | null>(null)
-  const trackRegionRef = useRef<HTMLDivElement | null>(null)
 
-  const [trackRegionWidthPx, setTrackRegionWidthPx] = useState(0)
-  const [scrollTop, setScrollTop] = useState(0)
+  const [viewportWidth, setViewportWidth] = useState(0)
   const [viewportHeight, setViewportHeight] = useState(0)
+  const [scrollLeft, setScrollLeft] = useState(0)
+  const [scrollTop, setScrollTop] = useState(0)
 
   const [systemExpanded, setSystemExpanded] = useState<Record<string, boolean>>({})
   const toggleSystem = useCallback((id: string) => {
@@ -76,12 +76,15 @@ export default function Timeline({timeline}: TimelineProps) {
   }, [])
 
   useEffect(() => {
-    const el = trackRegionRef.current
+    const el = scrollRef.current
     if (!el) return
-    const update = () => setTrackRegionWidthPx(el.clientWidth)
-    update()
+    const updateSize = () => {
+      setViewportWidth(el.clientWidth)
+      setViewportHeight(el.clientHeight)
+    }
+    updateSize()
     if (typeof ResizeObserver === 'undefined') return
-    const ro = new ResizeObserver(update)
+    const ro = new ResizeObserver(updateSize)
     ro.observe(el)
     return () => ro.disconnect()
   }, [])
@@ -89,27 +92,28 @@ export default function Timeline({timeline}: TimelineProps) {
   useEffect(() => {
     const el = scrollRef.current
     if (!el) return
-    const update = () => {
-      setScrollTop(el.scrollTop)
-      setViewportHeight(el.clientHeight)
+    let raf: number | null = null
+    const onScroll = () => {
+      if (raf !== null) return
+      raf = requestAnimationFrame(() => {
+        raf = null
+        setScrollLeft(el.scrollLeft)
+        setScrollTop(el.scrollTop)
+      })
     }
-    update()
-    el.addEventListener('scroll', update, {passive: true})
-    if (typeof ResizeObserver !== 'undefined') {
-      const ro = new ResizeObserver(update)
-      ro.observe(el)
-      return () => {
-        el.removeEventListener('scroll', update)
-        ro.disconnect()
-      }
+    onScroll()
+    el.addEventListener('scroll', onScroll, {passive: true})
+    return () => {
+      el.removeEventListener('scroll', onScroll)
+      if (raf !== null) cancelAnimationFrame(raf)
     }
-    return () => el.removeEventListener('scroll', update)
   }, [])
 
-  const {viewport, eventTargetRef} = useTimelineViewport({
+  const {pxPerMs, eventTargetRef} = useTimelineZoom({
     bounds: {start: timeline.start, end: timeline.end},
-    containerWidthPx: trackRegionWidthPx,
-    labelOffsetPx: LABEL_WIDTH_PX,
+    labelWidthPx: LABEL_WIDTH_PX,
+    containerWidthPx: viewportWidth,
+    scrollerRef: scrollRef,
   })
 
   // Precompute vertical layout with current expanded state.
@@ -137,8 +141,46 @@ export default function Timeline({timeline}: TimelineProps) {
     return {items, totalHeightPx: y}
   }, [timeline.systems, systemExpanded, trackExpanded])
 
-  const visibleTop = scrollTop - VERTICAL_OVERSCAN_PX
-  const visibleBottom = scrollTop + viewportHeight + VERTICAL_OVERSCAN_PX
+  const totalSpanMs = Math.max(timeline.end - timeline.start, MIN_SPAN_MS)
+  const innerWidthPx = LABEL_WIDTH_PX + totalSpanMs * pxPerMs
+
+  // Scroll + size inputs are deferred so the scroll event thread never blocks
+  // on the expensive culling/measure-layout render. React 19 renders the new
+  // culled output as a low-priority transition while translateX keeps the
+  // already-mounted DOM moving at 60fps.
+  const deferredScrollLeft = useDeferredValue(scrollLeft)
+  const deferredScrollTop = useDeferredValue(scrollTop)
+  const deferredViewportWidth = useDeferredValue(viewportWidth)
+  const deferredViewportHeight = useDeferredValue(viewportHeight)
+
+  const horizontalOverscanPx = Math.max(200, deferredViewportWidth * 0.5)
+  const verticalOverscanPx = Math.max(200, deferredViewportHeight * 0.5)
+
+  const visibleTop = deferredScrollTop - verticalOverscanPx
+  const visibleBottom = deferredScrollTop + deferredViewportHeight + verticalOverscanPx
+
+  const visibleStartMs = useMemo(() => {
+    if (pxPerMs <= 0) return timeline.start
+    const raw =
+      timeline.start + (deferredScrollLeft - horizontalOverscanPx - LABEL_WIDTH_PX) / pxPerMs
+    return Math.max(timeline.start, raw)
+  }, [deferredScrollLeft, horizontalOverscanPx, pxPerMs, timeline.start])
+
+  const visibleEndMs = useMemo(() => {
+    if (pxPerMs <= 0) return timeline.end
+    const raw =
+      timeline.start +
+      (deferredScrollLeft + deferredViewportWidth + horizontalOverscanPx - LABEL_WIDTH_PX) /
+        pxPerMs
+    return Math.min(timeline.end, raw)
+  }, [
+    deferredScrollLeft,
+    deferredViewportWidth,
+    horizontalOverscanPx,
+    pxPerMs,
+    timeline.start,
+    timeline.end,
+  ])
 
   const visibleSystems = useMemo(() => {
     return layout.items.filter(
@@ -148,36 +190,21 @@ export default function Timeline({timeline}: TimelineProps) {
 
   return (
     <div ref={scrollRef} className="relative flex-1 overflow-auto">
-      {/*
-        Zoom + pan gestures are captured on this inner wrapper so they work
-        anywhere over the timeline (including over measures and system
-        headers). The label gutter offset is passed into the viewport hook
-        so cursor-to-time math still anchors to the track region.
-      */}
       <div
         ref={eventTargetRef}
         data-testid="timeline-event-surface"
-        className="relative touch-none"
-        style={{minWidth: '100%', height: layout.totalHeightPx}}
+        className="relative"
+        style={{width: innerWidthPx, height: layout.totalHeightPx}}
       >
-        {/* Sizer row: fixed label column + flex track region the viewport measures. */}
-        <div
-          className="pointer-events-none absolute left-0 right-0 top-0 flex"
-          style={{height: 0}}
-          aria-hidden
-        >
-          <div style={{width: LABEL_WIDTH_PX, flex: '0 0 auto'}} />
-          <div
-            ref={trackRegionRef}
-            style={{flex: '1 1 auto'}}
-          />
-        </div>
-
         {visibleSystems.map(item => (
           <TimelineSystem
             key={item.system.id}
             layout={item}
-            viewport={viewport}
+            timelineStartMs={timeline.start}
+            pxPerMs={pxPerMs}
+            labelWidthPx={LABEL_WIDTH_PX}
+            visibleStartMs={visibleStartMs}
+            visibleEndMs={visibleEndMs}
             viewportTopPx={visibleTop}
             viewportBottomPx={visibleBottom}
             onToggle={() => toggleSystem(item.system.id)}
@@ -188,5 +215,3 @@ export default function Timeline({timeline}: TimelineProps) {
     </div>
   )
 }
-
-export type {Viewport}

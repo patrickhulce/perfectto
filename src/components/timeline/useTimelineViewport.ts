@@ -1,152 +1,121 @@
-import {useCallback, useEffect, useLayoutEffect, useRef, useState} from 'react'
-
-export interface Viewport {
-  /** Leftmost visible time in ms. */
-  startMs: number
-  /** Rightmost visible time in ms. */
-  endMs: number
-  /** Derived: containerWidthPx / (end - start). */
-  pxPerMs: number
-  /** Width of the track region in pixels (excluding any label gutter). */
-  containerWidthPx: number
-  timeToPx: (t: number) => number
-}
+import {useCallback, useEffect, useRef, useState, type RefObject} from 'react'
 
 export interface TimelineBounds {
   start: number
   end: number
 }
 
-export interface UseTimelineViewportOptions {
+export interface UseTimelineZoomOptions {
   bounds: TimelineBounds
   /**
-   * Current pixel width of the track region (i.e. the space events will be
-   * laid out in). Caller is responsible for measuring this, since in our
-   * layout the track region sits next to a fixed-width label gutter.
+   * Width of the label gutter in pixels. Measures are positioned starting at
+   * `labelWidthPx` so the sticky label sits cleanly to the left of them.
+   */
+  labelWidthPx: number
+  /**
+   * Current pixel width of the outer scroll container. Used to compute the
+   * initial "fit" zoom so the full trace fills the viewport before the user
+   * zooms manually.
    */
   containerWidthPx: number
   /**
-   * Horizontal offset from the left edge of the event target element to the
-   * start of the track region. When the event target spans the full timeline
-   * width (including the label gutter), set this to the gutter width so the
-   * cursor-to-time math anchors correctly.
+   * Ref to the scroll container whose `scrollLeft` represents pan.
+   * Ctrl/meta + wheel zoom and left-button drag update this directly.
    */
-  labelOffsetPx?: number
+  scrollerRef: RefObject<HTMLElement | null>
 }
 
-export interface UseTimelineViewportResult {
-  viewport: Viewport
-  /** Attach to the element that should receive wheel + pointer events. */
+export interface UseTimelineZoomResult {
+  pxPerMs: number
+  /** Attach to the element that should receive wheel + pointer gestures. */
   eventTargetRef: (el: HTMLElement | null) => void
-}
-
-interface ViewportRange {
-  startMs: number
-  endMs: number
 }
 
 const MIN_SPAN_MS = 0.01
 /** Hard cap on zoom-in so we never divide by ~zero. */
 const MAX_PX_PER_MS = 1e6
+/**
+ * Soft cap on the total inner-surface width. Browsers differ, but ~20M px is a
+ * safe ceiling across Chromium/Safari/Firefox. We clamp `pxPerMs` so
+ * `totalSpan * pxPerMs` stays under this.
+ */
+const MAX_CONTENT_WIDTH_PX = 20_000_000
 
-export function useTimelineViewport(
-  options: UseTimelineViewportOptions,
-): UseTimelineViewportResult {
-  const {bounds, containerWidthPx, labelOffsetPx = 0} = options
+function clampPxPerMs(value: number, totalSpan: number): number {
+  const maxByWidth =
+    totalSpan > 0 ? MAX_CONTENT_WIDTH_PX / totalSpan : MAX_PX_PER_MS
+  const lo = 1e-9
+  const hi = Math.min(MAX_PX_PER_MS, maxByWidth)
+  if (!Number.isFinite(value) || value <= 0) return lo
+  return Math.max(lo, Math.min(hi, value))
+}
 
-  const [range, setRange] = useState<ViewportRange>({
-    startMs: bounds.start,
-    endMs: bounds.end,
-  })
+export function useTimelineZoom(
+  options: UseTimelineZoomOptions,
+): UseTimelineZoomResult {
+  const {bounds, labelWidthPx, containerWidthPx, scrollerRef} = options
 
-  const widthRef = useRef(containerWidthPx)
-  widthRef.current = containerWidthPx
-  const rangeRef = useRef(range)
-  rangeRef.current = range
+  const totalSpan = Math.max(bounds.end - bounds.start, MIN_SPAN_MS)
+  const fitPxPerMs = containerWidthPx > 0 ? containerWidthPx / totalSpan : 0
+
+  // `null` means "follow the fit zoom". As soon as the user zooms, we pin
+  // `pxPerMs` explicitly and ignore subsequent container-width changes.
+  const [pxPerMsOverride, setPxPerMsOverride] = useState<number | null>(null)
+  const pxPerMs = pxPerMsOverride ?? fitPxPerMs
+
+  // When the underlying trace changes, reset to fit.
+  useEffect(() => {
+    setPxPerMsOverride(null)
+  }, [bounds.start, bounds.end])
+
+  const pxPerMsRef = useRef(pxPerMs)
+  pxPerMsRef.current = pxPerMs
   const boundsRef = useRef(bounds)
   boundsRef.current = bounds
-  const labelOffsetRef = useRef(labelOffsetPx)
-  labelOffsetRef.current = labelOffsetPx
+  const labelWidthRef = useRef(labelWidthPx)
+  labelWidthRef.current = labelWidthPx
 
   const [eventEl, setEventEl] = useState<HTMLElement | null>(null)
   const eventTargetRef = useCallback((el: HTMLElement | null) => {
     setEventEl(el)
   }, [])
 
-  useLayoutEffect(() => {
-    setRange({startMs: bounds.start, endMs: bounds.end})
-  }, [bounds.start, bounds.end])
-
   useEffect(() => {
     const el = eventEl
     if (!el) return
 
-    const clampRange = (next: ViewportRange): ViewportRange => {
-      const b = boundsRef.current
-      const minSpan = Math.max(widthRef.current / MAX_PX_PER_MS, MIN_SPAN_MS)
-      let {startMs, endMs} = next
-      if (endMs - startMs < minSpan) endMs = startMs + minSpan
-      const totalSpan = Math.max(b.end - b.start, MIN_SPAN_MS)
-      const visibleSpan = Math.min(endMs - startMs, totalSpan)
-      if (visibleSpan !== endMs - startMs) {
-        endMs = startMs + visibleSpan
-      }
-      if (startMs < b.start) {
-        const shift = b.start - startMs
-        startMs += shift
-        endMs += shift
-      }
-      if (endMs > b.end) {
-        const shift = endMs - b.end
-        startMs -= shift
-        endMs -= shift
-      }
-      return {startMs, endMs}
-    }
-
     const onWheel = (e: WheelEvent): void => {
+      const scroller = scrollerRef.current
+      if (!scroller) return
       const zooming = e.ctrlKey || e.metaKey
-      const horizontal = Math.abs(e.deltaX) > Math.abs(e.deltaY)
+      if (!zooming) return // native scroll handles pan in both axes
+      e.preventDefault()
 
-      if (zooming) {
-        // Always swallow ctrl/meta + wheel so the browser never zooms the
-        // whole page (which would change vertical layout too). Zoom is a
-        // horizontal-only affordance here.
-        e.preventDefault()
-        if (widthRef.current <= 0) return
-        const rect = el.getBoundingClientRect()
-        const cursorPx = Math.max(
-          0,
-          Math.min(e.clientX - rect.left - labelOffsetRef.current, widthRef.current),
-        )
-        const {startMs, endMs} = rangeRef.current
-        const spanMs = endMs - startMs
-        const anchorMs = startMs + (cursorPx / widthRef.current) * spanMs
-        const scale = Math.exp(e.deltaY * 0.0015)
-        const nextSpan = Math.max(spanMs * scale, widthRef.current / MAX_PX_PER_MS)
-        const ratio = cursorPx / widthRef.current
-        const nextStart = anchorMs - ratio * nextSpan
-        const nextEnd = nextStart + nextSpan
-        setRange(prev => {
-          const clamped = clampRange({startMs: nextStart, endMs: nextEnd})
-          if (clamped.startMs === prev.startMs && clamped.endMs === prev.endMs) return prev
-          return clamped
-        })
-        return
-      }
+      const rect = scroller.getBoundingClientRect()
+      const cursorXInViewport = Math.max(
+        0,
+        Math.min(e.clientX - rect.left, scroller.clientWidth),
+      )
+      const labelWidth = labelWidthRef.current
+      const innerX = scroller.scrollLeft + cursorXInViewport
+      const trackX = innerX - labelWidth
+      const b = boundsRef.current
+      const span = Math.max(b.end - b.start, MIN_SPAN_MS)
+      const current = pxPerMsRef.current
+      const anchorMs =
+        current > 0
+          ? b.start + Math.max(0, trackX) / current
+          : b.start
 
-      if (widthRef.current <= 0) return
-      if (e.shiftKey || horizontal) {
-        e.preventDefault()
-        const {startMs, endMs} = rangeRef.current
-        const spanMs = endMs - startMs
-        const delta = ((horizontal ? e.deltaX : e.deltaY) / widthRef.current) * spanMs
-        setRange(prev => {
-          const next = clampRange({startMs: prev.startMs + delta, endMs: prev.endMs + delta})
-          if (next.startMs === prev.startMs) return prev
-          return next
-        })
-      }
+      const scale = Math.exp(e.deltaY * 0.0015)
+      const next = clampPxPerMs(current / scale, span)
+      if (next === current) return
+
+      // Keep the anchor ms pinned under the cursor after the zoom.
+      const newTrackX = (anchorMs - b.start) * next
+      const newScrollLeft = newTrackX + labelWidth - cursorXInViewport
+      setPxPerMsOverride(next)
+      scroller.scrollLeft = newScrollLeft
     }
 
     // Safari trackpad pinch dispatches gesture events instead of ctrl+wheel;
@@ -156,18 +125,19 @@ export function useTimelineViewport(
     }
 
     let panning:
-      | {pointerId: number; startClientX: number; startRange: ViewportRange}
+      | {pointerId: number; startClientX: number; startScrollLeft: number}
       | null = null
 
     const onPointerDown = (e: PointerEvent): void => {
       if (e.button !== 0) return
       const target = e.target as HTMLElement | null
       if (target?.closest('button, input, textarea, [data-no-pan]')) return
-      if (widthRef.current <= 0) return
+      const scroller = scrollerRef.current
+      if (!scroller) return
       panning = {
         pointerId: e.pointerId,
         startClientX: e.clientX,
-        startRange: rangeRef.current,
+        startScrollLeft: scroller.scrollLeft,
       }
       try {
         el.setPointerCapture(e.pointerId)
@@ -178,16 +148,11 @@ export function useTimelineViewport(
 
     const onPointerMove = (e: PointerEvent): void => {
       if (!panning || e.pointerId !== panning.pointerId) return
+      const scroller = scrollerRef.current
+      if (!scroller) return
       const dx = e.clientX - panning.startClientX
       if (dx === 0) return
-      const spanMs = panning.startRange.endMs - panning.startRange.startMs
-      const deltaMs = -(dx / widthRef.current) * spanMs
-      setRange(() =>
-        clampRange({
-          startMs: panning!.startRange.startMs + deltaMs,
-          endMs: panning!.startRange.endMs + deltaMs,
-        }),
-      )
+      scroller.scrollLeft = panning.startScrollLeft - dx
     }
 
     const endPan = (e: PointerEvent): void => {
@@ -219,21 +184,7 @@ export function useTimelineViewport(
       el.removeEventListener('gesturechange', onGesture as EventListener)
       el.removeEventListener('gestureend', onGesture as EventListener)
     }
-  }, [eventEl])
+  }, [eventEl, scrollerRef])
 
-  const effectiveSpan = Math.max(range.endMs - range.startMs, MIN_SPAN_MS)
-  const pxPerMs = containerWidthPx > 0 ? containerWidthPx / effectiveSpan : 0
-  const {startMs, endMs} = range
-  const timeToPx = (t: number): number => (t - startMs) * pxPerMs
-
-  return {
-    viewport: {
-      startMs,
-      endMs,
-      pxPerMs,
-      containerWidthPx,
-      timeToPx,
-    },
-    eventTargetRef,
-  }
+  return {pxPerMs, eventTargetRef}
 }

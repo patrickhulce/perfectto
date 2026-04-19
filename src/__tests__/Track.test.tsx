@@ -1,7 +1,6 @@
 import {render} from '@testing-library/react'
 import Track from '../components/Track'
 import type {Measure, Track as TrackModel} from '../core'
-import type {Viewport} from '../components/timeline/useTimelineViewport'
 
 function makeMeasure(partial: Partial<Measure> & {id: string; start: number; end: number}): Measure {
   return {
@@ -26,18 +25,29 @@ function makeTrack(measures: Measure[]): TrackModel {
   }
 }
 
-function viewport(partial: Partial<Viewport>): Viewport {
+interface ViewportShape {
+  startMs: number
+  endMs: number
+  containerWidthPx: number
+}
+
+function viewport(partial: Partial<ViewportShape>): {
+  timelineStartMs: number
+  pxPerMs: number
+  labelWidthPx: number
+  visibleStartMs: number
+  visibleEndMs: number
+} {
   const startMs = partial.startMs ?? 0
   const endMs = partial.endMs ?? 1000
   const containerWidthPx = partial.containerWidthPx ?? 1000
   const pxPerMs = containerWidthPx / Math.max(endMs - startMs, 0.01)
   return {
-    startMs,
-    endMs,
-    containerWidthPx,
+    timelineStartMs: 0,
     pxPerMs,
-    timeToPx: t => (t - startMs) * pxPerMs,
-    ...partial,
+    labelWidthPx: 100,
+    visibleStartMs: startMs,
+    visibleEndMs: endMs,
   }
 }
 
@@ -51,9 +61,8 @@ describe('Track', () => {
     const {container} = render(
       <Track
         track={track}
-        viewport={viewport({startMs: 50, endMs: 500, containerWidthPx: 1000})}
+        {...viewport({startMs: 50, endMs: 500, containerWidthPx: 1000})}
         heightPx={30}
-        labelWidthPx={100}
       />,
     )
     const measureEls = container.querySelectorAll('[title^="visible"], [title^="left-of"], [title^="right-of"]')
@@ -78,9 +87,8 @@ describe('Track', () => {
     const {container} = render(
       <Track
         track={makeTrack([tiny, visible])}
-        viewport={viewport({startMs: 0, endMs: 1000, containerWidthPx: 1000})}
+        {...viewport({startMs: 0, endMs: 1000, containerWidthPx: 1000})}
         heightPx={30}
-        labelWidthPx={100}
       />,
     )
     const titles = Array.from(container.querySelectorAll('[title]')).map(
@@ -97,9 +105,8 @@ describe('Track', () => {
       <Track
         track={makeTrack([small])}
         // At pxPerMs=100, a 0.5ms measure is 50px wide.
-        viewport={viewport({startMs: 99, endMs: 109, containerWidthPx: 1000})}
+        {...viewport({startMs: 99, endMs: 109, containerWidthPx: 1000})}
         heightPx={30}
-        labelWidthPx={100}
       />,
     )
     const titles = Array.from(container.querySelectorAll('[title]')).map(
@@ -119,9 +126,8 @@ describe('Track', () => {
     const {container} = render(
       <Track
         track={makeTrack([child])}
-        viewport={viewport({startMs: 0, endMs: 1000, containerWidthPx: 1000})}
+        {...viewport({startMs: 0, endMs: 1000, containerWidthPx: 1000})}
         heightPx={40}
-        labelWidthPx={100}
         expanded={false}
       />,
     )
