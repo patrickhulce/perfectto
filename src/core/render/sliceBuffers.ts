@@ -225,3 +225,306 @@ export function maxDepthPlusOne(buffers: SliceBuffers): number {
   }
   return buffers.count === 0 ? 0 : maxD + 1
 }
+
+// ---------------------------------------------------------------------------
+// Mipmap / LOD (Phase 2)
+// ---------------------------------------------------------------------------
+
+/**
+ * One level of a {@link SliceMipmap}. Shares the struct-of-arrays shape with
+ * {@link SliceBuffers} so the canvas renderer can consume either via the same
+ * hot loop. Merged buckets aggregate several source slices into a single rect
+ * whose alpha is modulated by density at draw time.
+ */
+export interface SliceMipmapLevel {
+  count: number
+  starts: Float32Array
+  ends: Float32Array
+  depths: Uint16Array
+  /** Packed `0xRRGGBBAA` of the dominant (longest) contributor per bucket. */
+  colors: Uint32Array
+  /** Non-decreasing running max of `ends[0..i]`, same semantics as SliceBuffers. */
+  maxEndsPrefix: Float32Array
+  /** Number of source slices aggregated into bucket `i` (1 for singletons). */
+  counts: Uint32Array
+  /**
+   * Index of the first source slice in {@link SliceMipmap.base} that
+   * contributed to this bucket. Phase 3.5 uses this to drill back to the raw
+   * slice under the cursor; Phase 2 itself never reads it at draw time.
+   */
+  sourceStart: Uint32Array
+  /** Minimum slice width preserved at this level, in ms. */
+  resolutionMs: number
+}
+
+/**
+ * LOD pyramid over a track's {@link SliceBuffers}. `levels` is ordered finest
+ * → coarsest (ascending `resolutionMs`). Empty when the base is empty.
+ */
+export interface SliceMipmap {
+  base: SliceBuffers
+  levels: SliceMipmapLevel[]
+}
+
+/** Smallest resolution we build a level for. 2^1 * 0.25ms = 0.5ms. */
+const MIPMAP_MIN_LEVEL = 1
+/** Coarsest level before we bail out. 2^16 * 0.25ms ≈ 16.4s. */
+const MIPMAP_MAX_LEVEL = 16
+/** ms-per-level-index; actual resolution is `MIPMAP_BASE_MS * 2^L`. */
+const MIPMAP_BASE_MS = 0.25
+/**
+ * Once a level has shrunk below this bucket count there's nothing meaningful
+ * left to aggregate — further levels would just be weaker copies of the same
+ * handful of rects.
+ */
+const MIPMAP_FLOOR_BUCKETS = 128
+
+/**
+ * Build a LOD pyramid over a base {@link SliceBuffers}. For each fixed power
+ * of two, walk the base per-depth (so nested rows never merge into a shared
+ * bucket) and collapse runs of sub-resolution slices into density buckets.
+ *
+ * Cost: O(n) per level × O(log n) levels before the 128-bucket floor kicks
+ * in. Memory: bounded by ~2× the base count in the geometric worst case
+ * because each level halves bucket count on dense traces.
+ */
+export function buildSliceMipmap(base: SliceBuffers): SliceMipmap {
+  if (base.count === 0) return {base, levels: []}
+
+  // Partition base indices by depth so per-depth bucketing stays cheap in the
+  // inner loop. Each row's indices are already sorted by start (pre-order
+  // walk on a sorted tree).
+  const perDepth = partitionByDepth(base)
+
+  const levels: SliceMipmapLevel[] = []
+  for (let L = MIPMAP_MIN_LEVEL; L <= MIPMAP_MAX_LEVEL; L++) {
+    const resolutionMs = MIPMAP_BASE_MS * 2 ** L
+    const level = buildMipmapLevel(base, perDepth, resolutionMs)
+    if (level.count === 0) break
+    levels.push(level)
+    if (level.count <= MIPMAP_FLOOR_BUCKETS) break
+  }
+
+  return {base, levels}
+}
+
+function partitionByDepth(base: SliceBuffers): Uint32Array[] {
+  const depths = base.depths
+  const count = base.count
+  let maxD = 0
+  for (let i = 0; i < count; i++) {
+    if (depths[i] > maxD) maxD = depths[i]
+  }
+  const rowCount = count === 0 ? 0 : maxD + 1
+  const sizes = new Uint32Array(rowCount)
+  for (let i = 0; i < count; i++) sizes[depths[i]] += 1
+  const rows: Uint32Array[] = new Array(rowCount)
+  for (let d = 0; d < rowCount; d++) rows[d] = new Uint32Array(sizes[d])
+  const cursors = new Uint32Array(rowCount)
+  for (let i = 0; i < count; i++) {
+    const d = depths[i]
+    rows[d][cursors[d]++] = i
+  }
+  return rows
+}
+
+/**
+ * Bucket one resolution level. A bucket is either a singleton (slice wider
+ * than `resolutionMs`, passed through untouched) or a density bucket
+ * (contiguous run of sub-resolution slices, possibly with small gaps under
+ * `resolutionMs`).
+ */
+function buildMipmapLevel(
+  base: SliceBuffers,
+  perDepth: Uint32Array[],
+  resolutionMs: number,
+): SliceMipmapLevel {
+  const starts = base.starts
+  const ends = base.ends
+  const colors = base.colors
+
+  // Worst case: no merges happen at this level and we emit base.count buckets.
+  // We allocate tight arrays at the end from the final count.
+  const tmpStarts: number[] = []
+  const tmpEnds: number[] = []
+  const tmpDepths: number[] = []
+  const tmpColors: number[] = []
+  const tmpCounts: number[] = []
+  const tmpSourceStart: number[] = []
+
+  for (let d = 0; d < perDepth.length; d++) {
+    const row = perDepth[d]
+    const rowLen = row.length
+    if (rowLen === 0) continue
+
+    let bucketOpen = false
+    let bStart = 0
+    let bEnd = 0
+    let bColor = 0
+    let bCount = 0
+    let bSourceStart = 0
+    let bDominantDur = -1
+
+    const flush = (): void => {
+      if (!bucketOpen) return
+      tmpStarts.push(bStart)
+      tmpEnds.push(bEnd)
+      tmpDepths.push(d)
+      tmpColors.push(bColor)
+      tmpCounts.push(bCount)
+      tmpSourceStart.push(bSourceStart)
+      bucketOpen = false
+      bDominantDur = -1
+    }
+
+    for (let k = 0; k < rowLen; k++) {
+      const i = row[k]
+      const s = starts[i]
+      const e = ends[i]
+      const width = e - s
+
+      if (width >= resolutionMs) {
+        // Wide slice: flush any open merged bucket, then emit this slice as a
+        // singleton. Not merged forward so wide siblings keep their identity.
+        flush()
+        tmpStarts.push(s)
+        tmpEnds.push(e)
+        tmpDepths.push(d)
+        tmpColors.push(colors[i])
+        tmpCounts.push(1)
+        tmpSourceStart.push(i)
+        continue
+      }
+
+      if (bucketOpen && s - bEnd < resolutionMs) {
+        if (e > bEnd) bEnd = e
+        bCount += 1
+        if (width > bDominantDur) {
+          bDominantDur = width
+          bColor = colors[i]
+        }
+      } else {
+        flush()
+        bucketOpen = true
+        bStart = s
+        bEnd = e
+        bColor = colors[i]
+        bCount = 1
+        bSourceStart = i
+        bDominantDur = width
+      }
+    }
+
+    flush()
+  }
+
+  const total = tmpStarts.length
+  if (total === 0) {
+    return {
+      count: 0,
+      starts: EMPTY_F32,
+      ends: EMPTY_F32,
+      depths: EMPTY_U16,
+      colors: EMPTY_U32,
+      maxEndsPrefix: EMPTY_F32,
+      counts: new Uint32Array(0),
+      sourceStart: new Uint32Array(0),
+      resolutionMs,
+    }
+  }
+
+  // Per-depth streams are each sorted by `start`; a stable merge across
+  // depths reproduces the global sort-by-start invariant the renderer needs
+  // for lowerBound culling. Argsort by (start asc, then depth asc) keeps
+  // output deterministic when two buckets share a start.
+  const order = new Uint32Array(total)
+  for (let i = 0; i < total; i++) order[i] = i
+  const orderArr: number[] = Array.from(order)
+  orderArr.sort((a, b) => {
+    const ds = tmpStarts[a] - tmpStarts[b]
+    if (ds !== 0) return ds
+    return tmpDepths[a] - tmpDepths[b]
+  })
+
+  const startsOut = new Float32Array(total)
+  const endsOut = new Float32Array(total)
+  const depthsOut = new Uint16Array(total)
+  const colorsOut = new Uint32Array(total)
+  const countsOut = new Uint32Array(total)
+  const sourceStartOut = new Uint32Array(total)
+  for (let i = 0; i < total; i++) {
+    const src = orderArr[i]
+    startsOut[i] = tmpStarts[src]
+    endsOut[i] = tmpEnds[src]
+    depthsOut[i] = tmpDepths[src]
+    colorsOut[i] = tmpColors[src]
+    countsOut[i] = tmpCounts[src]
+    sourceStartOut[i] = tmpSourceStart[src]
+  }
+
+  const maxEndsPrefix = new Float32Array(total)
+  let running = -Infinity
+  for (let i = 0; i < total; i++) {
+    const e = endsOut[i]
+    if (e > running) running = e
+    maxEndsPrefix[i] = running
+  }
+
+  return {
+    count: total,
+    starts: startsOut,
+    ends: endsOut,
+    depths: depthsOut,
+    colors: colorsOut,
+    maxEndsPrefix,
+    counts: countsOut,
+    sourceStart: sourceStartOut,
+    resolutionMs,
+  }
+}
+
+/**
+ * Shape that {@link drawFrame} accepts. Either a raw {@link SliceBuffers}
+ * (zoomed all the way in, or a track with no mipmap yet) or one
+ * {@link SliceMipmapLevel}. Both share the same core arrays; only mipmap
+ * levels carry `counts`/`sourceStart`.
+ */
+export type SliceView = SliceBuffers | SliceMipmapLevel
+
+/**
+ * Pick the coarsest level whose resolution still fits one pixel at `pxPerMs`.
+ *
+ * Zoomed in past every level's resolution we return the *finest* level
+ * rather than `mipmap.base`. The finest level is strictly more visible
+ * than base at any zoom: wide slices are already singletons with their
+ * exact width (so they render identically), and sub-resolution runs are
+ * density-merged into rects that never get sub-pixel-culled. Tracks made
+ * entirely of sub-ms measures (e.g. Chrome_ChildIOThread in our sample
+ * trace) would otherwise vanish the moment the user zoomed past the
+ * finest level's threshold, even though nothing in base would be wide
+ * enough to render.
+ *
+ * Base stays reachable via {@link SliceMipmap.base} for the Aggregator /
+ * future hit-test layer.
+ */
+export function pickMipmapLevel(
+  mipmap: SliceMipmap | undefined,
+  pxPerMs: number,
+): SliceView {
+  if (!mipmap) return EMPTY_SLICE_BUFFERS
+  if (mipmap.levels.length === 0) return mipmap.base
+  if (pxPerMs <= 0) return mipmap.levels[mipmap.levels.length - 1]
+  const pixelResolutionMs = 1 / pxPerMs
+  // Walk coarsest → finest so we pick the largest usable resolution.
+  for (let i = mipmap.levels.length - 1; i >= 0; i--) {
+    if (mipmap.levels[i].resolutionMs <= pixelResolutionMs) {
+      return mipmap.levels[i]
+    }
+  }
+  return mipmap.levels[0]
+}
+
+/** Narrow type guard: does this view carry per-bucket density counts? */
+export function hasDensityCounts(view: SliceView): view is SliceMipmapLevel {
+  return (view as SliceMipmapLevel).counts !== undefined
+}

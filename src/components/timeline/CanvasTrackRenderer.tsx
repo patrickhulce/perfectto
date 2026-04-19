@@ -3,6 +3,7 @@ import type {Track as TrackModel} from '../../core'
 import {
   EMPTY_MARK_BUFFERS,
   EMPTY_SLICE_BUFFERS,
+  pickMipmapLevel,
 } from '../../core/render/sliceBuffers'
 import {drawFrame} from './canvas2d'
 import type {ViewportStore} from './viewportStore'
@@ -90,9 +91,16 @@ function CanvasTrackRendererBase({
       const visibleStartMs = msAtCanvasLeft
       const visibleEndMs = msAtCanvasLeft + visibleDurationMs
 
+      // Pick the coarsest LOD level whose resolution fits one pixel. Falls
+      // back to the raw SliceBuffers when the user is zoomed in past the
+      // finest level, or when the parser didn't build a mipmap.
+      const slices = track.mipmap
+        ? pickMipmapLevel(track.mipmap, pxPerMs)
+        : track.buffers ?? EMPTY_SLICE_BUFFERS
+
       drawFrame({
         ctx,
-        buffers: track.buffers ?? EMPTY_SLICE_BUFFERS,
+        slices,
         marks: track.markBuffers ?? EMPTY_MARK_BUFFERS,
         widthCss,
         heightCss,

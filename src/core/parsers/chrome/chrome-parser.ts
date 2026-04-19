@@ -11,7 +11,11 @@ import type {
   TraceMetadata,
   TraceSource,
 } from '../../types'
-import {buildMarkBuffers, buildSliceBuffers} from '../../render/sliceBuffers'
+import {
+  buildMarkBuffers,
+  buildSliceBuffers,
+  buildSliceMipmap,
+} from '../../render/sliceBuffers'
 import {yieldToEventLoop} from '../../utils/yieldToEventLoop'
 import type {FinalizeOptions, TraceParser} from '../types'
 import {
@@ -296,6 +300,10 @@ export class ChromeParser implements TraceParser {
         // truth for the Aggregator / hover panes.
         track.buffers = buildSliceBuffers(track)
         track.markBuffers = buildMarkBuffers(track)
+        // Phase 2 LOD: density-tinted buckets layered on top of the raw
+        // buffer. Cheap to build (O(n log n)) and zoomed-out renders read it
+        // instead of the raw flat list to stay viewport-bounded.
+        track.mipmap = buildSliceMipmap(track.buffers)
       }
 
       systems.push({

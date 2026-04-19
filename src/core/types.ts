@@ -51,6 +51,13 @@ export interface Track extends TimelineContainer {
   buffers?: import('./render/sliceBuffers').SliceBuffers
   /** Matching flat view for the track's marks. */
   markBuffers?: import('./render/sliceBuffers').MarkBuffers
+  /**
+   * Resolution-aware LOD pyramid built on top of {@link buffers} at parse
+   * finalize. The canvas renderer picks the coarsest level whose resolution
+   * still fits one pixel at the current zoom, rendering density-tinted
+   * buckets instead of tens of thousands of sub-pixel rects.
+   */
+  mipmap?: import('./render/sliceBuffers').SliceMipmap
 }
 
 export interface System {

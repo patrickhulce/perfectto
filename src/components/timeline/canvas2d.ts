@@ -1,13 +1,19 @@
 import {
+  hasDensityCounts,
   lowerBoundF32,
   type MarkBuffers,
-  type SliceBuffers,
+  type SliceView,
 } from '../../core/render/sliceBuffers'
 import {unpackColorToCss} from '../../core/render/packColor'
 
 export interface DrawFrameArgs {
   ctx: CanvasRenderingContext2D
-  buffers: SliceBuffers
+  /**
+   * What to draw. Either the raw {@link SliceBuffers} for the track (zoomed
+   * in past the finest mipmap level, or when no mipmap is present) or one
+   * {@link SliceMipmapLevel} of density-tinted buckets.
+   */
+  slices: SliceView
   marks: MarkBuffers
   /** Width of the canvas in CSS pixels (pre-DPR). */
   widthCss: number
@@ -38,17 +44,44 @@ export interface DrawFrameArgs {
 const ROW_VPAD_PX = 4
 
 /**
- * Batched fillRect renderer. Groups slices by packed color so we only assign
- * `ctx.fillStyle` once per color, which is the dominant cost for large
- * traces (setting fillStyle re-parses the color every time).
+ * Density alpha stops for merged mipmap buckets. Keyed on
+ * `min(ALPHA_STOPS.length - 1, floor(log2(count)))`. Denser buckets render
+ * *lighter* so hotspot density is legible against the dark UI without
+ * producing an indistinguishable dark blob.
+ *
+ * Index 0 is the opaque stop — it's what singleton buckets and raw slices
+ * get. Indices 1..4 are reserved for merged buckets where `count >= 2`.
+ */
+const ALPHA_STOPS = [1.0, 0.75, 0.55, 0.4, 0.28] as const
+const ALPHA_OPAQUE = 0
+
+function quantizeAlpha(count: number): number {
+  if (count <= 1) return ALPHA_OPAQUE
+  // floor(log2(count)) clamped into [1, ALPHA_STOPS.length - 1].
+  let stop = 0
+  let c = count
+  while (c > 1 && stop < ALPHA_STOPS.length - 1) {
+    c >>>= 1
+    stop += 1
+  }
+  return stop
+}
+
+/**
+ * Batched fillRect renderer. Groups slices by packed color AND density stop
+ * so we only assign `ctx.fillStyle` once per (color, alpha) pair, which is
+ * the dominant cost for large traces (setting fillStyle re-parses the color
+ * every time).
  *
  * Complexity per frame: O(visible_slices), with visible_slices bounded by
- * (viewport_px) in practice once slices narrower than 1px are dropped.
+ * (viewport_px) once slices narrower than 1px are dropped. On a mipmap
+ * level it's bounded by that level's bucket count, which Phase 2 caps at a
+ * few hundred.
  */
 export function drawFrame(args: DrawFrameArgs): void {
   const {
     ctx,
-    buffers,
+    slices,
     marks,
     widthCss,
     heightCss,
@@ -64,7 +97,7 @@ export function drawFrame(args: DrawFrameArgs): void {
   if (pxPerMs <= 0) return
 
   // --- Measures (filled rects). -----------------------------------------
-  if (buffers.count > 0) {
+  if (slices.count > 0) {
     // Binary-search the running-max-of-ends prefix to find the earliest
     // index whose slice could still reach into the viewport. Everything
     // before that is guaranteed to end before visibleStartMs and can be
@@ -73,21 +106,21 @@ export function drawFrame(args: DrawFrameArgs): void {
     // hundreds of their shorter descendants sit between them and the
     // viewport in the sorted `starts` array.
     const first = lowerBoundF32(
-      buffers.maxEndsPrefix,
-      buffers.count,
+      slices.maxEndsPrefix,
+      slices.count,
       visibleStartMs,
     )
 
-    // Group by color. Most traces have <20 distinct colors total, so this
-    // Map never grows; we reuse the batch arrays across calls.
     const batches = getScratchBatches()
+    const densityView = hasDensityCounts(slices) ? slices : null
+    const counts = densityView?.counts
 
     const rowH = rowHeight - ROW_VPAD_PX
-    const starts = buffers.starts
-    const ends = buffers.ends
-    const depths = buffers.depths
-    const colors = buffers.colors
-    const count = buffers.count
+    const starts = slices.starts
+    const ends = slices.ends
+    const depths = slices.depths
+    const colors = slices.colors
+    const count = slices.count
 
     for (let i = first; i < count; i++) {
       const s = starts[i]
@@ -98,15 +131,22 @@ export function drawFrame(args: DrawFrameArgs): void {
       if (d >= maxDepthExclusive) continue
       const xCss = (s - canvasStartMs) * pxPerMs
       const wCssRaw = (e - s) * pxPerMs
-      if (wCssRaw < 1) continue // sub-pixel cull
-      // Tiny rects render as at least 1px so single ticks don't disappear.
+      const bucketCount = counts ? counts[i] : 1
+      // Merged buckets span at least one full level-resolution by
+      // construction, so they always clear the 1px threshold. Sub-pixel
+      // culling only applies to singletons (raw slices or wide-enough
+      // mipmap passthroughs).
+      if (bucketCount === 1 && wCssRaw < 1) continue
       const wCss = wCssRaw < 1.5 ? 1 : wCssRaw
       const y = d * rowHeight + ROW_VPAD_PX / 2
-      const color = colors[i]
-      let batch = batches.get(color)
+      const alphaStop = counts ? quantizeAlpha(bucketCount) : ALPHA_OPAQUE
+      // Pack (color, alphaStop) into one number so we can key a Map<number>
+      // without string concat per slice. 3 bits of alphaStop is plenty.
+      const batchKey = (colors[i] >>> 0) * 8 + alphaStop
+      let batch = batches.get(batchKey)
       if (!batch) {
-        batch = {x: [], y: [], w: [], h: []}
-        batches.set(color, batch)
+        batch = {x: [], y: [], w: [], h: [], color: colors[i], alphaStop}
+        batches.set(batchKey, batch)
       }
       batch.x.push(xCss)
       batch.y.push(y)
@@ -114,8 +154,8 @@ export function drawFrame(args: DrawFrameArgs): void {
       batch.h.push(rowH)
     }
 
-    for (const [color, batch] of batches) {
-      ctx.fillStyle = unpackColorToCss(color)
+    for (const batch of batches.values()) {
+      ctx.fillStyle = styleForBatch(batch.color, batch.alphaStop)
       const len = batch.x.length
       for (let k = 0; k < len; k++) {
         ctx.fillRect(batch.x[k], batch.y[k], batch.w[k], batch.h[k])
@@ -145,10 +185,11 @@ export function drawFrame(args: DrawFrameArgs): void {
       const y = d * rowHeight + 2
       const h = rowHeight
       const color = mColors[i]
-      let batch = batches.get(color)
+      const batchKey = (color >>> 0) * 8 + ALPHA_OPAQUE
+      let batch = batches.get(batchKey)
       if (!batch) {
-        batch = {x: [], y: [], w: [], h: []}
-        batches.set(color, batch)
+        batch = {x: [], y: [], w: [], h: [], color, alphaStop: ALPHA_OPAQUE}
+        batches.set(batchKey, batch)
       }
       batch.x.push(xCss)
       batch.y.push(y)
@@ -156,8 +197,8 @@ export function drawFrame(args: DrawFrameArgs): void {
       batch.h.push(h)
     }
 
-    for (const [color, batch] of batches) {
-      ctx.fillStyle = unpackColorToCss(color)
+    for (const batch of batches.values()) {
+      ctx.fillStyle = styleForBatch(batch.color, batch.alphaStop)
       const len = batch.x.length
       for (let k = 0; k < len; k++) {
         ctx.fillRect(batch.x[k], batch.y[k], batch.w[k], batch.h[k])
@@ -166,11 +207,23 @@ export function drawFrame(args: DrawFrameArgs): void {
   }
 }
 
+function styleForBatch(packedColor: number, alphaStop: number): string {
+  if (alphaStop === ALPHA_OPAQUE) return unpackColorToCss(packedColor)
+  const r = (packedColor >>> 24) & 0xff
+  const g = (packedColor >>> 16) & 0xff
+  const b = (packedColor >>> 8) & 0xff
+  const baseA = (packedColor & 0xff) / 255
+  const a = baseA * ALPHA_STOPS[alphaStop]
+  return `rgba(${r},${g},${b},${a.toFixed(3)})`
+}
+
 interface Batch {
   x: number[]
   y: number[]
   w: number[]
   h: number[]
+  color: number
+  alphaStop: number
 }
 
 // A single renderer only draws on the main thread, so a module-level scratch
@@ -187,3 +240,6 @@ function getScratchBatches(): Map<number, Batch> {
   SCRATCH.clear()
   return SCRATCH
 }
+
+// Visible for tests.
+export const __test__ = {quantizeAlpha, ALPHA_STOPS, styleForBatch}
