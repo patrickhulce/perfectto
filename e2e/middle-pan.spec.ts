@@ -1,11 +1,11 @@
 import {test, expect} from './fixtures/trace'
 
 /**
- * Middle-click pan. Matches the left-drag pan contract (horizontal
- * scroll tracks cursor delta) and additionally works when the drag
- * STARTS over a gutter button — left-drag is filtered away in that case
- * so the toggle still fires on plain clicks, but middle-click is
- * conventionally "pan this surface" regardless of the target.
+ * Middle-click pan. Matches the left-drag pan contract (scroll tracks
+ * cursor delta in both axes) and additionally works when the drag STARTS
+ * over a gutter button — left-drag is filtered away in that case so the
+ * toggle still fires on plain clicks, but middle-click is conventionally
+ * "pan this surface" regardless of the target.
  */
 
 async function startingScrollLeft(
@@ -13,6 +13,14 @@ async function startingScrollLeft(
 ): Promise<number> {
   return page.evaluate(
     () => window.__perfecttoTimeline?.scrollLeft ?? 0,
+  )
+}
+
+async function startingScrollTop(
+  page: import('@playwright/test').Page,
+): Promise<number> {
+  return page.evaluate(
+    () => window.__perfecttoTimeline?.scrollTop ?? 0,
   )
 }
 
@@ -31,6 +39,23 @@ async function dragPan(
     await page.waitForTimeout(8)
   }
   await page.mouse.up({button})
+}
+
+/** Vertical-only middle drag: move mouse up so scrollTop increases (content moves down). */
+async function dragPanVertical(
+  page: import('@playwright/test').Page,
+  startX: number,
+  startY: number,
+  dyPx: number,
+): Promise<void> {
+  await page.mouse.move(startX, startY)
+  await page.mouse.down({button: 'middle'})
+  const steps = 15
+  for (let i = 1; i <= steps; i++) {
+    await page.mouse.move(startX, startY - (i * dyPx) / steps)
+    await page.waitForTimeout(8)
+  }
+  await page.mouse.up({button: 'middle'})
 }
 
 test.describe('middle-click pan', () => {
@@ -69,6 +94,43 @@ test.describe('middle-click pan', () => {
       after - before,
       'middle-click drag advances scrollLeft',
     ).toBeGreaterThanOrEqual(60)
+  })
+
+  test('drag with middle button scrolls the timeline vertically when content overflows', async ({
+    page,
+  }) => {
+    // Short viewport so the sample trace overflows vertically (default size
+    // often fits the full stack without scroll).
+    await page.setViewportSize({width: 1280, height: 360})
+    await expect
+      .poll(
+        async () =>
+          page.evaluate(() => {
+            const el = document.querySelector(
+              '[data-testid="timeline-event-surface"]',
+            )?.parentElement
+            if (!el) return 0
+            return el.scrollHeight - el.clientHeight
+          }),
+        {timeout: 5000},
+      )
+      .toBeGreaterThan(0)
+
+    const surface = page.getByTestId('timeline-event-surface')
+    const box = await surface.boundingBox()
+    if (!box) throw new Error('surface not measurable')
+
+    const before = await startingScrollTop(page)
+    const centerX = box.x + box.width / 2
+    const centerY = box.y + Math.min(200, box.height * 0.5)
+    await dragPanVertical(page, centerX, centerY, 120)
+    await page.waitForTimeout(64)
+    const after = await startingScrollTop(page)
+
+    expect(
+      Math.abs(after - before),
+      'middle-click vertical drag advances scrollTop',
+    ).toBeGreaterThanOrEqual(40)
   })
 
   test('middle-click pan works even when the drag starts on a gutter button', async ({

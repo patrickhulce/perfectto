@@ -324,7 +324,7 @@ export default function Timeline({timeline}: TimelineProps) {
   return (
     <div
       ref={scrollRef}
-      className="relative flex-1 overflow-auto"
+      className="relative min-h-0 flex-1 overflow-auto"
       // Reserve scrollbar-gutter space in both axes at all times so zooming
       // across the fit threshold (where the horizontal scrollbar
       // appears/disappears) doesn't reflow the tracks vertically, and

@@ -16,8 +16,8 @@ export interface UseTimelineZoomOptions {
    */
   containerWidthPx: number
   /**
-   * Ref to the scroll container whose `scrollLeft` represents pan.
-   * Ctrl/meta + wheel zoom and left-button drag update this directly.
+   * Ref to the scroll container whose `scrollLeft` / `scrollTop` represent pan.
+   * Ctrl/meta + wheel zoom and left/middle-button drag update these directly.
    */
   scrollerRef: RefObject<HTMLElement | null>
   /** Store to publish viewport updates into. */
@@ -40,12 +40,14 @@ const MAX_PX_PER_MS = 1e6
  */
 const MAX_CONTENT_WIDTH_PX = 20_000_000
 /**
- * Effective deltaY equivalent per W/S keypress. Matched to a single wheel
- * notch (~100) so keyboard and trackpad zoom feel identical.
+ * Base effective deltaY per W/S keypress before scaling. Matched to a single
+ * wheel notch (~100) so keyboard and trackpad zoom feel identical at scale 1.
  */
 const KEY_ZOOM_DELTA_Y = 80
 const KEY_PAN_VIEWPORT_FRACTION = 0.1
 const KEY_PAN_MIN_PX = 60
+/** Multiplier for W/S zoom steps and A/D pan steps (keyboard navigation). */
+const KEYBOARD_NAV_SCALE = 3
 
 function clampPxPerMs(
   value: number,
@@ -73,10 +75,12 @@ function clampPxPerMs(
  * Every gesture tick is committed immediately: wheel/W/S recompute `pxPerMs`,
  * recompute the scroll offset that keeps the anchor point under the cursor,
  * write the DOM `scrollLeft`, and publish the new state to the shared
- * `ViewportStore`. No transform tricks, no debounced commit, no flushSync —
- * every canvas subscriber schedules its own rAF and redraws on the next
- * frame, so the gesture still feels instant without paying a React render
- * tax per tick.
+ * `ViewportStore`. Left/middle-button drag pans in both horizontal and
+ * vertical axes via `scrollLeft` / `scrollTop`. W/S and A/D use
+ * `KEYBOARD_NAV_SCALE` for larger steps than a single wheel notch / viewport
+ * fraction. No transform tricks, no debounced commit, no flushSync — every
+ * canvas subscriber schedules its own rAF and redraws on the next frame, so
+ * the gesture still feels instant without paying a React render tax per tick.
  *
  * The React-visible `pxPerMs` return is only used by code that must size the
  * inner surface width (a single React element). Canvases read the store
@@ -253,8 +257,12 @@ export function useTimelineZoom(
       | {
           pointerId: number
           startClientX: number
+          startClientY: number
           startScrollLeft: number
+          startScrollTop: number
           button: number
+          /** Inline `cursor` before middle-button pan; restore on release. */
+          cursorBefore?: string
         }
       | null = null
 
@@ -279,9 +287,13 @@ export function useTimelineZoom(
       panning = {
         pointerId: e.pointerId,
         startClientX: e.clientX,
+        startClientY: e.clientY,
         startScrollLeft: scroller.scrollLeft,
+        startScrollTop: scroller.scrollTop,
         button: e.button,
+        ...(isMiddle ? {cursorBefore: el.style.cursor} : {}),
       }
+      if (isMiddle) el.style.cursor = 'grabbing'
       try {
         el.setPointerCapture(e.pointerId)
       } catch {
@@ -295,17 +307,21 @@ export function useTimelineZoom(
       const scroller = scrollerRef.current
       if (!scroller) return
       const dx = e.clientX - panning.startClientX
-      if (dx === 0) return
+      const dy = e.clientY - panning.startClientY
+      if (dx === 0 && dy === 0) return
       scroller.scrollLeft = panning.startScrollLeft - dx
+      scroller.scrollTop = panning.startScrollTop - dy
     }
 
     const endPan = (e: PointerEvent): void => {
       if (!panning || e.pointerId !== panning.pointerId) return
+      const cursorBefore = panning.cursorBefore
       try {
         el.releasePointerCapture(e.pointerId)
       } catch {
         // no-op
       }
+      if (cursorBefore !== undefined) el.style.cursor = cursorBefore
       panning = null
     }
 
@@ -358,22 +374,27 @@ export function useTimelineZoom(
         case 'w':
         case 'W':
           e.preventDefault()
-          applyZoom(-KEY_ZOOM_DELTA_Y, resolveZoomAnchor())
+          applyZoom(
+            -KEY_ZOOM_DELTA_Y * KEYBOARD_NAV_SCALE,
+            resolveZoomAnchor(),
+          )
           break
         case 's':
         case 'S':
           e.preventDefault()
-          applyZoom(KEY_ZOOM_DELTA_Y, resolveZoomAnchor())
+          applyZoom(KEY_ZOOM_DELTA_Y * KEYBOARD_NAV_SCALE, resolveZoomAnchor())
           break
         case 'a':
         case 'A': {
           const scroller = scrollerRef.current
           if (!scroller) return
           e.preventDefault()
-          const step = Math.max(
-            KEY_PAN_MIN_PX,
-            scroller.clientWidth * KEY_PAN_VIEWPORT_FRACTION,
-          )
+          const step =
+            KEYBOARD_NAV_SCALE *
+            Math.max(
+              KEY_PAN_MIN_PX,
+              scroller.clientWidth * KEY_PAN_VIEWPORT_FRACTION,
+            )
           keyboardPan(-step)
           break
         }
@@ -382,10 +403,12 @@ export function useTimelineZoom(
           const scroller = scrollerRef.current
           if (!scroller) return
           e.preventDefault()
-          const step = Math.max(
-            KEY_PAN_MIN_PX,
-            scroller.clientWidth * KEY_PAN_VIEWPORT_FRACTION,
-          )
+          const step =
+            KEYBOARD_NAV_SCALE *
+            Math.max(
+              KEY_PAN_MIN_PX,
+              scroller.clientWidth * KEY_PAN_VIEWPORT_FRACTION,
+            )
           keyboardPan(step)
           break
         }

@@ -10,7 +10,7 @@ interface TraceViewerProps {
 
 export default function TraceViewer({ trace, onBack }: TraceViewerProps) {
   return (
-    <div className="flex min-h-screen flex-col">
+    <div className="flex h-screen min-h-0 flex-col">
       <Metadata source={trace.source} onBack={onBack} />
       <Timeline timeline={trace.timeline} />
       <Aggregator />
