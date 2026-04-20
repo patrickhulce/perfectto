@@ -149,8 +149,18 @@ export function useTimelineZoom(
         0,
         Math.min(anchorClientX - rect.left, scroller.clientWidth),
       )
-      // Layer-x of the timeline ms currently under the cursor.
-      const scrollLeft = scroller.scrollLeft
+      // Layer-x of the timeline ms currently under the cursor. Read the
+      // precise (sub-pixel) scrollLeft from the store, not `scroller.
+      // scrollLeft`, because browsers round DOM scrollLeft to integer
+      // pixels on every write. Across a 20-tick zoom burst that rounding
+      // compounds into ~12px of anchor drift. The store holds the exact
+      // value we wrote on the previous tick; Timeline's native scroll
+      // listener echo-suppresses so this value isn't clobbered by the
+      // browser rounding our own write back at us.
+      const storeScrollLeft = storeRef.current.get().scrollLeft
+      const scrollLeft = Number.isFinite(storeScrollLeft)
+        ? storeScrollLeft
+        : scroller.scrollLeft
       const anchorLayerX = scrollLeft + cursorXInViewport - labelWidth
       const anchorMs = boundsRef.current.start + anchorLayerX / committed
       // Solve for scrollLeft such that the same ms is under the cursor at
@@ -160,13 +170,36 @@ export function useTimelineZoom(
         (anchorMs - boundsRef.current.start) * targetPxPerMs -
         cursorXInViewport
 
-      // Update the React-facing pxPerMs BEFORE writing scrollLeft, so the
-      // inner surface width grows to accommodate the new scroll target and
-      // the browser doesn't clamp our write. React 19 batches within this
-      // task; paint happens once at the end.
+      // The browser clamps `scroller.scrollLeft = X` to the current
+      // scrollWidth. Our scrollWidth is `labelWidth + totalSpan *
+      // committed` RIGHT NOW, because React hasn't committed
+      // `setPxPerMsOverride(targetPxPerMs)` yet (React 19 still batches
+      // state updates set inside event handlers — the comment that used
+      // to live here was wrong). If we just write scrollLeft first, a
+      // zoom-in tick gets clamped to the old max, the native scroll
+      // listener publishes that clamped value into the store, and the
+      // anchor drifts several pixels per tick.
+      //
+      // Fix: imperatively widen the event-surface element BEFORE writing
+      // scrollLeft, so the browser has the headroom to accept our write.
+      // React's next render will set `style.width` to the exact same
+      // value (innerWidthPx = labelWidth + totalSpan * targetPxPerMs),
+      // so there's no flicker or double-commit — the imperative write
+      // just races React to the DOM.
       pxPerMsRef.current = targetPxPerMs
-      setPxPerMsOverride(targetPxPerMs)
+      const nextInnerWidthPx = labelWidth + span * targetPxPerMs
+      const surfaceEl = el as HTMLElement
+      // `scroller.firstElementChild` would also work, but `el` is already
+      // the event surface we got wired to (same element the JSX binds
+      // `style={{width: innerWidthPx, ...}}` to).
+      if (
+        surfaceEl.style.width === '' ||
+        parseFloat(surfaceEl.style.width) < nextInnerWidthPx
+      ) {
+        surfaceEl.style.width = `${nextInnerWidthPx}px`
+      }
       scroller.scrollLeft = targetScrollLeft
+      setPxPerMsOverride(targetPxPerMs)
 
       storeRef.current.set({
         pxPerMs: targetPxPerMs,

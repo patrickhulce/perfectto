@@ -35,6 +35,62 @@ describe('quantizeAlpha', () => {
   })
 })
 
+describe('cropText', () => {
+  const {cropText, measureCache, cropCache} = __test__
+
+  // ctx that returns a stable 7px-per-char width and counts measureText calls
+  // so we can verify caches.
+  function makeMeasureCtx() {
+    let calls = 0
+    const ctx = {
+      measureText: (s: string) => {
+        calls += 1
+        return {width: s.length * 7} as TextMetrics
+      },
+    } as unknown as CanvasRenderingContext2D
+    return {ctx, getCalls: () => calls}
+  }
+
+  beforeEach(() => {
+    measureCache.clear()
+    cropCache.clear()
+  })
+
+  it('returns the full string when it fits', () => {
+    const {ctx} = makeMeasureCtx()
+    expect(cropText(ctx, 'hello', 100)).toBe('hello')
+  })
+
+  it('truncates with an ellipsis when it does not fit', () => {
+    const {ctx} = makeMeasureCtx()
+    // 7px/char * 10 chars = 70, plus ellipsis 7 = 77 > 50 → truncates.
+    const out = cropText(ctx, 'helloworld', 50)
+    expect(out.endsWith('…')).toBe(true)
+    expect(out.length).toBeLessThan('helloworld'.length + 1)
+  })
+
+  it('returns "" when even the ellipsis does not fit', () => {
+    const {ctx} = makeMeasureCtx()
+    expect(cropText(ctx, 'whatever', 3)).toBe('')
+  })
+
+  it('caches full-width measurement across calls', () => {
+    const {ctx, getCalls} = makeMeasureCtx()
+    cropText(ctx, 'hello', 100)
+    const first = getCalls()
+    cropText(ctx, 'hello', 100)
+    expect(getCalls()).toBe(first) // second call hits the measureCache
+  })
+
+  it('caches the cropped result across calls', () => {
+    const {ctx, getCalls} = makeMeasureCtx()
+    cropText(ctx, 'helloworld', 50)
+    const after = getCalls()
+    cropText(ctx, 'helloworld', 50)
+    expect(getCalls()).toBe(after) // crop cache hit, no new measureText work
+  })
+})
+
 describe('styleForBatch', () => {
   const {styleForBatch} = __test__
 
@@ -168,6 +224,125 @@ describe('drawFrame', () => {
       maxDepthExclusive: Infinity,
     })
     expect(fills.length).toBeGreaterThan(0)
+  })
+
+  it('renders a label via fillText for wide singletons with baseMeasures', () => {
+    const base = buildSliceBuffers(track([m('myWideMeasure', 0, 100)]))
+    const fillTextCalls: Array<{text: string; x: number; y: number}> = []
+    const ctx = {
+      get fillStyle() {
+        return ''
+      },
+      set fillStyle(_v: string) {},
+      set font(_v: string) {},
+      set textBaseline(_v: CanvasTextBaseline) {},
+      clearRect: (_x: number, _y: number, _w: number, _h: number): void => {},
+      fillRect: (_x: number, _y: number, _w: number, _h: number): void => {},
+      fillText: (text: string, x: number, y: number): void => {
+        fillTextCalls.push({text, x, y})
+      },
+      // Realistic enough for the label gate: 7px per char keeps short names
+      // fitting inside a 100px rect without truncation.
+      measureText: (s: string) => ({width: s.length * 7}) as TextMetrics,
+    } as unknown as CanvasRenderingContext2D
+
+    drawFrame({
+      ctx,
+      slices: base,
+      marks: EMPTY_MARK_BUFFERS,
+      widthCss: 200,
+      heightCss: 22,
+      rowHeight: 22,
+      pxPerMs: 2,
+      visibleStartMs: 0,
+      visibleEndMs: 100,
+      canvasStartMs: 0,
+      maxDepthExclusive: Infinity,
+      baseMeasures: base.measures,
+    })
+
+    expect(fillTextCalls.length).toBe(1)
+    expect(fillTextCalls[0].text).toBe('myWideMeasure')
+  })
+
+  it('skips labels for narrow singletons (below LABEL_MIN_WIDTH_PX)', () => {
+    const base = buildSliceBuffers(track([m('tiny', 0, 5)]))
+    let fillTextCalls = 0
+    const ctx = {
+      get fillStyle() {
+        return ''
+      },
+      set fillStyle(_v: string) {},
+      set font(_v: string) {},
+      set textBaseline(_v: CanvasTextBaseline) {},
+      clearRect: (_x: number, _y: number, _w: number, _h: number): void => {},
+      fillRect: (_x: number, _y: number, _w: number, _h: number): void => {},
+      fillText: (): void => {
+        fillTextCalls += 1
+      },
+      measureText: (s: string) => ({width: s.length * 7}) as TextMetrics,
+    } as unknown as CanvasRenderingContext2D
+
+    // 5ms × 2 px/ms = 10px wide — below the 18px label gate.
+    drawFrame({
+      ctx,
+      slices: base,
+      marks: EMPTY_MARK_BUFFERS,
+      widthCss: 200,
+      heightCss: 22,
+      rowHeight: 22,
+      pxPerMs: 2,
+      visibleStartMs: 0,
+      visibleEndMs: 5,
+      canvasStartMs: 0,
+      maxDepthExclusive: Infinity,
+      baseMeasures: base.measures,
+    })
+
+    expect(fillTextCalls).toBe(0)
+  })
+
+  it('does not label merged mipmap buckets even when wide', () => {
+    const children: Measure[] = []
+    for (let i = 0; i < 50; i++) {
+      children.push(m(`s${i}`, i * 0.01, i * 0.01 + 0.005))
+    }
+    const base = buildSliceBuffers(track(children))
+    const mm = buildSliceMipmap(base)
+    const finest = mm.levels[0]
+    expect(finest.counts[0]).toBeGreaterThan(1)
+
+    let fillTextCalls = 0
+    const ctx = {
+      get fillStyle() {
+        return ''
+      },
+      set fillStyle(_v: string) {},
+      set font(_v: string) {},
+      set textBaseline(_v: CanvasTextBaseline) {},
+      clearRect: (_x: number, _y: number, _w: number, _h: number): void => {},
+      fillRect: (_x: number, _y: number, _w: number, _h: number): void => {},
+      fillText: (): void => {
+        fillTextCalls += 1
+      },
+      measureText: (s: string) => ({width: s.length * 7}) as TextMetrics,
+    } as unknown as CanvasRenderingContext2D
+
+    drawFrame({
+      ctx,
+      slices: finest,
+      marks: EMPTY_MARK_BUFFERS,
+      widthCss: 400,
+      heightCss: 22,
+      rowHeight: 22,
+      pxPerMs: 200,
+      visibleStartMs: 0,
+      visibleEndMs: 1,
+      canvasStartMs: 0,
+      maxDepthExclusive: Infinity,
+      baseMeasures: base.measures,
+    })
+    expect(fillTextCalls).toBe(0)
   })
 
   it('skips sub-pixel singletons but always draws merged buckets', () => {

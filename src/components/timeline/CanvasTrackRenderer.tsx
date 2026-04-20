@@ -8,6 +8,7 @@ import {
 import {drawFrame} from './canvas2d'
 import type {ViewportStore} from './viewportStore'
 import {ROW_HEIGHT} from './trackLayout'
+import {isSkirtEnabled} from './skirtFlag'
 
 interface CanvasTrackRendererProps {
   track: TrackModel
@@ -16,6 +17,50 @@ interface CanvasTrackRendererProps {
   store: ViewportStore
   onToggle?: () => void
   expanded: boolean
+}
+
+/**
+ * Phase 3 buffered-bounds factor. The canvas is drawn `SKIRT_FACTOR ×
+ * viewport-content-width` pixels wide so most horizontal scrolls are
+ * compositor-only `transform: translateX(...)` updates instead of full
+ * redraws.
+ *
+ * `3` = one viewport on the left, one in the middle, one on the right —
+ * matches the Perfetto `BufferedBounds` 3× total skirt the mission doc
+ * cites.
+ */
+const SKIRT_FACTOR = 3
+
+/**
+ * When the visible viewport's left or right edge gets within this many CSS
+ * pixels of the drawn canvas's edge we redraw + recenter. Half a viewport
+ * means the user has at least one full viewport of buffered pan in either
+ * direction at any time — equivalent to Perfetto's "redraw at threshold
+ * cross" behavior.
+ */
+const SKIRT_EDGE_THRESHOLD_FRACTION = 0.5
+
+/**
+ * Snapshot of what the canvas currently has painted on it. Updated every
+ * time we redraw; consulted every frame to decide between a cheap
+ * `translateX` update and a full repaint.
+ */
+interface LoadedRange {
+  /** `pxPerMs` the canvas was painted at. Any change forces a full redraw. */
+  pxPerMs: number
+  /**
+   * `scrollLeft` value at which the canvas's leftmost pixel sits. Used to
+   * compute the per-frame translate as `loadedScrollLeft - state.scrollLeft`.
+   */
+  scrollLeftAnchor: number
+  /** Width in CSS px of the painted canvas (always `SKIRT_FACTOR × content`). */
+  widthCss: number
+  /** Height in CSS px the canvas was painted at; redraw if track height changes. */
+  heightCss: number
+  /** `expanded` value at paint time; redraw if it flips so depth-1 lines (re)appear. */
+  expanded: boolean
+  /** Track identity at paint time; redraw on track swap (rare, but cheap to guard). */
+  trackId: string
 }
 
 /**
@@ -36,84 +81,165 @@ function CanvasTrackRendererBase({
   expanded,
 }: CanvasTrackRendererProps) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null)
+  const wrapperRef = useRef<HTMLDivElement | null>(null)
   const rafRef = useRef<number | null>(null)
 
   useEffect(() => {
     const canvas = canvasRef.current
-    if (!canvas) return
+    const wrapper = wrapperRef.current
+    if (!canvas || !wrapper) return
     const ctx = canvas.getContext('2d')
     if (!ctx) return
 
-    // Cache the last applied CSS size so we skip the backing-store resize
-    // (and the `setTransform(dpr, ...)` that goes with it) when neither the
-    // viewport width nor DPR has changed.
-    let lastWidthCss = -1
-    let lastHeightCss = -1
-    let lastDpr = -1
+    const skirtEnabled = isSkirtEnabled()
+    let lastWrapperWidthCss = -1
 
-    const render = (): void => {
-      rafRef.current = null
-      const state = store.get()
-      const pxPerMs = state.pxPerMs
-      if (pxPerMs <= 0) {
-        // Nothing to draw yet — parse might still be in progress.
-        ctx.clearRect(0, 0, canvas.width, canvas.height)
-        return
-      }
-      const widthCss = Math.max(
-        0,
-        state.viewportWidth - state.labelWidthPx,
-      )
-      const heightCss = heightPx
+    // Cache the last applied backing size so we skip the (somewhat
+    // expensive) resize + `setTransform(dpr, ...)` work when nothing has
+    // changed about geometry. Tracks the canvas's actual pixel buffer
+    // dimensions, not the wrapper's.
+    let lastBackingWidthCss = -1
+    let lastBackingHeightCss = -1
+    let lastDpr = -1
+    /**
+     * What the canvas currently has painted. `null` means "must redraw" —
+     * either we haven't drawn yet, or geometry changed in a way the
+     * translate-only path can't handle.
+     */
+    let loaded: LoadedRange | null = null
+
+    const fullRedraw = (
+      contentWidthCss: number,
+      heightCss: number,
+      pxPerMs: number,
+      scrollLeftAnchor: number,
+    ): void => {
+      // The skirt buys us 3 viewport-widths of cached pan; outside skirt
+      // mode we draw exactly one viewport wide, exactly aligned with the
+      // visible window.
+      const canvasWidthCss = skirtEnabled
+        ? contentWidthCss * SKIRT_FACTOR
+        : contentWidthCss
       const dpr = window.devicePixelRatio || 1
 
-      if (widthCss !== lastWidthCss || heightCss !== lastHeightCss || dpr !== lastDpr) {
-        canvas.style.width = `${widthCss}px`
+      if (
+        canvasWidthCss !== lastBackingWidthCss ||
+        heightCss !== lastBackingHeightCss ||
+        dpr !== lastDpr
+      ) {
+        canvas.style.width = `${canvasWidthCss}px`
         canvas.style.height = `${heightCss}px`
-        canvas.width = Math.max(1, Math.round(widthCss * dpr))
+        canvas.width = Math.max(1, Math.round(canvasWidthCss * dpr))
         canvas.height = Math.max(1, Math.round(heightCss * dpr))
-        // setTransform so draw commands use CSS pixels.
+        // setTransform so draw commands use CSS pixels regardless of dpr.
         ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
-        lastWidthCss = widthCss
-        lastHeightCss = heightCss
+        lastBackingWidthCss = canvasWidthCss
+        lastBackingHeightCss = heightCss
         lastDpr = dpr
       }
 
-      if (widthCss <= 0) return
-
-      // The content layer starts at labelWidthPx in the outer scroller; the
-      // canvas itself starts at x=0 of that layer. So the ms at the canvas's
-      // left edge = timelineStart + scrollLeft / pxPerMs. Then we overdraw
-      // by half the viewport on each side so small horizontal scroll
-      // jitters don't clip content at the edges.
-      const msAtCanvasLeft = state.timelineStart + state.scrollLeft / pxPerMs
-      const visibleDurationMs = widthCss / pxPerMs
+      const state = store.get()
+      const msAtCanvasLeft =
+        state.timelineStart + scrollLeftAnchor / pxPerMs
+      const visibleDurationMs = canvasWidthCss / pxPerMs
       const visibleStartMs = msAtCanvasLeft
       const visibleEndMs = msAtCanvasLeft + visibleDurationMs
 
-      // Pick the coarsest LOD level whose resolution fits one pixel. Falls
-      // back to the raw SliceBuffers when the user is zoomed in past the
-      // finest level, or when the parser didn't build a mipmap.
       const slices = track.mipmap
         ? pickMipmapLevel(track.mipmap, pxPerMs)
         : track.buffers ?? EMPTY_SLICE_BUFFERS
+      const baseMeasures = track.mipmap
+        ? track.mipmap.base.measures
+        : track.buffers?.measures
 
       drawFrame({
         ctx,
         slices,
         marks: track.markBuffers ?? EMPTY_MARK_BUFFERS,
-        widthCss,
+        widthCss: canvasWidthCss,
         heightCss,
         rowHeight: ROW_HEIGHT,
         pxPerMs,
         visibleStartMs,
         visibleEndMs,
         canvasStartMs: msAtCanvasLeft,
-        // When collapsed, only draw direct children of the track root
-        // (depth 0). Matches the behavior of the old DOM renderer's
-        // `maxDepth = expanded ? ∞ : 1` rule.
         maxDepthExclusive: expanded ? Number.POSITIVE_INFINITY : 1,
+        baseMeasures,
       })
+
+      loaded = {
+        pxPerMs,
+        scrollLeftAnchor,
+        widthCss: canvasWidthCss,
+        heightCss,
+        expanded,
+        trackId: track.id,
+      }
+      // Apply the matching translate so the drawn region aligns with the
+      // current scroll position. Outside skirt mode this is always 0
+      // (anchor = scrollLeft).
+      canvas.style.transform = `translateX(${
+        scrollLeftAnchor - state.scrollLeft
+      }px)`
+    }
+
+    const render = (): void => {
+      rafRef.current = null
+      const state = store.get()
+      const pxPerMs = state.pxPerMs
+      if (pxPerMs <= 0) {
+        // Parse not finished yet; clear and bail.
+        ctx.clearRect(0, 0, canvas.width, canvas.height)
+        loaded = null
+        return
+      }
+      const contentWidthCss = Math.max(
+        0,
+        state.viewportWidth - state.labelWidthPx,
+      )
+      if (contentWidthCss <= 0) return
+
+      // Keep the sticky wrapper width in lockstep with the viewport's
+      // content area. Mutating `style.width` on the wrapper is a layout-only
+      // op and only fires on actual resize (we cache and skip).
+      if (contentWidthCss !== lastWrapperWidthCss) {
+        wrapper.style.width = `${contentWidthCss}px`
+        lastWrapperWidthCss = contentWidthCss
+      }
+
+      const heightCss = heightPx
+      const edgeThresholdPx = contentWidthCss * SKIRT_EDGE_THRESHOLD_FRACTION
+
+      // Decide between cheap translate and full redraw.
+      const mustRedraw =
+        !skirtEnabled ||
+        loaded === null ||
+        loaded.pxPerMs !== pxPerMs ||
+        loaded.heightCss !== heightCss ||
+        loaded.expanded !== expanded ||
+        loaded.trackId !== track.id ||
+        // Approaching the left edge of the painted canvas.
+        state.scrollLeft - loaded.scrollLeftAnchor < edgeThresholdPx ||
+        // Approaching the right edge of the painted canvas.
+        loaded.scrollLeftAnchor + loaded.widthCss -
+          (state.scrollLeft + contentWidthCss) <
+          edgeThresholdPx
+
+      if (mustRedraw) {
+        // Recenter so we have one viewport of skirt on each side. Outside
+        // skirt mode anchor === scrollLeft (no overdraw, no transform).
+        const anchor = skirtEnabled
+          ? state.scrollLeft - contentWidthCss
+          : state.scrollLeft
+        fullRedraw(contentWidthCss, heightCss, pxPerMs, anchor)
+      } else if (loaded) {
+        // Cheap path: just slide the already-painted canvas. No fillRect
+        // calls, no clearRect, no React work — this is the whole point of
+        // the skirt.
+        canvas.style.transform = `translateX(${
+          loaded.scrollLeftAnchor - state.scrollLeft
+        }px)`
+      }
     }
 
     const schedule = (): void => {
@@ -146,6 +272,16 @@ function CanvasTrackRendererBase({
   }, [track, store, heightPx, expanded])
 
   const canToggle = !!onToggle
+  // Screen-reader summary for the gutter button. The canvas is non-
+  // interactive (`pointer-events: none`), so the gutter button is the only
+  // focusable affordance per row — its aria-label is the entire a11y story
+  // for the row's contents.
+  const measureCount = track.buffers?.count ?? 0
+  const ariaLabel =
+    `${track.name}` +
+    (track.category ? ` (${track.category})` : '') +
+    `, ${measureCount} measure${measureCount === 1 ? '' : 's'}` +
+    (canToggle ? `, ${expanded ? 'expanded' : 'collapsed'}` : '')
 
   return (
     <div
@@ -164,6 +300,8 @@ function CanvasTrackRendererBase({
         type="button"
         onClick={onToggle}
         disabled={!canToggle}
+        aria-label={ariaLabel}
+        aria-expanded={canToggle ? expanded : undefined}
         data-no-pan
         className={
           'flex items-start gap-1 border-r border-[#2d3748] bg-[#11151d] px-2 py-2 text-left text-xs text-[#a0aec0]' +
@@ -195,31 +333,50 @@ function CanvasTrackRendererBase({
         </span>
       </button>
       {/*
-        Canvas sits as the second flex item and uses `position: sticky;
-        left: labelWidthPx` so it stays pinned just right of the label as
-        the scroller pans. We can't use `position: absolute` here — that
-        would make the canvas scroll with the content (its containing
-        block is the row, which is inside the huge innerWidthPx surface),
-        so it would march off-screen as the user scrolls right. Sticky
-        keeps it viewport-pinned while still letting the outer scroller
-        handle pan natively.
-
-        Width and backing-store size are applied imperatively in the
-        useEffect above so we don't trigger a React re-render per frame.
+        Skirt wrapper. Sticky-pinned to `left: labelWidthPx` so it always
+        hugs the gutter as the outer surface scrolls; `overflow: hidden`
+        clips the wider-than-viewport canvas inside it. The canvas itself
+        is a 3× viewport wide buffer (Phase 3) translated horizontally to
+        align with the current scroll position. Width is set to the live
+        viewport content width via CSS calc — no React re-render per
+        viewport-resize tick because the calc resolves at layout time.
       */}
-      <canvas
-        ref={canvasRef}
-        data-testid="track-canvas"
-        className="pointer-events-none"
+      <div
+        ref={wrapperRef}
+        data-testid="track-canvas-skirt"
+        className="pointer-events-none overflow-hidden"
         style={{
           position: 'sticky',
           left: labelWidthPx,
           top: 0,
           flexShrink: 0,
           height: heightPx,
+          // Width is set imperatively in the render loop from the live
+          // viewport-content size (viewportWidth - labelWidthPx). Starts at
+          // 0 so the first paint never flashes a too-wide canvas.
+          width: 0,
           display: 'block',
         }}
-      />
+      >
+        <canvas
+          ref={canvasRef}
+          data-testid="track-canvas"
+          className="pointer-events-none"
+          style={{
+            // The canvas's CSS width is set imperatively in the useEffect
+            // above (it's a multiple of the viewport content width). We
+            // anchor it at left:0 of the wrapper and slide via transform.
+            position: 'absolute',
+            left: 0,
+            top: 0,
+            height: heightPx,
+            display: 'block',
+            // willChange hints the compositor to keep this on its own
+            // layer so translateX during pan never paints.
+            willChange: 'transform',
+          }}
+        />
+      </div>
     </div>
   )
 }

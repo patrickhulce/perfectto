@@ -5,6 +5,7 @@ import {
   type SliceView,
 } from '../../core/render/sliceBuffers'
 import {unpackColorToCss} from '../../core/render/packColor'
+import type {Measure} from '../../core'
 
 export interface DrawFrameArgs {
   ctx: CanvasRenderingContext2D
@@ -38,10 +39,29 @@ export interface DrawFrameArgs {
    * visible row count, not the underlying tree depth.
    */
   maxDepthExclusive: number
+  /**
+   * Back-pointer array for slice-index → Measure lookups during the label
+   * pass. Always the base {@link SliceBuffers.measures}; for a mipmap view
+   * we translate `sourceStart[i]` through this. Labels are skipped when
+   * undefined (e.g. unit tests that don't exercise text).
+   */
+  baseMeasures?: Measure[]
 }
 
 /** Vertical padding inside a row (mirrors the old DOM renderer). */
 const ROW_VPAD_PX = 4
+
+/**
+ * Phase 3.5 label pass tunables. Below `LABEL_MIN_WIDTH_PX` the slice rect is
+ * too narrow for a single readable glyph, so we skip text entirely; above it
+ * we crop the name to the available width and draw a single fillText call.
+ */
+const LABEL_MIN_WIDTH_PX = 18
+const LABEL_PAD_PX = 3
+const LABEL_FONT =
+  '500 11px ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif'
+const LABEL_COLOR = '#0b0f17'
+const LABEL_BASELINE: CanvasTextBaseline = 'middle'
 
 /**
  * Density alpha stops for merged mipmap buckets. Keyed on
@@ -91,12 +111,19 @@ export function drawFrame(args: DrawFrameArgs): void {
     visibleEndMs,
     canvasStartMs,
     maxDepthExclusive,
+    baseMeasures,
   } = args
 
   ctx.clearRect(0, 0, widthCss, heightCss)
   if (pxPerMs <= 0) return
 
   // --- Measures (filled rects). -----------------------------------------
+  // The label pass needs the same per-slice (xCss, wCss, rowYCenter,
+  // measureIndex) tuples we just computed for `fillRect`, so we collect them
+  // into a scratch buffer during the main loop instead of re-running the
+  // culler. Collection is gated on `baseMeasures` being supplied AND the
+  // bucket being a singleton wide enough to fit at least one glyph.
+  const labelScratch = baseMeasures ? getScratchLabels() : null
   if (slices.count > 0) {
     // Binary-search the running-max-of-ends prefix to find the earliest
     // index whose slice could still reach into the viewport. Everything
@@ -114,6 +141,9 @@ export function drawFrame(args: DrawFrameArgs): void {
     const batches = getScratchBatches()
     const densityView = hasDensityCounts(slices) ? slices : null
     const counts = densityView?.counts
+    // Mipmap singletons need to indirect through `sourceStart` to reach the
+    // base measure; raw `SliceBuffers` use `i` directly.
+    const sourceStart = densityView?.sourceStart
 
     const rowH = rowHeight - ROW_VPAD_PX
     const starts = slices.starts
@@ -152,6 +182,27 @@ export function drawFrame(args: DrawFrameArgs): void {
       batch.y.push(y)
       batch.w.push(wCss)
       batch.h.push(rowH)
+
+      if (
+        labelScratch &&
+        bucketCount === 1 &&
+        wCss >= LABEL_MIN_WIDTH_PX &&
+        baseMeasures
+      ) {
+        // For a mipmap level we have to translate `sourceStart[i]` through
+        // `baseMeasures`; for raw SliceBuffers `i` is already the base index.
+        const baseIdx = sourceStart ? sourceStart[i] : i
+        const measure = baseMeasures[baseIdx]
+        if (measure !== undefined) {
+          labelScratch.push({
+            x: xCss,
+            y: y + rowH / 2,
+            w: wCss,
+            h: rowH,
+            name: measure.name,
+          })
+        }
+      }
     }
 
     for (const batch of batches.values()) {
@@ -205,6 +256,25 @@ export function drawFrame(args: DrawFrameArgs): void {
       }
     }
   }
+
+  // --- Slice labels (Phase 3.5). ---------------------------------------
+  // Drawn after every fillRect pass so the glyphs sit on top of their
+  // rects. One ctx.font / textBaseline / fillStyle assignment for the
+  // whole pass — measureText and cropText results are cached across
+  // frames so wide traces don't re-shape strings every paint.
+  if (labelScratch && labelScratch.length > 0) {
+    ctx.font = LABEL_FONT
+    ctx.textBaseline = LABEL_BASELINE
+    ctx.fillStyle = LABEL_COLOR
+    for (let i = 0; i < labelScratch.length; i++) {
+      const item = labelScratch[i]
+      const avail = item.w - 2 * LABEL_PAD_PX
+      if (avail <= 0) continue
+      const text = cropText(ctx, item.name, avail)
+      if (text.length === 0) continue
+      ctx.fillText(text, item.x + LABEL_PAD_PX, item.y)
+    }
+  }
 }
 
 function styleForBatch(packedColor: number, alphaStop: number): string {
@@ -241,5 +311,84 @@ function getScratchBatches(): Map<number, Batch> {
   return SCRATCH
 }
 
+interface LabelItem {
+  /** Slice rect left edge in CSS px, relative to canvas. */
+  x: number
+  /** Vertical text baseline center in CSS px, matches `LABEL_BASELINE`. */
+  y: number
+  /** Slice rect width in CSS px. Used to gate + crop. */
+  w: number
+  /** Slice rect height in CSS px. Reserved for future centering work. */
+  h: number
+  name: string
+}
+
+const LABEL_SCRATCH: LabelItem[] = []
+function getScratchLabels(): LabelItem[] {
+  LABEL_SCRATCH.length = 0
+  return LABEL_SCRATCH
+}
+
+// `ctx.measureText` is the dominant cost of the label pass. Cache by name
+// (font is frame-constant so it doesn't enter the key) and by (name, available
+// width) for the cropped result. The full-width cache is shared across frames,
+// so static measure names parse once for the lifetime of the page.
+const measureCache = new Map<string, number>()
+const cropCache = new Map<string, string>()
+const ELLIPSIS = '…'
+
+/**
+ * Trim `name` so it fits in `availPx`, preferring the full string when
+ * possible. Uses a cached `measureText` result for the full string and a
+ * binary search over character indices when truncation is needed.
+ *
+ * Width queries during the binary search aren't memoized (they're per-prefix,
+ * unbounded) but the final cropped string IS memoized, so subsequent frames
+ * with the same `(name, ⌊availPx⌋)` skip the search entirely.
+ */
+function cropText(
+  ctx: CanvasRenderingContext2D,
+  name: string,
+  availPx: number,
+): string {
+  if (name.length === 0 || availPx <= 0) return ''
+  let fullWidth = measureCache.get(name)
+  if (fullWidth === undefined) {
+    fullWidth = ctx.measureText(name).width
+    measureCache.set(name, fullWidth)
+  }
+  if (fullWidth <= availPx) return name
+
+  const cropKey = `${name}|${Math.floor(availPx)}`
+  const cached = cropCache.get(cropKey)
+  if (cached !== undefined) return cached
+
+  const ellipsisWidth = ctx.measureText(ELLIPSIS).width
+  if (ellipsisWidth >= availPx) {
+    cropCache.set(cropKey, '')
+    return ''
+  }
+
+  // Binary search the largest prefix length whose width + ellipsis fits.
+  let lo = 0
+  let hi = name.length
+  while (lo < hi) {
+    const mid = (lo + hi + 1) >>> 1
+    const w = ctx.measureText(name.slice(0, mid)).width + ellipsisWidth
+    if (w <= availPx) lo = mid
+    else hi = mid - 1
+  }
+  const result = lo === 0 ? '' : name.slice(0, lo) + ELLIPSIS
+  cropCache.set(cropKey, result)
+  return result
+}
+
 // Visible for tests.
-export const __test__ = {quantizeAlpha, ALPHA_STOPS, styleForBatch}
+export const __test__ = {
+  quantizeAlpha,
+  ALPHA_STOPS,
+  styleForBatch,
+  cropText,
+  measureCache,
+  cropCache,
+}

@@ -2,6 +2,7 @@ import {useCallback, useEffect, useMemo, useRef, useState} from 'react'
 import type {System, Timeline as TimelineModel, Track as TrackModel} from '../core'
 import TimelineSystem from './TimelineSystem'
 import {useTimelineZoom} from './timeline/useTimelineViewport'
+import {useTimelineHover, type HoverTrackLayout} from './timeline/useTimelineHover'
 import {containerDepth, ROW_HEIGHT} from './timeline/trackLayout'
 import {createViewportStore} from './timeline/viewportStore'
 
@@ -77,6 +78,10 @@ function systemHeightPx(
 
 export default function Timeline({timeline}: TimelineProps) {
   const scrollRef = useRef<HTMLDivElement | null>(null)
+  // Single floating tooltip element shared by all tracks. Lives in the
+  // outer scroller (not inside any TimelineSystem) so it can be positioned
+  // in viewport coordinates without escaping the row's stacking context.
+  const tooltipRef = useRef<HTMLDivElement | null>(null)
 
   // The viewport store is the single source of truth for pxPerMs /
   // scrollLeft / viewport dimensions that canvases need. It's created once
@@ -143,7 +148,26 @@ export default function Timeline({timeline}: TimelineProps) {
     //  - React setScrollTop is rAF-throttled because it only drives row
     //    virtualization, which doesn't need sub-frame resolution.
     const onScroll = (): void => {
-      store.set({scrollLeft: el.scrollLeft, scrollTop: el.scrollTop})
+      // Echo suppression: browsers round `scroller.scrollLeft = X` to the
+      // nearest integer pixel on write. When `useTimelineZoom.applyZoom`
+      // writes a sub-pixel target (e.g. 49.31) the browser stores 49 and
+      // fires a `scroll` event with the rounded value. If we just
+      // overwrote the store with that, we'd permanently lose the 0.31px
+      // sub-pixel component on every zoom tick — over a 20-tick burst
+      // the error compounds into > 10px of visible anchor drift.
+      //
+      // Fix: if the DOM's rounded scrollLeft is within 1px of the store's
+      // current (precise) value, assume this is our own echo and keep
+      // the precise value. Native user pans (wheel, drag on scrollbar,
+      // keyboard) always move by ≥ 1px so real pan events still
+      // propagate.
+      const domScrollLeft = el.scrollLeft
+      const storedScrollLeft = store.get().scrollLeft
+      if (Math.abs(domScrollLeft - storedScrollLeft) < 1) {
+        store.set({scrollTop: el.scrollTop})
+      } else {
+        store.set({scrollLeft: domScrollLeft, scrollTop: el.scrollTop})
+      }
       if (raf !== null) return
       raf = requestAnimationFrame(() => {
         raf = null
@@ -208,7 +232,13 @@ export default function Timeline({timeline}: TimelineProps) {
         return store.get().pxPerMs
       },
       get scrollLeft() {
-        return scrollRef.current?.scrollLeft ?? 0
+        // Prefer the store's precise value over `scrollRef.current.
+        // scrollLeft`: applyZoom writes a sub-pixel float that the DOM
+        // rounds to the nearest integer, and the scroll-listener's echo
+        // suppression keeps the precise value alive in the store. Tests
+        // and anchor math need the precise value to avoid compounding
+        // rounding errors across zoom ticks.
+        return store.get().scrollLeft
       },
       get scrollTop() {
         return scrollRef.current?.scrollTop ?? 0
@@ -254,10 +284,43 @@ export default function Timeline({timeline}: TimelineProps) {
     )
   }, [layout.items, visibleTop, visibleBottom])
 
+  // Flatten currently-mounted tracks into the row-list shape useTimelineHover
+  // wants. We pass the full vertical layout (not just `visibleSystems`) so
+  // that fast cursor moves during overscroll still hit-test correctly.
+  const hoverTrackRows = useMemo<HoverTrackLayout[]>(() => {
+    const rows: HoverTrackLayout[] = []
+    for (const sys of layout.items) {
+      if (!sys.expanded) continue
+      for (const tl of sys.tracks) {
+        rows.push({
+          track: tl.track,
+          topPx: tl.topPx,
+          heightPx: tl.heightPx,
+          expanded: tl.expanded,
+        })
+      }
+    }
+    return rows
+  }, [layout.items])
+
+  const eventTargetElRef = useRef<HTMLElement | null>(null)
+  const setEventTarget = useCallback((el: HTMLElement | null) => {
+    eventTargetElRef.current = el
+    eventTargetRef(el)
+  }, [eventTargetRef])
+
+  useTimelineHover({
+    scrollerRef: scrollRef,
+    eventTargetRef: eventTargetElRef,
+    store,
+    trackRows: hoverTrackRows,
+    tooltipRef,
+  })
+
   return (
     <div ref={scrollRef} className="relative flex-1 overflow-auto">
       <div
-        ref={eventTargetRef}
+        ref={setEventTarget}
         data-testid="timeline-event-surface"
         className="relative"
         style={{width: innerWidthPx, height: layout.totalHeightPx}}
@@ -275,6 +338,21 @@ export default function Timeline({timeline}: TimelineProps) {
           />
         ))}
       </div>
+      {/*
+        Floating tooltip. `position: fixed` keeps it pinned in viewport
+        coordinates regardless of scroll, and `pointer-events: none` so
+        cursor tracking through it never re-fires hit tests. The hover
+        hook mutates `textContent` and `style.transform` directly — no
+        React renders per mousemove.
+      */}
+      <div
+        ref={tooltipRef}
+        data-testid="timeline-tooltip"
+        role="tooltip"
+        aria-hidden="true"
+        className="pointer-events-none fixed left-0 top-0 z-50 max-w-xs whitespace-nowrap rounded border border-[#2d3748] bg-[#0b0f17]/95 px-2 py-1 text-xs text-[#e2e8f0] shadow-lg transition-opacity duration-75"
+        style={{opacity: 0, transform: 'translate(0px, 0px)'}}
+      />
     </div>
   )
 }
