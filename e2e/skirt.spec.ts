@@ -120,6 +120,18 @@ test.describe('Phase 3 skirt', () => {
     const box = await surface.boundingBox()
     if (!box) throw new Error('timeline surface not measurable')
 
+    // Zoom in first so there's a scrollable range to pan over; at
+    // initial fit-zoom (post-polish-pass clamp) innerWidth === viewport
+    // and a drag can't actually move scrollLeft.
+    await page.mouse.move(box.x + box.width / 2, box.y + 200)
+    await page.keyboard.down('Control')
+    for (let i = 0; i < 8; i++) {
+      await page.mouse.wheel(0, -100)
+      await page.waitForTimeout(8)
+    }
+    await page.keyboard.up('Control')
+    await page.waitForTimeout(120)
+
     await page.evaluate(() => window.__resetFillRectCount?.())
     await panBy(page, box, 200)
     await page.waitForTimeout(120)

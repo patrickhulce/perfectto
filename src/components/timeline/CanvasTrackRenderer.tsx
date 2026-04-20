@@ -9,6 +9,7 @@ import {drawFrame} from './canvas2d'
 import type {ViewportStore} from './viewportStore'
 import {ROW_HEIGHT} from './trackLayout'
 import {isSkirtEnabled} from './skirtFlag'
+import {computeAxisTicks} from './timeAxis'
 
 interface CanvasTrackRendererProps {
   track: TrackModel
@@ -152,6 +153,18 @@ function CanvasTrackRendererBase({
         ? track.mipmap.base.measures
         : track.buffers?.measures
 
+      // Compute tick positions from the same store snapshot the top
+      // `TimelineAxis` uses. Pure function, sub-millisecond per frame
+      // even for week-long traces, and sharing it guarantees the
+      // gridlines line up pixel-perfect with the axis labels.
+      const ticks = computeAxisTicks({
+        timelineStart: state.timelineStart,
+        timelineEnd: state.timelineEnd,
+        pxPerMs,
+        rangeStartMs: visibleStartMs,
+        rangeEndMs: visibleEndMs,
+      })
+
       drawFrame({
         ctx,
         slices,
@@ -165,6 +178,8 @@ function CanvasTrackRendererBase({
         canvasStartMs: msAtCanvasLeft,
         maxDepthExclusive: expanded ? Number.POSITIVE_INFINITY : 1,
         baseMeasures,
+        majorGridTicksMs: ticks.majorTicksMs,
+        minorGridTicksMs: ticks.minorTicksMs,
       })
 
       loaded = {

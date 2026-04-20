@@ -47,11 +47,22 @@ const KEY_ZOOM_DELTA_Y = 80
 const KEY_PAN_VIEWPORT_FRACTION = 0.1
 const KEY_PAN_MIN_PX = 60
 
-function clampPxPerMs(value: number, totalSpan: number): number {
+function clampPxPerMs(
+  value: number,
+  totalSpan: number,
+  minByFit: number,
+): number {
   const maxByWidth =
     totalSpan > 0 ? MAX_CONTENT_WIDTH_PX / totalSpan : MAX_PX_PER_MS
-  const lo = 1e-9
-  const hi = Math.min(MAX_PX_PER_MS, maxByWidth)
+  // `minByFit` is the pxPerMs at which innerWidthPx === viewport content
+  // width — i.e. the timeline exactly fills the track area with no
+  // horizontal scroll. Zooming out past this is disallowed: it would only
+  // produce an uncovered gap on the right (the "broken background" from
+  // the feedback screenshot) and has no analogue in Perfetto or Chrome
+  // DevTools. We still require a strictly positive lower bound so the
+  // very first mount (containerWidthPx === 0) doesn't collapse to zero.
+  const lo = Math.max(1e-9, minByFit)
+  const hi = Math.max(lo, Math.min(MAX_PX_PER_MS, maxByWidth))
   if (!Number.isFinite(value) || value <= 0) return lo
   return Math.max(lo, Math.min(hi, value))
 }
@@ -77,7 +88,15 @@ export function useTimelineZoom(
   const {bounds, labelWidthPx, containerWidthPx, scrollerRef, store} = options
 
   const totalSpan = Math.max(bounds.end - bounds.start, MIN_SPAN_MS)
-  const fitPxPerMs = containerWidthPx > 0 ? containerWidthPx / totalSpan : 0
+  // "Fit" means `innerWidthPx === containerWidthPx` — the surface exactly
+  // fills the visible track area with no horizontal scroll. innerWidthPx
+  // is `labelWidthPx + totalSpan * pxPerMs`, so fitPxPerMs subtracts the
+  // sticky label gutter. Previously this was `containerWidthPx /
+  // totalSpan`, which over-shot by labelWidth and put the timeline in a
+  // permanently-scrolled state at "fit" (#3) plus caused layout shift
+  // when zooming across the fit threshold (#4).
+  const contentWidthPx = Math.max(0, containerWidthPx - labelWidthPx)
+  const fitPxPerMs = contentWidthPx > 0 ? contentWidthPx / totalSpan : 0
 
   // `null` means "follow the fit zoom". As soon as the user zooms, we pin
   // `pxPerMs` explicitly and ignore subsequent container-width changes.
@@ -99,6 +118,10 @@ export function useTimelineZoom(
   labelWidthRef.current = labelWidthPx
   const storeRef = useRef(store)
   storeRef.current = store
+  // Kept in a ref so applyZoom can read the current fit without
+  // re-attaching its listener whenever the viewport resizes.
+  const fitPxPerMsRef = useRef(fitPxPerMs)
+  fitPxPerMsRef.current = fitPxPerMs
 
   // Keep the store's pxPerMs / labelWidthPx / bounds in sync with props even
   // outside a gesture (e.g. after the window resizes and fitPxPerMs changes).
@@ -140,7 +163,11 @@ export function useTimelineZoom(
       if (committed <= 0) return
 
       const scaleMultiplier = Math.exp(-deltaY * 0.0015)
-      const targetPxPerMs = clampPxPerMs(committed * scaleMultiplier, span)
+      const targetPxPerMs = clampPxPerMs(
+        committed * scaleMultiplier,
+        span,
+        fitPxPerMsRef.current,
+      )
       if (targetPxPerMs === committed) return
 
       const labelWidth = labelWidthRef.current
@@ -223,19 +250,37 @@ export function useTimelineZoom(
     }
 
     let panning:
-      | {pointerId: number; startClientX: number; startScrollLeft: number}
+      | {
+          pointerId: number
+          startClientX: number
+          startScrollLeft: number
+          button: number
+        }
       | null = null
 
     const onPointerDown = (e: PointerEvent): void => {
-      if (e.button !== 0) return
-      const target = e.target as HTMLElement | null
-      if (target?.closest('button, input, textarea, [data-no-pan]')) return
+      // Left click (0) and middle click (1) both start a drag-pan.
+      // Middle-click additionally bypasses the gutter-button/input
+      // filter — middle is conventionally "scroll this surface", so it
+      // should work even when the pointer lands on a toggle button.
+      const isLeft = e.button === 0
+      const isMiddle = e.button === 1
+      if (!isLeft && !isMiddle) return
+      if (isLeft) {
+        const target = e.target as HTMLElement | null
+        if (target?.closest('button, input, textarea, [data-no-pan]')) return
+      }
       const scroller = scrollerRef.current
       if (!scroller) return
+      // preventDefault on middle-click suppresses Chrome's classic
+      // auto-scroll cursor (the four-arrow widget) so the drag behaves
+      // like a regular pan.
+      if (isMiddle) e.preventDefault()
       panning = {
         pointerId: e.pointerId,
         startClientX: e.clientX,
         startScrollLeft: scroller.scrollLeft,
+        button: e.button,
       }
       try {
         el.setPointerCapture(e.pointerId)
@@ -347,6 +392,16 @@ export function useTimelineZoom(
       }
     }
 
+    // `auxclick` fires on middle (and right) button release. On Linux
+    // Chrome this triggers "paste from primary selection" — we want our
+    // middle-click-drag to feel like a pan, not paste random text into
+    // focused inputs, so we swallow the event when the button is 1.
+    // Note: pointerdown already called preventDefault, but browsers
+    // still dispatch auxclick unless we also cancel it here.
+    const onAuxClick = (e: MouseEvent): void => {
+      if (e.button === 1) e.preventDefault()
+    }
+
     el.addEventListener('wheel', onWheel, {passive: false})
     el.addEventListener('pointerdown', onPointerDown)
     el.addEventListener('pointermove', onPointerMove)
@@ -354,6 +409,7 @@ export function useTimelineZoom(
     el.addEventListener('pointerleave', onPointerLeaveTrack)
     el.addEventListener('pointerup', endPan)
     el.addEventListener('pointercancel', endPan)
+    el.addEventListener('auxclick', onAuxClick)
     el.addEventListener('gesturestart', onGesture as EventListener)
     el.addEventListener('gesturechange', onGesture as EventListener)
     el.addEventListener('gestureend', onGesture as EventListener)
@@ -367,6 +423,7 @@ export function useTimelineZoom(
       el.removeEventListener('pointerleave', onPointerLeaveTrack)
       el.removeEventListener('pointerup', endPan)
       el.removeEventListener('pointercancel', endPan)
+      el.removeEventListener('auxclick', onAuxClick)
       el.removeEventListener('gesturestart', onGesture as EventListener)
       el.removeEventListener('gesturechange', onGesture as EventListener)
       el.removeEventListener('gestureend', onGesture as EventListener)

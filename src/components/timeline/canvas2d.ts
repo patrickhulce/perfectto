@@ -46,10 +46,28 @@ export interface DrawFrameArgs {
    * undefined (e.g. unit tests that don't exercise text).
    */
   baseMeasures?: Measure[]
+  /**
+   * Absolute ms positions of major gridlines to bleed through the track
+   * (full-height strokes). Pre-computed once per frame by
+   * {@link CanvasTrackRenderer} via `computeAxisTicks` so every track +
+   * the top axis share a single tick grid. Optional: unit tests and
+   * other callers can omit it to skip the gridline pass entirely.
+   */
+  majorGridTicksMs?: Float64Array
+  /** Absolute ms positions of minor gridlines. See {@link majorGridTicksMs}. */
+  minorGridTicksMs?: Float64Array
 }
 
 /** Vertical padding inside a row (mirrors the old DOM renderer). */
 const ROW_VPAD_PX = 4
+
+/**
+ * Gridline tunables. Subtle-by-default colors so the measures stay the
+ * primary visual element; majors are ~30% brighter than minors so the
+ * labelled ticks read as anchors without competing with slice colors.
+ */
+const GRIDLINE_MAJOR_COLOR = 'rgba(160, 174, 192, 0.18)'
+const GRIDLINE_MINOR_COLOR = 'rgba(160, 174, 192, 0.08)'
 
 /**
  * Phase 3.5 label pass tunables. Below `LABEL_MIN_WIDTH_PX` the slice rect is
@@ -116,6 +134,48 @@ export function drawFrame(args: DrawFrameArgs): void {
 
   ctx.clearRect(0, 0, widthCss, heightCss)
   if (pxPerMs <= 0) return
+
+  // --- Gridlines (under everything). ------------------------------------
+  // Drawn before measures so slice rects always paint on top. Both
+  // passes batch into a single `beginPath` / `stroke` so we pay one
+  // rasterization regardless of how many ticks are visible. Xs are
+  // snapped to `round(x) + 0.5` so 1-px strokes land inside a single
+  // device pixel rather than blurring across two.
+  const {majorGridTicksMs, minorGridTicksMs} = args
+  if (
+    minorGridTicksMs &&
+    minorGridTicksMs.length > 0 &&
+    pxPerMs > 0
+  ) {
+    ctx.strokeStyle = GRIDLINE_MINOR_COLOR
+    ctx.lineWidth = 1
+    ctx.beginPath()
+    for (let i = 0; i < minorGridTicksMs.length; i++) {
+      const x = (minorGridTicksMs[i] - canvasStartMs) * pxPerMs
+      if (x < -1 || x > widthCss + 1) continue
+      const xPx = Math.round(x) + 0.5
+      ctx.moveTo(xPx, 0)
+      ctx.lineTo(xPx, heightCss)
+    }
+    ctx.stroke()
+  }
+  if (
+    majorGridTicksMs &&
+    majorGridTicksMs.length > 0 &&
+    pxPerMs > 0
+  ) {
+    ctx.strokeStyle = GRIDLINE_MAJOR_COLOR
+    ctx.lineWidth = 1
+    ctx.beginPath()
+    for (let i = 0; i < majorGridTicksMs.length; i++) {
+      const x = (majorGridTicksMs[i] - canvasStartMs) * pxPerMs
+      if (x < -1 || x > widthCss + 1) continue
+      const xPx = Math.round(x) + 0.5
+      ctx.moveTo(xPx, 0)
+      ctx.lineTo(xPx, heightCss)
+    }
+    ctx.stroke()
+  }
 
   // --- Measures (filled rects). -----------------------------------------
   // The label pass needs the same per-slice (xCss, wCss, rowYCenter,

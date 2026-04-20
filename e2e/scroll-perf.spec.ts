@@ -252,16 +252,10 @@ test.describe('Timeline interaction performance', () => {
       afterZoomIn.pxPerMs
     expect(zoomDrift, 'W zoom anchored at viewport center').toBeLessThan(2)
 
-    // ---- S zooms back out. ----------------------------------------------
-    for (let i = 0; i < 8; i++) await page.keyboard.press('s')
-    await page.waitForTimeout(48)
-    const afterZoomOut = await readSnapshot()
-    expect(
-      afterZoomOut.pxPerMs,
-      'S undoes zoom-in (pxPerMs returns near baseline)',
-    ).toBeLessThan(afterZoomIn.pxPerMs)
-
-    // ---- D pans right, A pans left. -------------------------------------
+    // ---- D pans right, A pans left. ------------------------------------
+    // Run pan tests BEFORE zooming back out: at fit (post-S) the
+    // clamp-to-fit logic leaves no scrollable range, so D would be a
+    // no-op. We're still zoomed in from the W burst here.
     const preD = await readSnapshot()
     await page.keyboard.press('d')
     // Pan is a synchronous scrollLeft mutation; the rAF-throttled scroll
@@ -280,6 +274,15 @@ test.describe('Timeline interaction performance', () => {
       afterA.scrollLeft,
       'A pans left (scrollLeft decreases)',
     ).toBeLessThan(afterD.scrollLeft)
+
+    // ---- S zooms back out. ----------------------------------------------
+    for (let i = 0; i < 8; i++) await page.keyboard.press('s')
+    await page.waitForTimeout(48)
+    const afterZoomOut = await readSnapshot()
+    expect(
+      afterZoomOut.pxPerMs,
+      'S undoes zoom-in (pxPerMs returns near baseline)',
+    ).toBeLessThan(afterZoomIn.pxPerMs)
   })
 
   test('vertical scroll through tracks stays smooth', async ({page}, testInfo) => {

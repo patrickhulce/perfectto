@@ -389,3 +389,178 @@ describe('drawFrame', () => {
     expect(fills.length).toBeGreaterThan(0)
   })
 })
+
+describe('drawFrame gridlines', () => {
+  interface StrokedSegment {
+    strokeStyle: string
+    moves: Array<[number, number]>
+    lines: Array<[number, number]>
+  }
+
+  function makeStrokeCtx(): {
+    ctx: CanvasRenderingContext2D
+    fills: Array<{x: number; y: number; w: number; h: number}>
+    strokes: StrokedSegment[]
+  } {
+    const strokes: StrokedSegment[] = []
+    const fills: Array<{x: number; y: number; w: number; h: number}> = []
+    let current: StrokedSegment | null = null
+    let strokeStyle = ''
+    const ctx = {
+      set fillStyle(_v: string) {
+        /* swallow */
+      },
+      get fillStyle() {
+        return ''
+      },
+      set strokeStyle(v: string) {
+        strokeStyle = v
+      },
+      get strokeStyle() {
+        return strokeStyle
+      },
+      lineWidth: 1,
+      clearRect: (_x: number, _y: number, _w: number, _h: number): void => {},
+      fillRect: (x: number, y: number, w: number, h: number): void => {
+        fills.push({x, y, w, h})
+      },
+      beginPath: (): void => {
+        current = {strokeStyle, moves: [], lines: []}
+      },
+      moveTo: (x: number, y: number): void => {
+        current?.moves.push([x, y])
+      },
+      lineTo: (x: number, y: number): void => {
+        current?.lines.push([x, y])
+      },
+      stroke: (): void => {
+        if (current) {
+          current.strokeStyle = strokeStyle
+          strokes.push(current)
+          current = null
+        }
+      },
+    } as unknown as CanvasRenderingContext2D
+    return {ctx, fills, strokes}
+  }
+
+  it('emits one stroke pass per non-empty tick array at the expected x-coords', () => {
+    const base = buildSliceBuffers(track([m('a', 0, 100, [], '#ff0000')]))
+    const {ctx, strokes} = makeStrokeCtx()
+
+    // Major ticks at 0/50/100 ms; minor at 25/75. At pxPerMs=2 these land
+    // on x = 0, 50, 100, 150, 200 respectively. canvasStartMs=0 so the
+    // gridlines start at the left edge.
+    drawFrame({
+      ctx,
+      slices: base,
+      marks: EMPTY_MARK_BUFFERS,
+      widthCss: 200,
+      heightCss: 20,
+      rowHeight: 20,
+      pxPerMs: 2,
+      visibleStartMs: 0,
+      visibleEndMs: 100,
+      canvasStartMs: 0,
+      maxDepthExclusive: Infinity,
+      majorGridTicksMs: new Float64Array([0, 50, 100]),
+      minorGridTicksMs: new Float64Array([25, 75]),
+    })
+
+    // Two stroke passes: one for minor, one for major. Minor emits first
+    // so major paints on top visually.
+    expect(strokes.length).toBe(2)
+    const [minor, major] = strokes
+    expect(minor.strokeStyle).toMatch(/rgba\(160, 174, 192, 0\.08\)/)
+    expect(major.strokeStyle).toMatch(/rgba\(160, 174, 192, 0\.18\)/)
+
+    // Each tick produces one (moveTo, lineTo) pair. `+0.5` pixel snap.
+    expect(minor.moves.map(([x]) => x)).toEqual([50.5, 150.5])
+    expect(major.moves.map(([x]) => x)).toEqual([0.5, 100.5, 200.5])
+    // Full-height vertical strokes.
+    for (const seg of strokes) {
+      for (let i = 0; i < seg.moves.length; i++) {
+        expect(seg.moves[i][1]).toBe(0)
+        expect(seg.lines[i][1]).toBe(20)
+        expect(seg.moves[i][0]).toBe(seg.lines[i][0])
+      }
+    }
+  })
+
+  it('skips gridline passes when no ticks are provided', () => {
+    const base = buildSliceBuffers(track([m('a', 0, 100, [], '#ff0000')]))
+    const {ctx, strokes} = makeStrokeCtx()
+    drawFrame({
+      ctx,
+      slices: base,
+      marks: EMPTY_MARK_BUFFERS,
+      widthCss: 200,
+      heightCss: 20,
+      rowHeight: 20,
+      pxPerMs: 2,
+      visibleStartMs: 0,
+      visibleEndMs: 100,
+      canvasStartMs: 0,
+      maxDepthExclusive: Infinity,
+    })
+    expect(strokes.length).toBe(0)
+  })
+
+  it('culls ticks that lie outside [0, widthCss]', () => {
+    const base = buildSliceBuffers(track([m('a', 0, 100, [], '#ff0000')]))
+    const {ctx, strokes} = makeStrokeCtx()
+    drawFrame({
+      ctx,
+      slices: base,
+      marks: EMPTY_MARK_BUFFERS,
+      widthCss: 100,
+      heightCss: 20,
+      rowHeight: 20,
+      pxPerMs: 1,
+      visibleStartMs: 0,
+      visibleEndMs: 100,
+      canvasStartMs: 0,
+      maxDepthExclusive: Infinity,
+      // 250 sits past the right edge at x=250, -50 past the left at
+      // x=-50, 50 is in-bounds, 0 and 100 are the edges.
+      majorGridTicksMs: new Float64Array([-50, 0, 50, 100, 250]),
+    })
+    expect(strokes.length).toBe(1)
+    const xs = strokes[0].moves.map(([x]) => x)
+    expect(xs).toEqual([0.5, 50.5, 100.5])
+  })
+
+  it('draws gridlines before any fillRect so slices paint on top', () => {
+    const base = buildSliceBuffers(track([m('a', 0, 100, [], '#ff0000')]))
+    const events: string[] = []
+    const ctx = {
+      set fillStyle(_v: string) {},
+      set strokeStyle(_v: string) {},
+      lineWidth: 1,
+      clearRect: () => {},
+      beginPath: () => events.push('beginPath'),
+      moveTo: () => {},
+      lineTo: () => {},
+      stroke: () => events.push('stroke'),
+      fillRect: () => events.push('fillRect'),
+    } as unknown as CanvasRenderingContext2D
+    drawFrame({
+      ctx,
+      slices: base,
+      marks: EMPTY_MARK_BUFFERS,
+      widthCss: 200,
+      heightCss: 20,
+      rowHeight: 20,
+      pxPerMs: 2,
+      visibleStartMs: 0,
+      visibleEndMs: 100,
+      canvasStartMs: 0,
+      maxDepthExclusive: Infinity,
+      majorGridTicksMs: new Float64Array([50]),
+    })
+    const firstStroke = events.indexOf('stroke')
+    const firstFill = events.indexOf('fillRect')
+    expect(firstStroke).toBeGreaterThanOrEqual(0)
+    expect(firstFill).toBeGreaterThan(firstStroke)
+  })
+})

@@ -5,6 +5,7 @@ import {useTimelineZoom} from './timeline/useTimelineViewport'
 import {useTimelineHover, type HoverTrackLayout} from './timeline/useTimelineHover'
 import {containerDepth, ROW_HEIGHT} from './timeline/trackLayout'
 import {createViewportStore} from './timeline/viewportStore'
+import TimelineAxis, {TIMELINE_AXIS_HEIGHT_PX} from './timeline/TimelineAxis'
 
 interface TimelineProps {
   timeline: TimelineModel
@@ -190,10 +191,13 @@ export default function Timeline({timeline}: TimelineProps) {
     store,
   })
 
-  // Precompute vertical layout with current expanded state.
+  // Precompute vertical layout with current expanded state. We reserve
+  // `TIMELINE_AXIS_HEIGHT_PX` at the top for the sticky time ruler so
+  // the first TimelineSystem starts just below it (systems are
+  // absolutely positioned within the event surface by their `topPx`).
   const layout = useMemo(() => {
     const items: SystemLayout[] = []
-    let y = 0
+    let y = TIMELINE_AXIS_HEIGHT_PX
     for (const system of timeline.systems) {
       const expanded = systemExpanded[system.id] ?? true
       const headerHeightPx = SYSTEM_HEADER_HEIGHT_PX + SYSTEM_BORDER_HEIGHT_PX
@@ -318,13 +322,23 @@ export default function Timeline({timeline}: TimelineProps) {
   })
 
   return (
-    <div ref={scrollRef} className="relative flex-1 overflow-auto">
+    <div
+      ref={scrollRef}
+      className="relative flex-1 overflow-auto"
+      // Reserve scrollbar-gutter space in both axes at all times so zooming
+      // across the fit threshold (where the horizontal scrollbar
+      // appears/disappears) doesn't reflow the tracks vertically, and
+      // vertical scrollbar appearance on tall traces doesn't shift the axis
+      // tick labels horizontally.
+      style={{scrollbarGutter: 'stable'}}
+    >
       <div
         ref={setEventTarget}
         data-testid="timeline-event-surface"
         className="relative"
         style={{width: innerWidthPx, height: layout.totalHeightPx}}
       >
+        <TimelineAxis store={store} labelWidthPx={LABEL_WIDTH_PX} />
         {visibleSystems.map(item => (
           <TimelineSystem
             key={item.system.id}
