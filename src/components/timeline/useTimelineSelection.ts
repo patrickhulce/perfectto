@@ -1,6 +1,8 @@
 import {useEffect, type RefObject} from 'react'
 import type {SelectionStore} from './selectionStore'
 import type {ViewportStore} from './viewportStore'
+import type {InputBindingsStore} from './inputBindingsStore'
+import {matchGesture, modsFromEvent} from './inputBindings'
 
 export interface UseTimelineSelectionOptions {
   /** Outer scroll container — its bounding rect maps client coords. */
@@ -17,6 +19,14 @@ export interface UseTimelineSelectionOptions {
    * matching the imperative pattern used by `useTimelineHover`.
    */
   tooltipRef: RefObject<HTMLElement | null>
+  /**
+   * Input-binding store. When provided, the main-surface left-drag
+   * only starts a selection if the current binding for `leftDrag`
+   * (with the active modifiers) resolves to `selection.selectRange`.
+   * The overview-canvas drag always selects regardless, because that
+   * canvas has no other affordance. Optional for test-only usage.
+   */
+  bindingsStore?: InputBindingsStore
 }
 
 /** Minimum pointer movement (in CSS px) before a click promotes to a drag. */
@@ -52,6 +62,7 @@ export function useTimelineSelection(
     store,
     selectionStore,
     tooltipRef,
+    bindingsStore,
   } = options
 
   useEffect(() => {
@@ -135,6 +146,19 @@ export function useTimelineSelection(
         return
       }
 
+      // Bindings gate on the main surface only. The overview canvas
+      // always selects on left-drag regardless of preset — it has no
+      // other affordance and rebinding it would be surprising.
+      if (source === 'main' && bindingsStore) {
+        const mods = modsFromEvent(e)
+        const action = matchGesture('leftDrag', mods, bindingsStore.get().bindings)
+        if (action !== 'selection.selectRange') {
+          // Some other hook (or the viewport hook) owns this
+          // gesture; leave the pointer alone.
+          return
+        }
+      }
+
       const host = (source === 'overview' ? overviewCanvasRef.current : eventTargetRef.current) as HTMLElement | null
       if (!host) return
 
@@ -211,13 +235,25 @@ export function useTimelineSelection(
         //     to deselect" gesture. Clicks inside the committed range
         //     are preserved so the user can still click through to
         //     inspect slices within their selection.
+        //
+        // The deselect step is gated on the `click` binding matching
+        // `selection.deselect` so users who rebind click to something
+        // else (or to `none`) don't lose their selection on incidental
+        // clicks. All built-in presets keep this binding as deselect.
         selectionStore.cancel()
-        const committed = selectionStore.get().committed
-        if (committed !== null) {
-          const inside = anchorMs >= committed.startMs && anchorMs <= committed.endMs
-          if (!inside) {
-            selectionStore.setCommitted(null)
+        const clickAction = bindingsStore
+          ? matchGesture('click', modsFromEvent(e), bindingsStore.get().bindings)
+          : 'selection.deselect'
+        if (clickAction === 'selection.deselect') {
+          const committed = selectionStore.get().committed
+          if (committed !== null) {
+            const inside = anchorMs >= committed.startMs && anchorMs <= committed.endMs
+            if (!inside) {
+              selectionStore.setCommitted(null)
+            }
           }
+        } else if (clickAction === 'selection.clearSelection') {
+          selectionStore.clear()
         }
       }
       hideTooltip()
@@ -264,6 +300,7 @@ export function useTimelineSelection(
     store,
     selectionStore,
     tooltipRef,
+    bindingsStore,
   ])
 }
 

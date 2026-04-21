@@ -168,7 +168,10 @@ function CanvasTrackRendererBase({
       drawFrame({
         ctx,
         slices,
-        marks: track.markBuffers ?? EMPTY_MARK_BUFFERS,
+        // Marks intentionally suppressed for now — the 2px orange ticks drown
+        // the measures visually on dense traces. Re-enable once we have a
+        // density/zoom gate that keeps them legible without overwhelming.
+        marks: EMPTY_MARK_BUFFERS,
         widthCss: canvasWidthCss,
         heightCss,
         rowHeight: ROW_HEIGHT,
@@ -319,7 +322,7 @@ function CanvasTrackRendererBase({
         aria-expanded={canToggle ? expanded : undefined}
         data-no-pan
         className={
-          'flex items-start gap-1 border-r border-[#2d3748] bg-[#11151d] px-2 py-2 text-left text-xs text-[#a0aec0]' +
+          'flex items-start gap-2 border-r border-[#2d3748] bg-[#11151d] px-4 py-2 text-left text-xs text-[#a0aec0]' +
           (canToggle ? ' cursor-pointer hover:bg-[#151b25]' : ' cursor-default')
         }
         style={{

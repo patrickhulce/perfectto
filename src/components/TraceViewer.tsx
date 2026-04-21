@@ -10,6 +10,23 @@ import Aggregator from './Aggregator'
 import Metadata from './Metadata'
 import Timeline from './Timeline'
 import {createSelectionStore} from './timeline/selectionStore'
+import {
+  createInputBindingsStore,
+  type InputBindingsStore,
+} from './timeline/inputBindingsStore'
+
+/**
+ * Input-binding settings are app-wide (a user's preferred matrix
+ * shouldn't reset when they load a new trace), so the store lives at
+ * module scope and hydrates from localStorage once on first import.
+ */
+let sharedInputBindingsStore: InputBindingsStore | null = null
+function getBindingsStore(): InputBindingsStore {
+  if (sharedInputBindingsStore === null) {
+    sharedInputBindingsStore = createInputBindingsStore()
+  }
+  return sharedInputBindingsStore
+}
 
 interface TraceViewerProps {
   trace: ParsedTrace
@@ -36,6 +53,8 @@ export default function TraceViewer({trace, onBack}: TraceViewerProps) {
     return applyPersona(trace, persona)
   }, [trace, activePersonaId, detectedPersona])
 
+  const bindingsStore = getBindingsStore()
+
   return (
     <div className="flex h-screen min-h-0 flex-col">
       <Metadata
@@ -45,11 +64,13 @@ export default function TraceViewer({trace, onBack}: TraceViewerProps) {
         activePersonaId={appliedPersona.persona.id}
         detectedPersonaId={detectedPersona.id}
         onPersonaChange={setActivePersonaId}
+        bindingsStore={bindingsStore}
       />
       <Timeline
         timeline={trace.timeline}
         selectionStore={selectionStore}
         appliedPersona={appliedPersona}
+        bindingsStore={bindingsStore}
       />
       <Aggregator selectionStore={selectionStore} />
     </div>

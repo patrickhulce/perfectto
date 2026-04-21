@@ -1,6 +1,15 @@
 import {useEffect, useRef, useState, type RefObject} from 'react'
 import {ViewportStore} from './viewportStore'
 import type {SelectionStore} from './selectionStore'
+import type {InputBindingsStore} from './inputBindingsStore'
+import {
+  matchGesture,
+  modsFromEvent,
+  normalizeKey,
+  type Action,
+  type Modifier,
+} from './inputBindings'
+import {classifyWheel, createCtrlTracker} from './trackpadDetect'
 
 export interface TimelineBounds {
   start: number
@@ -30,6 +39,12 @@ export interface UseTimelineZoomOptions {
    * selection UI.
    */
   selectionStore?: SelectionStore
+  /**
+   * Input-binding store that drives which gesture triggers which
+   * action. Optional so tests (and any future minimal usage) can fall
+   * back to the historical hardcoded behavior.
+   */
+  bindingsStore?: InputBindingsStore
 }
 
 export interface UseTimelineZoomResult {
@@ -104,7 +119,15 @@ function clampPxPerMs(
 export function useTimelineZoom(
   options: UseTimelineZoomOptions,
 ): UseTimelineZoomResult {
-  const {bounds, labelWidthPx, containerWidthPx, scrollerRef, store, selectionStore} = options
+  const {
+    bounds,
+    labelWidthPx,
+    containerWidthPx,
+    scrollerRef,
+    store,
+    selectionStore,
+    bindingsStore,
+  } = options
 
   const totalSpan = Math.max(bounds.end - bounds.start, MIN_SPAN_MS)
   // "Fit" means `innerWidthPx === containerWidthPx` — the surface exactly
@@ -143,6 +166,8 @@ export function useTimelineZoom(
   fitPxPerMsRef.current = fitPxPerMs
   const selectionStoreRef = useRef(selectionStore)
   selectionStoreRef.current = selectionStore
+  const bindingsStoreRef = useRef(bindingsStore)
+  bindingsStoreRef.current = bindingsStore
 
   // Keep the store's pxPerMs / labelWidthPx / bounds in sync with props even
   // outside a gesture (e.g. after the window resizes and fitPxPerMs changes).
@@ -166,6 +191,34 @@ export function useTimelineZoom(
 
     let lastCursorClientX = 0
     let cursorOverTimeline = false
+
+    // Real-Ctrl tracker for classifying pinch-vs-ctrl+wheel. See
+    // `trackpadDetect.ts` for the rationale — browsers synthesise
+    // `ctrlKey=true` on wheel events during a pinch gesture.
+    const ctrlTracker = createCtrlTracker()
+
+    /**
+     * Resolve the action bound to a non-key gesture with the given
+     * modifiers. Returns `'none'` when there's no binding or no
+     * bindings store is provided (so tests still work without a store).
+     */
+    const resolveAction = (
+      kind: 'wheel' | 'leftDrag' | 'middleDrag' | 'click',
+      mods: readonly Modifier[],
+    ): Action => {
+      const bs = bindingsStoreRef.current
+      if (!bs) {
+        // Back-compat fallback: emulate the historical hardcoded
+        // behavior so tests that don't pass a bindings store still see
+        // the old model (ctrl/cmd+wheel zooms, middle-drag pans).
+        if (kind === 'wheel' && (mods.includes('ctrl') || mods.includes('cmd'))) {
+          return 'viewport.scrollZoom'
+        }
+        if (kind === 'middleDrag' && mods.length === 0) return 'viewport.panBoth'
+        return 'none'
+      }
+      return matchGesture(kind, mods, bs.get().bindings)
+    }
 
     /**
      * Recompute `pxPerMs` and the scroll offset that pins `anchorClientX` to
@@ -255,76 +308,320 @@ export function useTimelineZoom(
       })
     }
 
+    const WHEEL_NUDGE_STEP_PX = 60
+
     const onWheel = (e: WheelEvent): void => {
       const scroller = scrollerRef.current
       if (!scroller) return
-      const zooming = e.ctrlKey || e.metaKey
-      if (!zooming) return // native scroll handles pan in both axes
-      e.preventDefault()
-      applyZoom(e.deltaY, e.clientX)
+
+      // Trackpad gestures bypass the binding matrix: a two-finger
+      // swipe must always scroll and a pinch must always zoom,
+      // regardless of what `wheel` is bound to. Only a physical mouse
+      // wheel is routed through the matrix.
+      const kind = classifyWheel(e, ctrlTracker.isCtrlDown())
+      if (kind === 'trackpad-pinch') {
+        e.preventDefault()
+        applyZoom(e.deltaY, e.clientX)
+        return
+      }
+      if (kind === 'trackpad-scroll') {
+        // Let the native scroller handle both axes — don't
+        // preventDefault. The matrix only covers `wheel`, not trackpad
+        // two-finger scrolls.
+        return
+      }
+
+      const mods = modsFromEvent(e)
+      const action = resolveAction('wheel', mods)
+      // Choose the dominant axis so sideways-scroll mice still feel
+      // right when the binding expects vertical delta.
+      const dominantDelta =
+        Math.abs(e.deltaY) >= Math.abs(e.deltaX) ? e.deltaY : e.deltaX
+      switch (action) {
+        case 'viewport.scrollZoom':
+          e.preventDefault()
+          applyZoom(dominantDelta, e.clientX)
+          return
+        case 'viewport.scrollHorizontal':
+        case 'viewport.panHorizontal':
+          e.preventDefault()
+          scroller.scrollLeft += dominantDelta
+          return
+        case 'viewport.scrollVertical':
+        case 'viewport.panVertical':
+          // Native scroll on the outer scroller handles vertical pan
+          // already. Returning without preventDefault lets the
+          // browser do its job (including inertial scroll on Mac).
+          return
+        case 'viewport.nudgeIn':
+          e.preventDefault()
+          applyZoom(-KEY_ZOOM_DELTA_Y, e.clientX)
+          return
+        case 'viewport.nudgeOut':
+          e.preventDefault()
+          applyZoom(KEY_ZOOM_DELTA_Y, e.clientX)
+          return
+        case 'viewport.nudgeLeft':
+          e.preventDefault()
+          scroller.scrollLeft -= WHEEL_NUDGE_STEP_PX
+          return
+        case 'viewport.nudgeRight':
+          e.preventDefault()
+          scroller.scrollLeft += WHEEL_NUDGE_STEP_PX
+          return
+        default:
+          // 'none' or selection actions — nothing sensible to do with
+          // a wheel. Let the default scroll happen.
+          return
+      }
     }
 
-    // Safari trackpad pinch dispatches gesture events instead of ctrl+wheel;
-    // swallow them so the page can't zoom.
-    const onGesture = (e: Event): void => {
+    /**
+     * Safari trackpad pinch dispatches `gesturestart`/`gesturechange`/
+     * `gestureend` instead of synthetic ctrl+wheel. We always zoom
+     * regardless of preset (same rule as trackpad-pinch on Chrome),
+     * anchored at the gesture's reported coordinates. Without the
+     * `preventDefault` the browser page-zooms.
+     */
+    let gestureStartScale = 1
+    let gestureStartClientX = 0
+    const onGestureStart = (e: Event): void => {
       e.preventDefault()
+      const ge = e as Event & {scale?: number; clientX?: number}
+      gestureStartScale = ge.scale ?? 1
+      gestureStartClientX = ge.clientX ?? 0
+    }
+    const onGestureChange = (e: Event): void => {
+      e.preventDefault()
+      const ge = e as Event & {scale?: number; clientX?: number}
+      const scale = ge.scale ?? 1
+      if (scale === gestureStartScale || scale <= 0) return
+      // Convert Safari's multiplicative scale into the additive
+      // deltaY our `applyZoom` expects (which uses
+      // `Math.exp(-deltaY * 0.0015)` internally). Solving for deltaY
+      // at the ratio gives a smooth, pinch-proportional zoom.
+      const ratio = scale / gestureStartScale
+      const deltaY = -Math.log(ratio) / 0.0015
+      gestureStartScale = scale
+      const anchorX = ge.clientX ?? gestureStartClientX
+      applyZoom(deltaY, anchorX)
+    }
+    const onGestureEnd = (e: Event): void => {
+      e.preventDefault()
+      gestureStartScale = 1
     }
 
+    /**
+     * Active pointer gesture tracked by this hook. Covers:
+     *  - `pan-*`: a drag that moves scrollLeft/scrollTop.
+     *  - `click-track`: a left-click that hasn't crossed the 3px
+     *    threshold yet. If pointerup fires before the threshold, we
+     *    dispatch whatever the `click` gesture is bound to.
+     */
+    type PanAxes = 'x' | 'y' | 'both'
     let panning:
       | {
+          kind: 'pan'
+          axes: PanAxes
           pointerId: number
           startClientX: number
           startClientY: number
           startScrollLeft: number
           startScrollTop: number
           button: number
-          /** Inline `cursor` before middle-button pan; restore on release. */
+          /** Inline `cursor` before pan; restore on release. */
           cursorBefore?: string
+        }
+      | {
+          kind: 'click-track'
+          pointerId: number
+          startClientX: number
+          startClientY: number
         }
       | null = null
 
+    const CLICK_THRESHOLD_PX = 3
+
+    const panAxesForAction = (action: Action): PanAxes | null => {
+      switch (action) {
+        case 'viewport.panBoth':
+          return 'both'
+        case 'viewport.panHorizontal':
+          return 'x'
+        case 'viewport.panVertical':
+          return 'y'
+        default:
+          return null
+      }
+    }
+
+    /**
+     * Actions that make sense to dispatch on a discrete click event
+     * (viewport-owned subset). Selection-side click actions (`deselect`)
+     * are handled in `useTimelineSelection` since that hook owns the
+     * committed-range state the deselect decision depends on.
+     */
+    const dispatchClickAction = (action: Action, clientX: number): void => {
+      switch (action) {
+        case 'viewport.scrollZoom':
+        case 'viewport.nudgeIn':
+          applyZoom(-KEY_ZOOM_DELTA_Y, clientX)
+          return
+        case 'viewport.nudgeOut':
+          applyZoom(KEY_ZOOM_DELTA_Y, clientX)
+          return
+        case 'selection.zoomToSelection': {
+          const sel = selectionStoreRef.current
+          const committed = sel?.get().committed
+          if (committed && committed.endMs > committed.startMs) {
+            zoomToRange(committed.startMs, committed.endMs)
+          }
+          return
+        }
+        case 'selection.clearSelection': {
+          const sel = selectionStoreRef.current
+          sel?.clear()
+          return
+        }
+        default:
+          // `selection.deselect` and other selection actions belong to
+          // the selection hook; leave them alone here.
+          return
+      }
+    }
+
     const onPointerDown = (e: PointerEvent): void => {
-      // Only middle-button (1) starts a pan now. Left-button is owned by
-      // `useTimelineSelection` and used for drag-selection. Right-click
-      // falls through to the native context menu.
-      if (e.button !== 1) return
       const scroller = scrollerRef.current
       if (!scroller) return
-      // preventDefault on middle-click suppresses Chrome's classic
-      // auto-scroll cursor (the four-arrow widget) so the drag behaves
-      // like a regular pan.
-      e.preventDefault()
-      panning = {
-        pointerId: e.pointerId,
-        startClientX: e.clientX,
-        startClientY: e.clientY,
-        startScrollLeft: scroller.scrollLeft,
-        startScrollTop: scroller.scrollTop,
-        button: e.button,
-        cursorBefore: el.style.cursor,
+
+      const target = e.target as HTMLElement | null
+      const overInteractive = !!target?.closest(
+        'button, input, textarea, [data-no-pan]',
+      )
+
+      const mods = modsFromEvent(e)
+
+      if (e.button === 1) {
+        // Middle-click is conventionally "pan this surface" — it
+        // bypasses the interactive-chrome filter so dragging from a
+        // gutter toggle still pans. Left-click keeps the filter so
+        // row-expand buttons still fire on plain clicks.
+        // Middle-button: consult the `middleDrag` binding.
+        const action = resolveAction('middleDrag', mods)
+        const axes = panAxesForAction(action)
+        if (axes === null) return
+        // preventDefault on middle-click suppresses Chrome's classic
+        // auto-scroll cursor (the four-arrow widget) so the drag
+        // behaves like a regular pan.
+        e.preventDefault()
+        panning = {
+          kind: 'pan',
+          axes,
+          pointerId: e.pointerId,
+          startClientX: e.clientX,
+          startClientY: e.clientY,
+          startScrollLeft: scroller.scrollLeft,
+          startScrollTop: scroller.scrollTop,
+          button: e.button,
+          cursorBefore: el.style.cursor,
+        }
+        el.style.cursor = 'grabbing'
+        try {
+          el.setPointerCapture(e.pointerId)
+        } catch {
+          // Non-capture-eligible target; ignore.
+        }
+        return
       }
-      el.style.cursor = 'grabbing'
-      try {
-        el.setPointerCapture(e.pointerId)
-      } catch {
-        // setPointerCapture can throw if the target isn't capture-eligible;
-        // ignore.
+
+      if (e.button === 0) {
+        // Row-chrome toggles win over left-drag pans so the user can
+        // still click the expand affordance — same contract the
+        // selection hook applies for left-drag-to-select.
+        if (overInteractive) return
+        // Left-button: the selection hook owns this sequence when
+        // `leftDrag` is bound to `selection.selectRange`. Otherwise
+        // we handle it here as a pan or a click-track.
+        const action = resolveAction('leftDrag', mods)
+        if (action === 'selection.selectRange') return
+        const axes = panAxesForAction(action)
+        if (axes !== null) {
+          panning = {
+            kind: 'pan',
+            axes,
+            pointerId: e.pointerId,
+            startClientX: e.clientX,
+            startClientY: e.clientY,
+            startScrollLeft: scroller.scrollLeft,
+            startScrollTop: scroller.scrollTop,
+            button: e.button,
+            cursorBefore: el.style.cursor,
+          }
+          el.style.cursor = 'grabbing'
+          try {
+            el.setPointerCapture(e.pointerId)
+          } catch {
+            // Non-capture-eligible target; ignore.
+          }
+          return
+        }
+        // `leftDrag` bound to none or to something we don't handle
+        // (nudge-on-drag isn't meaningful). Track the pointer so we
+        // can still dispatch the `click` binding on short releases.
+        panning = {
+          kind: 'click-track',
+          pointerId: e.pointerId,
+          startClientX: e.clientX,
+          startClientY: e.clientY,
+        }
+        return
       }
     }
 
     const onPointerMove = (e: PointerEvent): void => {
       if (!panning || e.pointerId !== panning.pointerId) return
+      if (panning.kind === 'click-track') {
+        const dx = e.clientX - panning.startClientX
+        const dy = e.clientY - panning.startClientY
+        if (Math.abs(dx) >= CLICK_THRESHOLD_PX || Math.abs(dy) >= CLICK_THRESHOLD_PX) {
+          // Abandon click tracking once the user crosses the drag
+          // threshold. No drag action is bound, so we simply stop
+          // caring about this pointer sequence.
+          panning = null
+        }
+        return
+      }
       const scroller = scrollerRef.current
       if (!scroller) return
       const dx = e.clientX - panning.startClientX
       const dy = e.clientY - panning.startClientY
       if (dx === 0 && dy === 0) return
-      scroller.scrollLeft = panning.startScrollLeft - dx
-      scroller.scrollTop = panning.startScrollTop - dy
+      if (panning.axes === 'x' || panning.axes === 'both') {
+        scroller.scrollLeft = panning.startScrollLeft - dx
+      }
+      if (panning.axes === 'y' || panning.axes === 'both') {
+        scroller.scrollTop = panning.startScrollTop - dy
+      }
     }
 
     const endPan = (e: PointerEvent): void => {
       if (!panning || e.pointerId !== panning.pointerId) return
+      if (panning.kind === 'click-track') {
+        const dx = e.clientX - panning.startClientX
+        const dy = e.clientY - panning.startClientY
+        const isClick =
+          Math.abs(dx) < CLICK_THRESHOLD_PX && Math.abs(dy) < CLICK_THRESHOLD_PX
+        panning = null
+        if (!isClick) return
+        const action = resolveAction('click', modsFromEvent(e))
+        // `selection.deselect` is intentionally left to the selection
+        // hook (it needs the anchor's ms to decide inside/outside the
+        // committed range). Everything else dispatches here.
+        if (action !== 'selection.deselect') {
+          dispatchClickAction(action, e.clientX)
+        }
+        return
+      }
       const cursorBefore = panning.cursorBefore
       try {
         el.releasePointerCapture(e.pointerId)
@@ -343,16 +640,6 @@ export function useTimelineZoom(
     }
     const onPointerLeaveTrack = (): void => {
       cursorOverTimeline = false
-    }
-
-    const shouldHandleKey = (e: KeyboardEvent): boolean => {
-      if (e.ctrlKey || e.metaKey || e.altKey) return false
-      const active = document.activeElement as HTMLElement | null
-      if (!active) return true
-      const tag = active.tagName
-      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return false
-      if (active.isContentEditable) return false
-      return true
     }
 
     const resolveZoomAnchor = (): number => {
@@ -430,88 +717,95 @@ export function useTimelineZoom(
       })
     }
 
-    const onKeyDown = (e: KeyboardEvent): void => {
-      // Z / Shift+Z and Escape are handled even under some modifier sets
-      // that `shouldHandleKey` would otherwise gate out — specifically,
-      // Z zoom-to-selection is allowed with Shift (to clear).
-      if (e.key === 'Escape') {
-        const sel = selectionStoreRef.current
-        if (sel && (sel.get().committed || sel.get().inProgress)) {
-          e.preventDefault()
-          sel.clear()
-          return
-        }
-      }
-      if ((e.key === 'z' || e.key === 'Z') && !e.ctrlKey && !e.metaKey && !e.altKey) {
-        const sel = selectionStoreRef.current
-        const active = document.activeElement as HTMLElement | null
-        const inField =
-          !!active &&
-          (active.tagName === 'INPUT' ||
-            active.tagName === 'TEXTAREA' ||
-            active.tagName === 'SELECT' ||
-            active.isContentEditable)
-        if (inField) return
-        if (e.shiftKey) {
-          if (sel) {
-            e.preventDefault()
-            sel.clear()
-          }
-          return
-        }
-        const committed = sel?.get().committed
-        if (committed && committed.endMs > committed.startMs) {
-          e.preventDefault()
-          zoomToRange(committed.startMs, committed.endMs)
-          return
-        }
-        // No selection → fall through; Z has no other binding.
-        return
-      }
-      if (!shouldHandleKey(e)) return
-      switch (e.key) {
-        case 'w':
-        case 'W':
-          e.preventDefault()
-          applyZoom(
-            -KEY_ZOOM_DELTA_Y * KEYBOARD_NAV_SCALE,
-            resolveZoomAnchor(),
-          )
-          break
-        case 's':
-        case 'S':
-          e.preventDefault()
+    /**
+     * Keyboard nudge step size in CSS pixels. Smaller than the
+     * `KEYBOARD_NAV_SCALE`-boosted zoom step because A/D presses are
+     * typically rapid-fire (users hold them down) and a 3x-scaled pan
+     * overshoots the region under inspection on every tap.
+     */
+    const keyboardPanStep = (): number => {
+      const scroller = scrollerRef.current
+      if (!scroller) return KEY_PAN_MIN_PX
+      return Math.max(
+        KEY_PAN_MIN_PX,
+        scroller.clientWidth * KEY_PAN_VIEWPORT_FRACTION,
+      )
+    }
+
+    /**
+     * Dispatch a bound action as a keyboard event — W/S nudge, A/D
+     * pan, Z zoom-to-selection, Escape clear, etc. Returns whether
+     * the caller should `preventDefault`.
+     */
+    const dispatchKeyAction = (action: Action): boolean => {
+      switch (action) {
+        case 'viewport.nudgeIn':
+          applyZoom(-KEY_ZOOM_DELTA_Y * KEYBOARD_NAV_SCALE, resolveZoomAnchor())
+          return true
+        case 'viewport.nudgeOut':
           applyZoom(KEY_ZOOM_DELTA_Y * KEYBOARD_NAV_SCALE, resolveZoomAnchor())
-          break
-        case 'a':
-        case 'A': {
-          const scroller = scrollerRef.current
-          if (!scroller) return
-          e.preventDefault()
-          const step =
-            KEYBOARD_NAV_SCALE *
-            Math.max(
-              KEY_PAN_MIN_PX,
-              scroller.clientWidth * KEY_PAN_VIEWPORT_FRACTION,
-            )
-          keyboardPan(-step)
-          break
+          return true
+        case 'viewport.nudgeLeft':
+          keyboardPan(-keyboardPanStep())
+          return true
+        case 'viewport.nudgeRight':
+          keyboardPan(keyboardPanStep())
+          return true
+        case 'viewport.scrollZoom':
+          applyZoom(-KEY_ZOOM_DELTA_Y * KEYBOARD_NAV_SCALE, resolveZoomAnchor())
+          return true
+        case 'viewport.scrollHorizontal':
+        case 'viewport.panHorizontal':
+          keyboardPan(keyboardPanStep())
+          return true
+        case 'selection.zoomToSelection': {
+          const sel = selectionStoreRef.current
+          const committed = sel?.get().committed
+          if (committed && committed.endMs > committed.startMs) {
+            zoomToRange(committed.startMs, committed.endMs)
+            return true
+          }
+          return false
         }
-        case 'd':
-        case 'D': {
-          const scroller = scrollerRef.current
-          if (!scroller) return
-          e.preventDefault()
-          const step =
-            KEYBOARD_NAV_SCALE *
-            Math.max(
-              KEY_PAN_MIN_PX,
-              scroller.clientWidth * KEY_PAN_VIEWPORT_FRACTION,
-            )
-          keyboardPan(step)
-          break
+        case 'selection.clearSelection': {
+          const sel = selectionStoreRef.current
+          if (sel && (sel.get().committed || sel.get().inProgress)) {
+            sel.clear()
+            return true
+          }
+          return false
         }
+        default:
+          return false
       }
+    }
+
+    /**
+     * Key handler: consults the bindings matrix first, with a couple
+     * of exceptions for inputs. Escape is always allowed through
+     * `shouldHandleKey`-style input filtering because clearing the
+     * selection is useful even when focus is elsewhere on the page.
+     */
+    const onKeyDown = (e: KeyboardEvent): void => {
+      const bs = bindingsStoreRef.current
+      if (!bs) return
+      // Gate out typing in real inputs so rebinding 'w' to something
+      // doesn't hijack every W keypress in the app.
+      const active = document.activeElement as HTMLElement | null
+      const inField =
+        !!active &&
+        (active.tagName === 'INPUT' ||
+          active.tagName === 'TEXTAREA' ||
+          active.tagName === 'SELECT' ||
+          active.isContentEditable)
+      if (inField) return
+
+      const mods = modsFromEvent(e)
+      const key = normalizeKey(e.key)
+      const action = matchGesture('key', mods, bs.get().bindings, key)
+      if (action === 'none') return
+      const consumed = dispatchKeyAction(action)
+      if (consumed) e.preventDefault()
     }
 
     // `auxclick` fires on middle (and right) button release. On Linux
@@ -532,9 +826,9 @@ export function useTimelineZoom(
     el.addEventListener('pointerup', endPan)
     el.addEventListener('pointercancel', endPan)
     el.addEventListener('auxclick', onAuxClick)
-    el.addEventListener('gesturestart', onGesture as EventListener)
-    el.addEventListener('gesturechange', onGesture as EventListener)
-    el.addEventListener('gestureend', onGesture as EventListener)
+    el.addEventListener('gesturestart', onGestureStart as EventListener)
+    el.addEventListener('gesturechange', onGestureChange as EventListener)
+    el.addEventListener('gestureend', onGestureEnd as EventListener)
     window.addEventListener('keydown', onKeyDown)
 
     return () => {
@@ -546,10 +840,11 @@ export function useTimelineZoom(
       el.removeEventListener('pointerup', endPan)
       el.removeEventListener('pointercancel', endPan)
       el.removeEventListener('auxclick', onAuxClick)
-      el.removeEventListener('gesturestart', onGesture as EventListener)
-      el.removeEventListener('gesturechange', onGesture as EventListener)
-      el.removeEventListener('gestureend', onGesture as EventListener)
+      el.removeEventListener('gesturestart', onGestureStart as EventListener)
+      el.removeEventListener('gesturechange', onGestureChange as EventListener)
+      el.removeEventListener('gestureend', onGestureEnd as EventListener)
       window.removeEventListener('keydown', onKeyDown)
+      ctrlTracker.dispose()
     }
   }, [eventEl, scrollerRef])
 

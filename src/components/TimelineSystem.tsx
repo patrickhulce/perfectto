@@ -97,7 +97,7 @@ function TimelineSystem({
                 labelWidthPx={labelWidthPx}
                 store={store}
                 expanded={tl.expanded}
-                onToggle={() => onToggleTrack(tl.track.id)}
+                onToggle={tl.canExpand ? () => onToggleTrack(tl.track.id) : undefined}
               />
             </div>
           )

@@ -9,6 +9,7 @@ import {useTimelineSelection} from './timeline/useTimelineSelection'
 import {containerDepth, ROW_HEIGHT} from './timeline/trackLayout'
 import {createViewportStore} from './timeline/viewportStore'
 import {createSelectionStore, type SelectionStore} from './timeline/selectionStore'
+import type {InputBindingsStore} from './timeline/inputBindingsStore'
 import TimelineAxis, {TIMELINE_AXIS_HEIGHT_PX} from './timeline/TimelineAxis'
 import TimelineOverview, {TIMELINE_OVERVIEW_HEIGHT_PX} from './timeline/TimelineOverview'
 import SelectionOverlay from './timeline/SelectionOverlay'
@@ -24,6 +25,12 @@ interface TimelineProps {
    * rendered as stacked category bands.
    */
   appliedPersona?: AppliedPersona
+  /**
+   * Input-bindings store. Drives which gesture triggers which action
+   * (scroll/zoom/pan/select/…). Optional so tests and standalone
+   * Timeline usage can fall back to the historical default behavior.
+   */
+  bindingsStore?: InputBindingsStore
 }
 
 export interface PerfecttoTimelineSnapshot {
@@ -76,6 +83,12 @@ export interface TrackLayout {
   topPx: number
   heightPx: number
   expanded: boolean
+  /**
+   * True iff the track has nested measures worth revealing. Tracks with only
+   * top-level measures (`containerDepth === 1`) render identically whether
+   * expanded or not, so we suppress the expand affordance entirely for them.
+   */
+  canExpand: boolean
 }
 
 function trackHeightPx(track: TrackModel, expanded: boolean): number {
@@ -101,7 +114,12 @@ function computeSystemHeightPx(
   return header + tracksHeight
 }
 
-export default function Timeline({timeline, selectionStore, appliedPersona}: TimelineProps) {
+export default function Timeline({
+  timeline,
+  selectionStore,
+  appliedPersona,
+  bindingsStore,
+}: TimelineProps) {
   const scrollRef = useRef<HTMLDivElement | null>(null)
   // Single floating tooltip element shared by all tracks. Lives in the
   // outer scroller (not inside any TimelineSystem) so it can be positioned
@@ -272,6 +290,7 @@ export default function Timeline({timeline, selectionStore, appliedPersona}: Tim
     scrollerRef: scrollRef,
     store,
     selectionStore: effectiveSelectionStore,
+    bindingsStore,
   })
 
   // Base systems list (persona-derived if a persona is applied, else raw).
@@ -315,10 +334,12 @@ export default function Timeline({timeline, selectionStore, appliedPersona}: Tim
       if (expanded) {
         let ty = tracksStartY
         for (const track of system.tracks) {
+          const canExpand = containerDepth(track) > 1
           const trDefaultExpanded = defaultTrackExpandedFromPersona[track.id] ?? true
-          const trackIsExpanded = trackExpanded[track.id] ?? trDefaultExpanded
+          const trackIsExpanded =
+            canExpand && (trackExpanded[track.id] ?? trDefaultExpanded)
           const h = trackHeightPx(track, trackIsExpanded)
-          tracks.push({track, topPx: ty, heightPx: h, expanded: trackIsExpanded})
+          tracks.push({track, topPx: ty, heightPx: h, expanded: trackIsExpanded, canExpand})
           ty += h
         }
       }
@@ -480,6 +501,7 @@ export default function Timeline({timeline, selectionStore, appliedPersona}: Tim
     store,
     selectionStore: effectiveSelectionStore,
     tooltipRef,
+    bindingsStore,
   })
 
   return (
