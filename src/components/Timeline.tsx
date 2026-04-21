@@ -369,7 +369,10 @@ export default function Timeline({timeline, selectionStore}: TimelineProps) {
   return (
     <div
       ref={scrollRef}
-      className="relative min-h-0 flex-1 overflow-auto"
+      // `select-none` (user-select: none) cascades to the whole timeline
+      // surface so left-drag-to-select never also drags a native text
+      // selection across row labels / axis / category tags.
+      className="relative min-h-0 flex-1 overflow-auto select-none"
       // Reserve scrollbar-gutter space in both axes at all times so
       // zooming across the fit threshold doesn't reflow anything:
       //  - `scrollbarGutter: 'stable'` reserves the vertical (inline)

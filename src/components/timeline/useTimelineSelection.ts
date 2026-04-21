@@ -138,6 +138,14 @@ export function useTimelineSelection(
       const host = (source === 'overview' ? overviewCanvasRef.current : eventTargetRef.current) as HTMLElement | null
       if (!host) return
 
+      // Stop the browser from starting a native text selection. CSS
+      // `user-select: none` on the scroller already covers this in
+      // evergreen browsers, but Safari / edge cases with contenteditable
+      // ancestors still honor mousedown defaults. Calling
+      // preventDefault after we've decided this pointerdown is ours
+      // keeps click-through / capture semantics intact.
+      e.preventDefault()
+
       drag = {
         host,
         pointerId: e.pointerId,

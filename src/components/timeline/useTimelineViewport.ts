@@ -401,8 +401,16 @@ export function useTimelineZoom(
         traceSpan,
         fitPxPerMsRef.current,
       )
+      // Place `startMs` at the left edge of the content area (not the
+      // left edge of the inner surface). The sticky label gutter
+      // covers inner-x `[scrollLeft, scrollLeft + labelWidth]`, so the
+      // visible track content starts at inner-x `scrollLeft +
+      // labelWidth`. Since the inner-x of `startMs` is `labelWidth +
+      // (startMs - start) * pxPerMs`, solving for scrollLeft gives
+      // `(startMs - start) * pxPerMs` — the labelWidth terms cancel.
+      // Including `labelWidth +` here (as a previous iteration did)
+      // shifted the zoomed view one full gutter width to the right.
       const targetScrollLeft =
-        labelWidth +
         (startMs - boundsRef.current.start) * targetPxPerMs
 
       pxPerMsRef.current = targetPxPerMs
