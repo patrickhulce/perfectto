@@ -9,8 +9,13 @@ interface TimelineSystemProps {
   viewportTopPx: number
   viewportBottomPx: number
   store: ViewportStore
+  /** Number of tracks the active profile hid by default for this system. */
+  hiddenTrackCount?: number
+  /** Whether those hidden tracks are currently revealed. */
+  hiddenTracksShown?: boolean
   onToggle: () => void
   onToggleTrack: (trackId: string) => void
+  onToggleHidden?: () => void
 }
 
 function TimelineSystem({
@@ -19,8 +24,11 @@ function TimelineSystem({
   viewportTopPx,
   viewportBottomPx,
   store,
+  hiddenTrackCount = 0,
+  hiddenTracksShown = false,
   onToggle,
   onToggleTrack,
+  onToggleHidden,
 }: TimelineSystemProps) {
   const {system, topPx, headerHeightPx, heightPx, expanded, tracks} = layout
 
@@ -29,15 +37,15 @@ function TimelineSystem({
       className="absolute left-0 right-0 border-b border-[#2d3748]"
       style={{top: topPx, height: heightPx}}
     >
-      <button
-        type="button"
-        onClick={onToggle}
-        data-no-pan
-        className="absolute left-0 right-0 top-0 flex cursor-pointer items-center bg-[#1a202c] text-left text-sm font-semibold text-[#e2e8f0] hover:bg-[#232b3a]"
+      <div
+        className="absolute left-0 right-0 top-0 flex items-center bg-[#1a202c] text-left text-sm font-semibold text-[#e2e8f0]"
         style={{height: headerHeightPx, zIndex: 2}}
       >
-        <span
-          className="sticky left-0 flex items-center gap-2 px-4 py-2"
+        <button
+          type="button"
+          onClick={onToggle}
+          data-no-pan
+          className="sticky left-0 flex cursor-pointer items-center gap-2 px-4 py-2 hover:bg-[#232b3a]"
           style={{minWidth: labelWidthPx}}
         >
           <span className="inline-block w-3 text-[#718096]">{expanded ? '▾' : '▸'}</span>
@@ -45,8 +53,34 @@ function TimelineSystem({
           <span className="text-xs font-normal text-[#718096]">
             {system.tracks.length} track{system.tracks.length === 1 ? '' : 's'}
           </span>
-        </span>
-      </button>
+          {hiddenTrackCount > 0 && onToggleHidden && (
+            <span
+              role="button"
+              tabIndex={0}
+              data-no-pan
+              aria-label={
+                hiddenTracksShown
+                  ? `Hide ${hiddenTrackCount} tracks`
+                  : `Show ${hiddenTrackCount} hidden tracks`
+              }
+              onClick={e => {
+                e.stopPropagation()
+                onToggleHidden()
+              }}
+              onKeyDown={e => {
+                if (e.key === 'Enter' || e.key === ' ') {
+                  e.preventDefault()
+                  e.stopPropagation()
+                  onToggleHidden()
+                }
+              }}
+              className="ml-1 cursor-pointer rounded border border-[#2d3748] px-1.5 py-0.5 text-[10px] font-normal uppercase tracking-wider text-[#a0aec0] hover:border-[#667eea] hover:text-[#e2e8f0]"
+            >
+              {hiddenTracksShown ? `hide +${hiddenTrackCount}` : `+${hiddenTrackCount} hidden`}
+            </span>
+          )}
+        </button>
+      </div>
       {expanded &&
         tracks.map(tl => {
           if (tl.topPx + tl.heightPx <= viewportTopPx) return null

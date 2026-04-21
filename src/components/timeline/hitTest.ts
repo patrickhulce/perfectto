@@ -52,6 +52,7 @@ export function hitTestTrack(
   trackLocalY: number,
   rowHeight: number,
   maxDepthExclusive: number,
+  minHitboxMs: number = 0,
 ): HitTestResult {
   if (buffers.count === 0 || rowHeight <= 0) return MISS
   if (trackLocalY < 0) return MISS
@@ -65,10 +66,21 @@ export function hitTestTrack(
   const targetDepth = Math.floor(trackLocalY / rowHeight)
   if (targetDepth >= maxDepthExclusive) return MISS
 
+  // Hitbox widening: treat any slice narrower than `minHitboxMs` as if
+  // it were `minHitboxMs` wide, centered on the original slice. This
+  // only affects slices already narrower than the threshold — wide
+  // slices keep their exact `[start, end]` bounds — so normal-sized
+  // rects feel pixel-accurate while 0.01ms compositor events become
+  // hoverable without aim.
+  const halfHit = Math.max(0, minHitboxMs) * 0.5
+
+  // With widening, a slice at index `i` "reaches" `timelineMs` if
+  // `e + halfHit >= timelineMs`, so we shift the lower-bound probe by
+  // the same amount to keep the binary search correct.
   const first = lowerBoundF32(
     buffers.maxEndsPrefix,
     buffers.count,
-    timelineMs,
+    timelineMs - halfHit,
   )
 
   const starts = buffers.starts
@@ -76,31 +88,42 @@ export function hitTestTrack(
   const depths = buffers.depths
   const count = buffers.count
 
-  let bestIndex = -1
-  let bestDepth = -1
+  // Prefer a slice whose true `[start, end]` contains the cursor (the
+  // "exact" hit). If no slice truly contains it, fall back to the
+  // nearest widened candidate at the target depth. Within a single
+  // depth the renderer never stacks rects at the same time, so there
+  // is at most one exact hit; widened candidates can overlap at the
+  // boundaries, hence the nearest-center tiebreak.
+  let exactIndex = -1
+  let nearestIndex = -1
+  let nearestDist = Number.POSITIVE_INFINITY
   for (let i = first; i < count; i++) {
     const s = starts[i]
-    if (s > timelineMs) break
+    if (s - halfHit > timelineMs) break
     const e = ends[i]
-    if (e < timelineMs) continue
+    if (e + halfHit < timelineMs) continue
     const d = depths[i]
     if (d !== targetDepth) continue
-    // Iteration order isn't strictly depth-monotonic across all parent /
-    // child orderings, but per-depth uniqueness at a single timestamp means
-    // the first qualifying hit IS the deepest one whose row contains the
-    // cursor. We still keep the "deepest wins" guard so future renderer
-    // changes (e.g. multi-row depth packing) stay safe.
-    if (d > bestDepth) {
-      bestIndex = i
-      bestDepth = d
-      // The renderer never stacks two rects at the same depth at the same
-      // time, so once we've matched `targetDepth` we can stop.
+
+    if (s <= timelineMs && e >= timelineMs) {
+      exactIndex = i
+      // Exact hits are unique per depth at a timestamp — stop scanning.
       break
+    }
+
+    // Widened-only match: track the slice whose center is closest to
+    // the cursor, so two adjacent tiny slices break ties intuitively.
+    const center = (s + e) * 0.5
+    const dist = Math.abs(center - timelineMs)
+    if (dist < nearestDist) {
+      nearestDist = dist
+      nearestIndex = i
     }
   }
 
+  const bestIndex = exactIndex !== -1 ? exactIndex : nearestIndex
   if (bestIndex === -1) return MISS
-  return {index: bestIndex, depth: bestDepth}
+  return {index: bestIndex, depth: targetDepth}
 }
 
 // Visible for tests.

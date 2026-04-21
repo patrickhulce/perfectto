@@ -1,5 +1,6 @@
 import {useCallback, useEffect, useMemo, useRef, useState} from 'react'
-import type {System, Timeline as TimelineModel, Track as TrackModel} from '../core'
+import type {AppliedProfile, System, Timeline as TimelineModel, Track as TrackModel} from '../core'
+import {buildOverviewBands} from '../core/render/overviewBands'
 import {buildOverviewUtilization} from '../core/render/overviewUtilization'
 import TimelineSystem from './TimelineSystem'
 import {useTimelineZoom} from './timeline/useTimelineViewport'
@@ -15,6 +16,14 @@ import SelectionOverlay from './timeline/SelectionOverlay'
 interface TimelineProps {
   timeline: TimelineModel
   selectionStore?: SelectionStore
+  /**
+   * Optional applied profile. When provided, systems/tracks are taken
+   * from `appliedProfile.systems` (already filtered, sorted, relabeled),
+   * initial expand state is seeded from the profile's defaults, hidden
+   * tracks are exposed behind a per-system toggle, and the overview is
+   * rendered as stacked category bands.
+   */
+  appliedProfile?: AppliedProfile
 }
 
 export interface PerfecttoTimelineSnapshot {
@@ -45,6 +54,13 @@ const MIN_SPAN_MS = 0.01
  * how many rows of content the track actually has.
  */
 const MIN_TRACK_HEIGHT_PX = 44
+/**
+ * Height reserved below the last system for the "N hidden systems"
+ * reveal button. Only allocated when the applied profile actually has
+ * hidden systems; otherwise the footer collapses to 0 and totalHeightPx
+ * matches the old layout exactly.
+ */
+const HIDDEN_SYSTEMS_FOOTER_HEIGHT_PX = 32
 
 export interface SystemLayout {
   system: System
@@ -68,22 +84,24 @@ function trackHeightPx(track: TrackModel, expanded: boolean): number {
   return Math.max(depth * ROW_HEIGHT + 8 + TRACK_BORDER_HEIGHT_PX, MIN_TRACK_HEIGHT_PX)
 }
 
-function systemHeightPx(
+function computeSystemHeightPx(
   system: System,
   systemExpanded: boolean,
   trackExpanded: Record<string, boolean>,
+  defaultTrackExpandedFromProfile: Record<string, boolean>,
 ): number {
   const header = SYSTEM_HEADER_HEIGHT_PX + SYSTEM_BORDER_HEIGHT_PX
   if (!systemExpanded) return header
   let tracksHeight = 0
   for (const track of system.tracks) {
-    const expanded = trackExpanded[track.id] ?? true
+    const trDefault = defaultTrackExpandedFromProfile[track.id] ?? true
+    const expanded = trackExpanded[track.id] ?? trDefault
     tracksHeight += trackHeightPx(track, expanded)
   }
   return header + tracksHeight
 }
 
-export default function Timeline({timeline, selectionStore}: TimelineProps) {
+export default function Timeline({timeline, selectionStore, appliedProfile}: TimelineProps) {
   const scrollRef = useRef<HTMLDivElement | null>(null)
   // Single floating tooltip element shared by all tracks. Lives in the
   // outer scroller (not inside any TimelineSystem) so it can be positioned
@@ -130,15 +148,61 @@ export default function Timeline({timeline, selectionStore}: TimelineProps) {
   const [viewportHeight, setViewportHeight] = useState(0)
   const [scrollTop, setScrollTop] = useState(0)
 
+  // Profile-supplied defaults. A track or system that has a default here
+  // starts in that state; users can still toggle it freely afterwards.
+  const defaultSystemExpandedFromProfile =
+    appliedProfile?.defaultSystemExpanded ?? {}
+  const defaultTrackExpandedFromProfile =
+    appliedProfile?.defaultTrackExpanded ?? {}
+
   const [systemExpanded, setSystemExpanded] = useState<Record<string, boolean>>({})
   const toggleSystem = useCallback((id: string) => {
-    setSystemExpanded(prev => ({...prev, [id]: prev[id] === undefined ? false : !prev[id]}))
-  }, [])
+    const profileDefault = defaultSystemExpandedFromProfile[id]
+    const uiDefault = profileDefault ?? true
+    setSystemExpanded(prev => ({
+      ...prev,
+      [id]: prev[id] === undefined ? !uiDefault : !prev[id],
+    }))
+  }, [defaultSystemExpandedFromProfile])
 
   const [trackExpanded, setTrackExpanded] = useState<Record<string, boolean>>({})
-  const toggleTrack = useCallback((id: string) => {
-    setTrackExpanded(prev => ({...prev, [id]: prev[id] === undefined ? false : !prev[id]}))
+  const toggleTrack = useCallback(
+    (id: string) => {
+      const profileDefault = defaultTrackExpandedFromProfile[id]
+      const uiDefault = profileDefault ?? true
+      setTrackExpanded(prev => ({
+        ...prev,
+        [id]: prev[id] === undefined ? !uiDefault : !prev[id],
+      }))
+    },
+    [defaultTrackExpandedFromProfile],
+  )
+
+  // Per-system "show hidden tracks" toggle. Off by default; when on,
+  // the system's hidden tracks are folded into its render list
+  // (appended, matching the profile's sort tail).
+  const [systemHiddenVisible, setSystemHiddenVisible] = useState<Record<string, boolean>>({})
+  const toggleSystemHidden = useCallback((id: string) => {
+    setSystemHiddenVisible(prev => ({...prev, [id]: !prev[id]}))
   }, [])
+
+  // Global "show hidden systems" toggle — the bottom-of-timeline
+  // counterpart to the per-system "show hidden tracks" affordance.
+  // Off by default; when on, every system in `appliedProfile.hiddenSystems`
+  // is appended to the layout.
+  const [hiddenSystemsShown, setHiddenSystemsShown] = useState(false)
+
+  // Reset UI state when the applied profile id changes so the fresh
+  // defaults take effect. Keeping per-profile state around would feel
+  // unexpected — users switching from Web Dev → Raw expect Raw's
+  // "everything expanded" defaults, not their prior Web Dev toggles.
+  const profileId = appliedProfile?.profile.id
+  useEffect(() => {
+    setSystemExpanded({})
+    setTrackExpanded({})
+    setSystemHiddenVisible({})
+    setHiddenSystemsShown(false)
+  }, [profileId])
 
   useEffect(() => {
     const el = scrollRef.current
@@ -210,6 +274,30 @@ export default function Timeline({timeline, selectionStore}: TimelineProps) {
     selectionStore: effectiveSelectionStore,
   })
 
+  // Base systems list (profile-derived if a profile is applied, else raw).
+  // When the user has clicked the "show N hidden systems" footer
+  // affordance, we append the profile's hidden systems so they render
+  // at the bottom of the timeline.
+  const baseSystems: System[] = useMemo(() => {
+    const visible = appliedProfile?.systems ?? timeline.systems
+    if (!appliedProfile || !hiddenSystemsShown || appliedProfile.hiddenSystems.length === 0) {
+      return visible
+    }
+    return [...visible, ...appliedProfile.hiddenSystems]
+  }, [appliedProfile, timeline.systems, hiddenSystemsShown])
+
+  // Effective systems: fold any hidden tracks back in for systems where
+  // the user has toggled "show hidden" on.
+  const effectiveSystems = useMemo<System[]>(() => {
+    const hiddenBySystem = appliedProfile?.hiddenTracksBySystem ?? {}
+    return baseSystems.map(sys => {
+      if (!systemHiddenVisible[sys.id]) return sys
+      const hidden = hiddenBySystem[sys.id]
+      if (!hidden || hidden.length === 0) return sys
+      return {...sys, tracks: [...sys.tracks, ...hidden]}
+    })
+  }, [baseSystems, appliedProfile, systemHiddenVisible])
+
   // Precompute vertical layout with current expanded state. We reserve
   // `TIMELINE_OVERVIEW_HEIGHT_PX + TIMELINE_AXIS_HEIGHT_PX` at the top
   // for the sticky overview track and the sticky time ruler so the
@@ -218,38 +306,66 @@ export default function Timeline({timeline, selectionStore}: TimelineProps) {
   const layout = useMemo(() => {
     const items: SystemLayout[] = []
     let y = TIMELINE_OVERVIEW_HEIGHT_PX + TIMELINE_AXIS_HEIGHT_PX
-    for (const system of timeline.systems) {
-      const expanded = systemExpanded[system.id] ?? true
+    for (const system of effectiveSystems) {
+      const sysDefaultExpanded = defaultSystemExpandedFromProfile[system.id] ?? true
+      const expanded = systemExpanded[system.id] ?? sysDefaultExpanded
       const headerHeightPx = SYSTEM_HEADER_HEIGHT_PX + SYSTEM_BORDER_HEIGHT_PX
       const tracksStartY = y + headerHeightPx
       const tracks: TrackLayout[] = []
       if (expanded) {
         let ty = tracksStartY
         for (const track of system.tracks) {
-          const trackIsExpanded = trackExpanded[track.id] ?? true
+          const trDefaultExpanded = defaultTrackExpandedFromProfile[track.id] ?? true
+          const trackIsExpanded = trackExpanded[track.id] ?? trDefaultExpanded
           const h = trackHeightPx(track, trackIsExpanded)
           tracks.push({track, topPx: ty, heightPx: h, expanded: trackIsExpanded})
           ty += h
         }
       }
-      const heightPx = systemHeightPx(system, expanded, trackExpanded)
+      const heightPx = computeSystemHeightPx(
+        system,
+        expanded,
+        trackExpanded,
+        defaultTrackExpandedFromProfile,
+      )
       items.push({system, topPx: y, heightPx, headerHeightPx, expanded, tracks})
       y += heightPx
     }
-    return {items, totalHeightPx: y}
-  }, [timeline.systems, systemExpanded, trackExpanded])
+    const footerHeightPx =
+      appliedProfile && appliedProfile.hiddenSystems.length > 0
+        ? HIDDEN_SYSTEMS_FOOTER_HEIGHT_PX
+        : 0
+    return {items, totalHeightPx: y + footerHeightPx, footerTopPx: y, footerHeightPx}
+  }, [
+    effectiveSystems,
+    systemExpanded,
+    trackExpanded,
+    defaultSystemExpandedFromProfile,
+    defaultTrackExpandedFromProfile,
+    appliedProfile,
+  ])
 
   const totalSpanMs = Math.max(timeline.end - timeline.start, MIN_SPAN_MS)
   const innerWidthPx = LABEL_WIDTH_PX + totalSpanMs * pxPerMs
 
-  // Overview utilization. Computed once per `timeline` identity — the
-  // parser hands us a fresh object per trace, so memoizing on it is
-  // equivalent to "compute on parse". Runs on the main thread; O(total
-  // depth-0 slices) plus a 7-tap smoothing pass, well inside a frame.
+  // Overview utilization (single curve). Computed once per `timeline`
+  // identity — the parser hands us a fresh object per trace, so
+  // memoizing on it is equivalent to "compute on parse". Runs on the
+  // main thread; O(total depth-0 slices) plus a 7-tap smoothing pass,
+  // well inside a frame. Used when the profile doesn't define bands.
   const overviewUtilization = useMemo(
     () => buildOverviewUtilization(timeline),
     [timeline],
   )
+
+  // Stacked category bands, computed on demand when the applied profile
+  // defines any. Same cost profile as `buildOverviewUtilization` and
+  // cached on both the timeline identity and the applied-profile
+  // identity so profile switches recompute exactly once.
+  const overviewBands = useMemo(() => {
+    if (!appliedProfile || appliedProfile.bands.length === 0) return undefined
+    return buildOverviewBands(timeline, appliedProfile)
+  }, [timeline, appliedProfile])
 
   // Test hook: expose a live snapshot of the viewport state so e2e tests can
   // verify zoom anchoring and cursor math without scraping the DOM. Reads
@@ -392,6 +508,7 @@ export default function Timeline({timeline, selectionStore}: TimelineProps) {
       >
         <TimelineOverview
           overview={overviewUtilization}
+          bands={overviewBands}
           store={store}
           selectionStore={effectiveSelectionStore}
           labelWidthPx={LABEL_WIDTH_PX}
@@ -402,24 +519,60 @@ export default function Timeline({timeline, selectionStore}: TimelineProps) {
           labelWidthPx={LABEL_WIDTH_PX}
           stickyTopPx={TIMELINE_OVERVIEW_HEIGHT_PX}
         />
-        {visibleSystems.map(item => (
-          <TimelineSystem
-            key={item.system.id}
-            layout={item}
-            labelWidthPx={LABEL_WIDTH_PX}
-            viewportTopPx={visibleTop}
-            viewportBottomPx={visibleBottom}
-            store={store}
-            onToggle={() => toggleSystem(item.system.id)}
-            onToggleTrack={toggleTrack}
-          />
-        ))}
+        {visibleSystems.map(item => {
+          const hiddenCount =
+            appliedProfile?.hiddenTracksBySystem[item.system.id]?.length ?? 0
+          return (
+            <TimelineSystem
+              key={item.system.id}
+              layout={item}
+              labelWidthPx={LABEL_WIDTH_PX}
+              viewportTopPx={visibleTop}
+              viewportBottomPx={visibleBottom}
+              store={store}
+              hiddenTrackCount={hiddenCount}
+              hiddenTracksShown={systemHiddenVisible[item.system.id] === true}
+              onToggle={() => toggleSystem(item.system.id)}
+              onToggleTrack={toggleTrack}
+              onToggleHidden={() => toggleSystemHidden(item.system.id)}
+            />
+          )
+        })}
         <SelectionOverlay
           store={store}
           selectionStore={effectiveSelectionStore}
           labelWidthPx={LABEL_WIDTH_PX}
           totalHeightPx={layout.totalHeightPx}
         />
+        {appliedProfile && appliedProfile.hiddenSystems.length > 0 && (
+          <div
+            data-testid="timeline-hidden-systems-footer"
+            // Positioned inside the event surface so it scrolls with the
+            // timeline content. Sticks to the left gutter (not the full
+            // width) to stay visible regardless of horizontal scroll.
+            className="absolute flex items-center"
+            style={{
+              top: layout.footerTopPx,
+              left: 0,
+              height: layout.footerHeightPx,
+              paddingLeft: 12,
+            }}
+          >
+            <button
+              type="button"
+              onClick={() => setHiddenSystemsShown(v => !v)}
+              className="rounded border border-[#2d3748] bg-[#0b0f17]/80 px-2 py-0.5 text-xs text-[#a0aec0] hover:bg-[#1a202c] hover:text-[#e2e8f0]"
+            >
+              {hiddenSystemsShown
+                ? `hide ${appliedProfile.hiddenSystems.length} hidden system${
+                    appliedProfile.hiddenSystems.length === 1 ? '' : 's'
+                  }`
+                : `+${appliedProfile.hiddenSystems.length} hidden system${
+                    appliedProfile.hiddenSystems.length === 1 ? '' : 's'
+                  }`}
+            </button>
+          </div>
+        )}
       </div>
       {/*
         Floating tooltip. `position: fixed` keeps it pinned in viewport

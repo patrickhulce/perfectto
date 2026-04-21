@@ -5,6 +5,15 @@ import {ROW_HEIGHT} from './trackLayout'
 import type {SelectionStore} from './selectionStore'
 import type {ViewportStore} from './viewportStore'
 
+/**
+ * Minimum effective slice width, in pixels, for hit-testing. Slices
+ * narrower than this are widened symmetrically in the time domain so
+ * the cursor can still land on them. Sized slightly larger than the
+ * canvas draw-path's `MIN_SLICE_WIDTH_PX` (≈ 1px) so users don't need
+ * pixel-perfect aim on sub-millisecond slices.
+ */
+const MIN_HITBOX_PX = 3
+
 export interface HoverTrackLayout {
   /** The track this row maps to. We hit-test against `track.buffers`. */
   track: TrackModel
@@ -154,12 +163,19 @@ export function useTimelineHover(options: UseTimelineHoverOptions): void {
       }
       const trackLocalY = contentY - row.topPx
       const maxDepthExclusive = row.expanded ? Number.POSITIVE_INFINITY : 1
+      // Widen the hit-test to roughly MIN_HITBOX_PX pixels so 0.01ms
+      // compositor / RunTask slices (rendered as a single-pixel bar)
+      // are still hoverable. Kept slightly larger than the canvas
+      // draw-path's `MIN_SLICE_WIDTH_PX` so the user doesn't need
+      // pixel-perfect aim.
+      const minHitboxMs = pxPerMs > 0 ? MIN_HITBOX_PX / pxPerMs : 0
       const hit = hitTestTrack(
         buffers,
         timelineMs,
         trackLocalY,
         ROW_HEIGHT,
         maxDepthExclusive,
+        minHitboxMs,
       )
       if (hit.index < 0) {
         hideTooltip()

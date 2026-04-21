@@ -194,6 +194,7 @@ export function useTimelineSelection(
       if (!drag || e.pointerId !== drag.pointerId) return
       const host = drag.host
       const wasPromoted = drag.promoted
+      const anchorMs = drag.anchorMs
       try {
         host.releasePointerCapture(e.pointerId)
       } catch {
@@ -203,9 +204,21 @@ export function useTimelineSelection(
       if (wasPromoted) {
         selectionStore.commit()
       } else {
-        // Sub-threshold click: drop in-progress without clobbering a
-        // previously committed range.
+        // Sub-threshold click (no drag). Two things to do:
+        //  1. Drop any in-progress draft so it doesn't linger.
+        //  2. If the click landed outside an existing committed
+        //     selection, clear the selection — the common "click away
+        //     to deselect" gesture. Clicks inside the committed range
+        //     are preserved so the user can still click through to
+        //     inspect slices within their selection.
         selectionStore.cancel()
+        const committed = selectionStore.get().committed
+        if (committed !== null) {
+          const inside = anchorMs >= committed.startMs && anchorMs <= committed.endMs
+          if (!inside) {
+            selectionStore.setCommitted(null)
+          }
+        }
       }
       hideTooltip()
     }

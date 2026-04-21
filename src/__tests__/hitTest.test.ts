@@ -83,4 +83,53 @@ describe('hitTestTrack', () => {
     const buffers = buildSliceBuffers(track([m('a', 0, 100)]))
     expect(hitTestTrack(buffers, 50, -1, ROW, Infinity).index).toBe(-1)
   })
+
+  describe('minHitboxMs widening', () => {
+    it('hits a sub-pixel slice when the cursor is within the widened range', () => {
+      // 0.01ms slice centered at 50.005ms. A 1ms hitbox widens it to
+      // ~[49.505, 50.505], so cursors up to ~0.5ms on either side
+      // should register.
+      const buffers = buildSliceBuffers(track([m('tiny', 50, 50.01)]))
+      const hitLeft = hitTestTrack(buffers, 49.7, ROW / 2, ROW, Infinity, 1)
+      expect(hitLeft.index).toBe(0)
+      const hitRight = hitTestTrack(buffers, 50.3, ROW / 2, ROW, Infinity, 1)
+      expect(hitRight.index).toBe(0)
+      // Outside the widened range — still a miss.
+      const miss = hitTestTrack(buffers, 52, ROW / 2, ROW, Infinity, 1)
+      expect(miss.index).toBe(-1)
+    })
+
+    it('exact containment wins over widened-only neighbors', () => {
+      // Two adjacent tiny slices: 'a' at [10, 10.05], 'b' at [10.5,
+      // 10.55]. With a 2ms hitbox both widen to contain cursor=10.3,
+      // but 'a' is also closer so nearest-center should prefer it. A
+      // cursor at exactly 10.52 is inside 'b' exactly — exact hit must
+      // win regardless of which is nearer by center.
+      const buffers = buildSliceBuffers(
+        track([m('a', 10, 10.05), m('b', 10.5, 10.55)]),
+      )
+      const bNearestCenter = hitTestTrack(buffers, 10.52, ROW / 2, ROW, Infinity, 2)
+      expect(buffers.measures[bNearestCenter.index].id).toBe('b')
+
+      // Cursor well between them but slightly closer to 'a': widened
+      // nearest-center picks 'a'.
+      const aNearestCenter = hitTestTrack(buffers, 10.22, ROW / 2, ROW, Infinity, 2)
+      expect(buffers.measures[aNearestCenter.index].id).toBe('a')
+    })
+
+    it('does not widen when minHitboxMs is zero (back-compat)', () => {
+      const buffers = buildSliceBuffers(track([m('tiny', 50, 50.01)]))
+      // 0.3ms outside the slice — legacy behavior should miss.
+      expect(hitTestTrack(buffers, 50.3, ROW / 2, ROW, Infinity, 0).index).toBe(-1)
+      expect(hitTestTrack(buffers, 50.3, ROW / 2, ROW, Infinity).index).toBe(-1)
+    })
+
+    it('still reaches a wide slice with its true [start, end] range', () => {
+      // 1000ms slice plus a 1ms hitbox — cursor inside the real range
+      // should hit via the exact-containment path.
+      const buffers = buildSliceBuffers(track([m('wide', 0, 1000)]))
+      const hit = hitTestTrack(buffers, 500, ROW / 2, ROW, Infinity, 1)
+      expect(buffers.measures[hit.index].id).toBe('wide')
+    })
+  })
 })

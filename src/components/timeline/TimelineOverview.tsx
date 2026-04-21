@@ -1,4 +1,5 @@
 import {memo, useEffect, useRef, type MutableRefObject} from 'react'
+import type {OverviewBandsResult} from '../../core/render/overviewBands'
 import type {OverviewUtilization} from '../../core/render/overviewUtilization'
 import type {SelectionStore} from './selectionStore'
 import type {ViewportStore} from './viewportStore'
@@ -7,6 +8,12 @@ export const TIMELINE_OVERVIEW_HEIGHT_PX = 56
 
 interface TimelineOverviewProps {
   overview: OverviewUtilization
+  /**
+   * Optional stacked-category bands. When provided, the overview renders
+   * them as stacked area layers instead of the single utilization
+   * mountain. Used by profiles with `overviewBands` defined.
+   */
+  bands?: OverviewBandsResult
   store: ViewportStore
   selectionStore: SelectionStore
   labelWidthPx: number
@@ -40,6 +47,7 @@ interface TimelineOverviewProps {
  */
 function TimelineOverviewBase({
   overview,
+  bands,
   store,
   selectionStore,
   labelWidthPx,
@@ -101,77 +109,122 @@ function TimelineOverviewBase({
       const traceStart = overview.startMs
       const traceEnd = overview.endMs
       const traceSpan = Math.max(traceEnd - traceStart, 1e-6)
-      const buckets = overview.buckets
-      const bucketCount = buckets.length
 
-      // Map pixel column → bucket index. The overview always spans the
-      // whole trace, independent of the main viewport's zoom.
+      // Map pixel column → ms. The overview always spans the whole
+      // trace, independent of the main viewport's zoom.
       const msPerPx = traceSpan / contentWidthCss
-
-      // Precompute the silhouette so the fill and stroke share the same
-      // per-column y values. The mountain is drawn top-down from y = 2
-      // (leaving room for a subtle top margin) to baseline at height-1.
       const topMargin = 4
       const baselineY = heightCss - 1
       const mountainTopMax = topMargin
       const mountainHeight = baselineY - mountainTopMax
+      const columnCount = Math.max(1, Math.ceil(contentWidthCss))
 
-      // Density-aware sampling: take max across all buckets that fall in
-      // this column so a single spike never vanishes when the column
-      // covers many buckets (zoomed-out traces).
-      const ys = new Float32Array(Math.max(1, Math.ceil(contentWidthCss)))
-      for (let x = 0; x < ys.length; x++) {
-        const msAtLeft = x * msPerPx
-        const msAtRight = (x + 1) * msPerPx
-        const bLo = Math.min(
-          bucketCount - 1,
-          Math.max(0, Math.floor(msAtLeft / overview.bucketMs)),
+      if (bands && bands.bands.length > 0) {
+        // ------------------------------------------------------------------
+        // Stacked-band mode (profile-driven).
+        // ------------------------------------------------------------------
+        // Each band's [0,1] normalized signal is drawn as an area stacked
+        // on top of the previous bands. We sample each band at one
+        // column per pixel, density-aware (max across source buckets
+        // covered by the column).
+        const perBandSamples: Float32Array[] = bands.bands.map(b =>
+          sampleSignal(b.buckets, bands.bucketMs, msPerPx, columnCount),
         )
-        const bHi = Math.min(
-          bucketCount - 1,
-          Math.max(0, Math.floor(msAtRight / overview.bucketMs)),
-        )
-        let maxV = 0
-        for (let b = bLo; b <= bHi; b++) {
-          const v = buckets[b]
-          if (v > maxV) maxV = v
+
+        // Cumulative stack, in band order (bottom-up). `cumulative[x]`
+        // tracks the stack height (in [0, 1]) after drawing bands
+        // 0..current. Clamp to 1 so overlapping/over-normalized bands
+        // don't paint past the top.
+        const cumulative = new Float32Array(columnCount)
+        for (let bi = 0; bi < bands.bands.length; bi++) {
+          const band = bands.bands[bi]
+          const values = perBandSamples[bi]
+          ctx.fillStyle = withAlpha(band.color, 0.85)
+
+          ctx.beginPath()
+          // Bottom edge of this band at column x = baselineY - cumulative[x] * mountainHeight.
+          for (let x = 0; x < columnCount; x++) {
+            const bottomY = baselineY - cumulative[x] * mountainHeight
+            if (x === 0) ctx.moveTo(x + 0.5, bottomY)
+            else ctx.lineTo(x + 0.5, bottomY)
+          }
+          // Top edge, traversed right-to-left.
+          for (let x = columnCount - 1; x >= 0; x--) {
+            const next = Math.min(1, cumulative[x] + values[x])
+            const topY = baselineY - next * mountainHeight
+            ctx.lineTo(x + 0.5, topY)
+          }
+          ctx.closePath()
+          ctx.fill()
+
+          // Advance the cumulative stack for the next band.
+          for (let x = 0; x < columnCount; x++) {
+            cumulative[x] = Math.min(1, cumulative[x] + values[x])
+          }
         }
-        ys[x] = baselineY - maxV * mountainHeight
-      }
 
-      // Mountain fill: top → bottom vertical gradient. Closed path at the
-      // baseline so the interior is filled.
-      const grad = ctx.createLinearGradient(0, mountainTopMax, 0, baselineY)
-      grad.addColorStop(0, 'rgba(99, 179, 237, 0.55)')
-      grad.addColorStop(1, 'rgba(99, 179, 237, 0.05)')
-      ctx.fillStyle = grad
-      ctx.beginPath()
-      ctx.moveTo(0, baselineY)
-      for (let x = 0; x < ys.length; x++) {
-        ctx.lineTo(x + 0.5, ys[x])
-      }
-      ctx.lineTo(ys.length - 1, baselineY)
-      ctx.closePath()
-      ctx.fill()
+        // Baseline.
+        ctx.strokeStyle = '#2d3748'
+        ctx.beginPath()
+        ctx.moveTo(0, baselineY + 0.5)
+        ctx.lineTo(contentWidthCss, baselineY + 0.5)
+        ctx.stroke()
+      } else {
+        // ------------------------------------------------------------------
+        // Single-curve mode (Raw profile / no bands configured).
+        // ------------------------------------------------------------------
+        const buckets = overview.buckets
+        const bucketCount = buckets.length
 
-      // Mountain stroke. 1px top line so the silhouette stays crisp even
-      // on flat regions where the gradient is barely visible.
-      ctx.strokeStyle = 'rgba(144, 205, 244, 0.85)'
-      ctx.lineWidth = 1
-      ctx.beginPath()
-      for (let x = 0; x < ys.length; x++) {
-        const px = x + 0.5
-        if (x === 0) ctx.moveTo(px, ys[x])
-        else ctx.lineTo(px, ys[x])
-      }
-      ctx.stroke()
+        const ys = new Float32Array(columnCount)
+        for (let x = 0; x < ys.length; x++) {
+          const msAtLeft = x * msPerPx
+          const msAtRight = (x + 1) * msPerPx
+          const bLo = Math.min(
+            bucketCount - 1,
+            Math.max(0, Math.floor(msAtLeft / overview.bucketMs)),
+          )
+          const bHi = Math.min(
+            bucketCount - 1,
+            Math.max(0, Math.floor(msAtRight / overview.bucketMs)),
+          )
+          let maxV = 0
+          for (let b = bLo; b <= bHi; b++) {
+            const v = buckets[b]
+            if (v > maxV) maxV = v
+          }
+          ys[x] = baselineY - maxV * mountainHeight
+        }
 
-      // Baseline.
-      ctx.strokeStyle = '#2d3748'
-      ctx.beginPath()
-      ctx.moveTo(0, baselineY + 0.5)
-      ctx.lineTo(contentWidthCss, baselineY + 0.5)
-      ctx.stroke()
+        const grad = ctx.createLinearGradient(0, mountainTopMax, 0, baselineY)
+        grad.addColorStop(0, 'rgba(99, 179, 237, 0.55)')
+        grad.addColorStop(1, 'rgba(99, 179, 237, 0.05)')
+        ctx.fillStyle = grad
+        ctx.beginPath()
+        ctx.moveTo(0, baselineY)
+        for (let x = 0; x < ys.length; x++) {
+          ctx.lineTo(x + 0.5, ys[x])
+        }
+        ctx.lineTo(ys.length - 1, baselineY)
+        ctx.closePath()
+        ctx.fill()
+
+        ctx.strokeStyle = 'rgba(144, 205, 244, 0.85)'
+        ctx.lineWidth = 1
+        ctx.beginPath()
+        for (let x = 0; x < ys.length; x++) {
+          const px = x + 0.5
+          if (x === 0) ctx.moveTo(px, ys[x])
+          else ctx.lineTo(px, ys[x])
+        }
+        ctx.stroke()
+
+        ctx.strokeStyle = '#2d3748'
+        ctx.beginPath()
+        ctx.moveTo(0, baselineY + 0.5)
+        ctx.lineTo(contentWidthCss, baselineY + 0.5)
+        ctx.stroke()
+      }
 
       // Current viewport indicator. When the user is zoomed in, dim the
       // regions outside the viewport and outline the visible window.
@@ -276,7 +329,7 @@ function TimelineOverviewBase({
         rafRef.current = null
       }
     }
-  }, [overview, store, selectionStore])
+  }, [overview, bands, store, selectionStore])
 
   return (
     <div
@@ -341,3 +394,58 @@ function TimelineOverviewBase({
 }
 
 export default memo(TimelineOverviewBase)
+
+/**
+ * Density-aware resample of a bucketized signal to one value per CSS
+ * pixel column. Takes the max across all source buckets that fall in a
+ * column so narrow spikes never vanish at full zoom-out.
+ */
+function sampleSignal(
+  buckets: Float32Array,
+  bucketMs: number,
+  msPerPx: number,
+  columnCount: number,
+): Float32Array {
+  const bucketCount = buckets.length
+  const out = new Float32Array(columnCount)
+  if (bucketCount === 0 || bucketMs <= 0) return out
+  for (let x = 0; x < columnCount; x++) {
+    const msAtLeft = x * msPerPx
+    const msAtRight = (x + 1) * msPerPx
+    const bLo = Math.min(bucketCount - 1, Math.max(0, Math.floor(msAtLeft / bucketMs)))
+    const bHi = Math.min(bucketCount - 1, Math.max(0, Math.floor(msAtRight / bucketMs)))
+    let maxV = 0
+    for (let b = bLo; b <= bHi; b++) {
+      const v = buckets[b]
+      if (v > maxV) maxV = v
+    }
+    out[x] = maxV
+  }
+  return out
+}
+
+/**
+ * Quick `#rrggbb` → `rgba(...)` expansion so we can tint a profile's
+ * category palette at draw time. Falls back to the original color if
+ * the input isn't a simple hex — canvas accepts the string as-is.
+ */
+function withAlpha(cssColor: string, alpha: number): string {
+  if (cssColor.charCodeAt(0) !== 35 /* # */) return cssColor
+  const body = cssColor.slice(1)
+  let r = 0
+  let g = 0
+  let b = 0
+  if (body.length === 3) {
+    r = parseInt(body[0] + body[0], 16)
+    g = parseInt(body[1] + body[1], 16)
+    b = parseInt(body[2] + body[2], 16)
+  } else if (body.length === 6) {
+    r = parseInt(body.slice(0, 2), 16)
+    g = parseInt(body.slice(2, 4), 16)
+    b = parseInt(body.slice(4, 6), 16)
+  } else {
+    return cssColor
+  }
+  if (!Number.isFinite(r) || !Number.isFinite(g) || !Number.isFinite(b)) return cssColor
+  return `rgba(${r},${g},${b},${alpha})`
+}
