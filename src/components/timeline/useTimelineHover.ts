@@ -2,6 +2,7 @@ import {useEffect, type RefObject} from 'react'
 import type {Track as TrackModel} from '../../core'
 import {hitTestTrack} from './hitTest'
 import {ROW_HEIGHT} from './trackLayout'
+import type {SelectionStore} from './selectionStore'
 import type {ViewportStore} from './viewportStore'
 
 export interface HoverTrackLayout {
@@ -34,6 +35,12 @@ export interface UseTimelineHoverOptions {
    * mousemove.
    */
   tooltipRef: RefObject<HTMLElement | null>
+  /**
+   * Optional selection store. When a drag-selection is in progress the
+   * hover tooltip suppresses itself so the selection's duration tooltip
+   * (owned by `useTimelineSelection`) is the only one visible.
+   */
+  selectionStore?: SelectionStore
 }
 
 /**
@@ -48,7 +55,7 @@ export interface UseTimelineHoverOptions {
  *   `pointerdown` / `pointerup` and gating updates accordingly.
  */
 export function useTimelineHover(options: UseTimelineHoverOptions): void {
-  const {scrollerRef, eventTargetRef, store, trackRows, tooltipRef} = options
+  const {scrollerRef, eventTargetRef, store, trackRows, tooltipRef, selectionStore} = options
 
   useEffect(() => {
     const eventEl = eventTargetRef.current
@@ -97,6 +104,12 @@ export function useTimelineHover(options: UseTimelineHoverOptions): void {
 
     const onPointerMove = (e: PointerEvent): void => {
       if (panning) {
+        hideTooltip()
+        return
+      }
+      // Suppress the hover tooltip during an active drag-selection so
+      // the selection's duration readout is the only one visible.
+      if (selectionStore && selectionStore.get().inProgress) {
         hideTooltip()
         return
       }
@@ -182,7 +195,7 @@ export function useTimelineHover(options: UseTimelineHoverOptions): void {
       eventEl.removeEventListener('pointercancel', onPointerUp)
       hideTooltip()
     }
-  }, [eventTargetRef, scrollerRef, store, trackRows, tooltipRef])
+  }, [eventTargetRef, scrollerRef, store, trackRows, tooltipRef, selectionStore])
 }
 
 /**

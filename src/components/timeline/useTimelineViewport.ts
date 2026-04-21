@@ -1,5 +1,6 @@
 import {useEffect, useRef, useState, type RefObject} from 'react'
 import {ViewportStore} from './viewportStore'
+import type {SelectionStore} from './selectionStore'
 
 export interface TimelineBounds {
   start: number
@@ -17,11 +18,18 @@ export interface UseTimelineZoomOptions {
   containerWidthPx: number
   /**
    * Ref to the scroll container whose `scrollLeft` / `scrollTop` represent pan.
-   * Ctrl/meta + wheel zoom and left/middle-button drag update these directly.
+   * Ctrl/meta + wheel zoom and middle-button drag update these directly.
    */
   scrollerRef: RefObject<HTMLElement | null>
   /** Store to publish viewport updates into. */
   store: ViewportStore
+  /**
+   * Selection store, used by the `Z` hotkey to zoom to the current
+   * committed selection and by `Escape`/`Shift+Z` to clear it. Optional
+   * for backwards compatibility with tests that don't render the
+   * selection UI.
+   */
+  selectionStore?: SelectionStore
 }
 
 export interface UseTimelineZoomResult {
@@ -72,24 +80,31 @@ function clampPxPerMs(
 /**
  * Zoom + pan controller for the canvas-based timeline.
  *
- * Every gesture tick is committed immediately: wheel/W/S recompute `pxPerMs`,
- * recompute the scroll offset that keeps the anchor point under the cursor,
- * write the DOM `scrollLeft`, and publish the new state to the shared
- * `ViewportStore`. Left/middle-button drag pans in both horizontal and
- * vertical axes via `scrollLeft` / `scrollTop`. W/S and A/D use
- * `KEYBOARD_NAV_SCALE` for larger steps than a single wheel notch / viewport
- * fraction. No transform tricks, no debounced commit, no flushSync — every
- * canvas subscriber schedules its own rAF and redraws on the next frame, so
- * the gesture still feels instant without paying a React render tax per tick.
+ * Mouse model (updated):
+ *  - Left-button drag is OWNED by `useTimelineSelection` — it creates a
+ *    time-range selection. This hook no longer starts a pan on left.
+ *  - Middle-button drag pans (both horizontal and vertical).
+ *  - Wheel = scroll; Ctrl/Cmd + wheel = zoom around cursor.
+ *  - W / S zoom around cursor (or viewport center when cursor is outside).
+ *    A / D pan horizontally.
+ *  - Z zooms to the current committed selection; Shift+Z / Escape clear it.
  *
- * The React-visible `pxPerMs` return is only used by code that must size the
- * inner surface width (a single React element). Canvases read the store
- * directly and never re-render during scroll/zoom.
+ * Every gesture tick is committed immediately: wheel/W/S recompute
+ * `pxPerMs`, recompute the scroll offset that keeps the anchor point
+ * under the cursor, write the DOM `scrollLeft`, and publish the new
+ * state to the shared `ViewportStore`. No transform tricks, no debounced
+ * commit — every canvas subscriber schedules its own rAF and redraws on
+ * the next frame, so the gesture still feels instant without paying a
+ * React render tax per tick.
+ *
+ * The React-visible `pxPerMs` return is only used by code that must size
+ * the inner surface width (a single React element). Canvases read the
+ * store directly and never re-render during scroll/zoom.
  */
 export function useTimelineZoom(
   options: UseTimelineZoomOptions,
 ): UseTimelineZoomResult {
-  const {bounds, labelWidthPx, containerWidthPx, scrollerRef, store} = options
+  const {bounds, labelWidthPx, containerWidthPx, scrollerRef, store, selectionStore} = options
 
   const totalSpan = Math.max(bounds.end - bounds.start, MIN_SPAN_MS)
   // "Fit" means `innerWidthPx === containerWidthPx` — the surface exactly
@@ -126,6 +141,8 @@ export function useTimelineZoom(
   // re-attaching its listener whenever the viewport resizes.
   const fitPxPerMsRef = useRef(fitPxPerMs)
   fitPxPerMsRef.current = fitPxPerMs
+  const selectionStoreRef = useRef(selectionStore)
+  selectionStoreRef.current = selectionStore
 
   // Keep the store's pxPerMs / labelWidthPx / bounds in sync with props even
   // outside a gesture (e.g. after the window resizes and fitPxPerMs changes).
@@ -267,23 +284,16 @@ export function useTimelineZoom(
       | null = null
 
     const onPointerDown = (e: PointerEvent): void => {
-      // Left click (0) and middle click (1) both start a drag-pan.
-      // Middle-click additionally bypasses the gutter-button/input
-      // filter — middle is conventionally "scroll this surface", so it
-      // should work even when the pointer lands on a toggle button.
-      const isLeft = e.button === 0
-      const isMiddle = e.button === 1
-      if (!isLeft && !isMiddle) return
-      if (isLeft) {
-        const target = e.target as HTMLElement | null
-        if (target?.closest('button, input, textarea, [data-no-pan]')) return
-      }
+      // Only middle-button (1) starts a pan now. Left-button is owned by
+      // `useTimelineSelection` and used for drag-selection. Right-click
+      // falls through to the native context menu.
+      if (e.button !== 1) return
       const scroller = scrollerRef.current
       if (!scroller) return
       // preventDefault on middle-click suppresses Chrome's classic
       // auto-scroll cursor (the four-arrow widget) so the drag behaves
       // like a regular pan.
-      if (isMiddle) e.preventDefault()
+      e.preventDefault()
       panning = {
         pointerId: e.pointerId,
         startClientX: e.clientX,
@@ -291,9 +301,9 @@ export function useTimelineZoom(
         startScrollLeft: scroller.scrollLeft,
         startScrollTop: scroller.scrollTop,
         button: e.button,
-        ...(isMiddle ? {cursorBefore: el.style.cursor} : {}),
+        cursorBefore: el.style.cursor,
       }
-      if (isMiddle) el.style.cursor = 'grabbing'
+      el.style.cursor = 'grabbing'
       try {
         el.setPointerCapture(e.pointerId)
       } catch {
@@ -368,7 +378,88 @@ export function useTimelineZoom(
       scroller.scrollLeft += deltaPx
     }
 
+    /**
+     * Zoom the viewport to cover exactly `[startMs, endMs]`. Uses the same
+     * imperative-widen-then-scroll dance as `applyZoom` so there's no
+     * one-frame flicker when the zoom crosses the current scrollWidth.
+     * Leaves the committed selection in place so the user can press `Z`
+     * repeatedly without losing their anchor.
+     */
+    const zoomToRange = (startMs: number, endMs: number): void => {
+      const scroller = scrollerRef.current
+      if (!scroller) return
+      const span = Math.max(endMs - startMs, MIN_SPAN_MS)
+      const traceSpan = Math.max(
+        boundsRef.current.end - boundsRef.current.start,
+        MIN_SPAN_MS,
+      )
+      const labelWidth = labelWidthRef.current
+      const contentWidthPx = Math.max(0, scroller.clientWidth - labelWidth)
+      if (contentWidthPx <= 0) return
+      const targetPxPerMs = clampPxPerMs(
+        contentWidthPx / span,
+        traceSpan,
+        fitPxPerMsRef.current,
+      )
+      const targetScrollLeft =
+        labelWidth +
+        (startMs - boundsRef.current.start) * targetPxPerMs
+
+      pxPerMsRef.current = targetPxPerMs
+      const nextInnerWidthPx = labelWidth + traceSpan * targetPxPerMs
+      const surfaceEl = el as HTMLElement
+      if (
+        surfaceEl.style.width === '' ||
+        parseFloat(surfaceEl.style.width) < nextInnerWidthPx
+      ) {
+        surfaceEl.style.width = `${nextInnerWidthPx}px`
+      }
+      scroller.scrollLeft = targetScrollLeft
+      setPxPerMsOverride(targetPxPerMs)
+      storeRef.current.set({
+        pxPerMs: targetPxPerMs,
+        scrollLeft: targetScrollLeft,
+      })
+    }
+
     const onKeyDown = (e: KeyboardEvent): void => {
+      // Z / Shift+Z and Escape are handled even under some modifier sets
+      // that `shouldHandleKey` would otherwise gate out — specifically,
+      // Z zoom-to-selection is allowed with Shift (to clear).
+      if (e.key === 'Escape') {
+        const sel = selectionStoreRef.current
+        if (sel && (sel.get().committed || sel.get().inProgress)) {
+          e.preventDefault()
+          sel.clear()
+          return
+        }
+      }
+      if ((e.key === 'z' || e.key === 'Z') && !e.ctrlKey && !e.metaKey && !e.altKey) {
+        const sel = selectionStoreRef.current
+        const active = document.activeElement as HTMLElement | null
+        const inField =
+          !!active &&
+          (active.tagName === 'INPUT' ||
+            active.tagName === 'TEXTAREA' ||
+            active.tagName === 'SELECT' ||
+            active.isContentEditable)
+        if (inField) return
+        if (e.shiftKey) {
+          if (sel) {
+            e.preventDefault()
+            sel.clear()
+          }
+          return
+        }
+        const committed = sel?.get().committed
+        if (committed && committed.endMs > committed.startMs) {
+          e.preventDefault()
+          zoomToRange(committed.startMs, committed.endMs)
+          return
+        }
+        // No selection → fall through; Z has no other binding.
+        return
+      }
       if (!shouldHandleKey(e)) return
       switch (e.key) {
         case 'w':

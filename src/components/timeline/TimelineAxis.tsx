@@ -7,6 +7,13 @@ export const TIMELINE_AXIS_HEIGHT_PX = 28
 interface TimelineAxisProps {
   store: ViewportStore
   labelWidthPx: number
+  /**
+   * How far from the top of the scroller the axis should stick. Defaults
+   * to 0 (pin to the top). When the sticky `TimelineOverview` is also
+   * mounted, the axis stacks beneath it at `TIMELINE_OVERVIEW_HEIGHT_PX`
+   * so they don't overlap while scrolling vertically.
+   */
+  stickyTopPx?: number
 }
 
 /**
@@ -26,7 +33,7 @@ interface TimelineAxisProps {
  * positions without the sub-pixel shimmer a translate-only path would
  * introduce.
  */
-function TimelineAxisBase({store, labelWidthPx}: TimelineAxisProps) {
+function TimelineAxisBase({store, labelWidthPx, stickyTopPx = 0}: TimelineAxisProps) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null)
   const wrapperRef = useRef<HTMLDivElement | null>(null)
   const rafRef = useRef<number | null>(null)
@@ -176,10 +183,11 @@ function TimelineAxisBase({store, labelWidthPx}: TimelineAxisProps) {
       style={{
         display: 'flex',
         alignItems: 'stretch',
-        // Stick to the top of the scroller. z-index keeps the axis above
-        // track content during vertical scroll.
+        // Stick to the top of the scroller (or just below the overview
+        // when one is present — see `stickyTopPx`). z-index keeps the
+        // axis above track content during vertical scroll.
         position: 'sticky',
-        top: 0,
+        top: stickyTopPx,
         zIndex: 2,
         height: TIMELINE_AXIS_HEIGHT_PX,
         width: '100%',
@@ -196,7 +204,7 @@ function TimelineAxisBase({store, labelWidthPx}: TimelineAxisProps) {
         style={{
           position: 'sticky',
           left: 0,
-          top: 0,
+          top: stickyTopPx,
           zIndex: 1,
           flexShrink: 0,
           width: labelWidthPx,
@@ -209,7 +217,7 @@ function TimelineAxisBase({store, labelWidthPx}: TimelineAxisProps) {
         style={{
           position: 'sticky',
           left: labelWidthPx,
-          top: 0,
+          top: stickyTopPx,
           flexShrink: 0,
           height: TIMELINE_AXIS_HEIGHT_PX,
           // Width set imperatively from the store.

@@ -1,14 +1,20 @@
 import {useCallback, useEffect, useMemo, useRef, useState} from 'react'
 import type {System, Timeline as TimelineModel, Track as TrackModel} from '../core'
+import {buildOverviewUtilization} from '../core/render/overviewUtilization'
 import TimelineSystem from './TimelineSystem'
 import {useTimelineZoom} from './timeline/useTimelineViewport'
 import {useTimelineHover, type HoverTrackLayout} from './timeline/useTimelineHover'
+import {useTimelineSelection} from './timeline/useTimelineSelection'
 import {containerDepth, ROW_HEIGHT} from './timeline/trackLayout'
 import {createViewportStore} from './timeline/viewportStore'
+import {createSelectionStore, type SelectionStore} from './timeline/selectionStore'
 import TimelineAxis, {TIMELINE_AXIS_HEIGHT_PX} from './timeline/TimelineAxis'
+import TimelineOverview, {TIMELINE_OVERVIEW_HEIGHT_PX} from './timeline/TimelineOverview'
+import SelectionOverlay from './timeline/SelectionOverlay'
 
 interface TimelineProps {
   timeline: TimelineModel
+  selectionStore?: SelectionStore
 }
 
 export interface PerfecttoTimelineSnapshot {
@@ -77,7 +83,7 @@ function systemHeightPx(
   return header + tracksHeight
 }
 
-export default function Timeline({timeline}: TimelineProps) {
+export default function Timeline({timeline, selectionStore}: TimelineProps) {
   const scrollRef = useRef<HTMLDivElement | null>(null)
   // Single floating tooltip element shared by all tracks. Lives in the
   // outer scroller (not inside any TimelineSystem) so it can be positioned
@@ -102,6 +108,18 @@ export default function Timeline({timeline}: TimelineProps) {
     })
   }
   const store = storeRef.current
+
+  // Selection store. Mirrors the viewport-store pattern — one instance per
+  // Timeline mount, created lazily on first render. When a parent passes
+  // in their own `selectionStore` we use that instead so the Aggregator
+  // panel (mounted as a sibling, not a descendant) can read the same
+  // state without threading props through React.
+  const localSelectionStoreRef = useRef<SelectionStore | null>(null)
+  if (localSelectionStoreRef.current === null && !selectionStore) {
+    localSelectionStoreRef.current = createSelectionStore()
+  }
+  const effectiveSelectionStore =
+    selectionStore ?? (localSelectionStoreRef.current as SelectionStore)
 
   // React-visible mirrors of a handful of store fields. Kept narrow so that
   // only layout-relevant changes (viewport size for fit-zoom math, vertical
@@ -189,15 +207,17 @@ export default function Timeline({timeline}: TimelineProps) {
     containerWidthPx: viewportWidth,
     scrollerRef: scrollRef,
     store,
+    selectionStore: effectiveSelectionStore,
   })
 
   // Precompute vertical layout with current expanded state. We reserve
-  // `TIMELINE_AXIS_HEIGHT_PX` at the top for the sticky time ruler so
-  // the first TimelineSystem starts just below it (systems are
-  // absolutely positioned within the event surface by their `topPx`).
+  // `TIMELINE_OVERVIEW_HEIGHT_PX + TIMELINE_AXIS_HEIGHT_PX` at the top
+  // for the sticky overview track and the sticky time ruler so the
+  // first TimelineSystem starts just below them (systems are absolutely
+  // positioned within the event surface by their `topPx`).
   const layout = useMemo(() => {
     const items: SystemLayout[] = []
-    let y = TIMELINE_AXIS_HEIGHT_PX
+    let y = TIMELINE_OVERVIEW_HEIGHT_PX + TIMELINE_AXIS_HEIGHT_PX
     for (const system of timeline.systems) {
       const expanded = systemExpanded[system.id] ?? true
       const headerHeightPx = SYSTEM_HEADER_HEIGHT_PX + SYSTEM_BORDER_HEIGHT_PX
@@ -221,6 +241,15 @@ export default function Timeline({timeline}: TimelineProps) {
 
   const totalSpanMs = Math.max(timeline.end - timeline.start, MIN_SPAN_MS)
   const innerWidthPx = LABEL_WIDTH_PX + totalSpanMs * pxPerMs
+
+  // Overview utilization. Computed once per `timeline` identity — the
+  // parser hands us a fresh object per trace, so memoizing on it is
+  // equivalent to "compute on parse". Runs on the main thread; O(total
+  // depth-0 slices) plus a 7-tap smoothing pass, well inside a frame.
+  const overviewUtilization = useMemo(
+    () => buildOverviewUtilization(timeline),
+    [timeline],
+  )
 
   // Test hook: expose a live snapshot of the viewport state so e2e tests can
   // verify zoom anchoring and cursor math without scraping the DOM. Reads
@@ -319,18 +348,38 @@ export default function Timeline({timeline}: TimelineProps) {
     store,
     trackRows: hoverTrackRows,
     tooltipRef,
+    selectionStore: effectiveSelectionStore,
+  })
+
+  // Separate ref for the overview canvas so the selection hook can wire
+  // a dedicated left-drag handler there (distinct from the main event
+  // surface) — allows future differentiation like "overview drag always
+  // selects, even over the label gutter" if we want it.
+  const overviewCanvasRef = useRef<HTMLCanvasElement | null>(null)
+
+  useTimelineSelection({
+    scrollerRef: scrollRef,
+    eventTargetRef: eventTargetElRef,
+    overviewCanvasRef,
+    store,
+    selectionStore: effectiveSelectionStore,
+    tooltipRef,
   })
 
   return (
     <div
       ref={scrollRef}
       className="relative min-h-0 flex-1 overflow-auto"
-      // Reserve scrollbar-gutter space in both axes at all times so zooming
-      // across the fit threshold (where the horizontal scrollbar
-      // appears/disappears) doesn't reflow the tracks vertically, and
-      // vertical scrollbar appearance on tall traces doesn't shift the axis
-      // tick labels horizontally.
-      style={{scrollbarGutter: 'stable'}}
+      // Reserve scrollbar-gutter space in both axes at all times so
+      // zooming across the fit threshold doesn't reflow anything:
+      //  - `scrollbarGutter: 'stable'` reserves the vertical (inline)
+      //    gutter — only reliable axis the spec covers.
+      //  - `overflowX: 'scroll'` forces the horizontal scrollbar to
+      //    always be present (even at fit-zoom where there's nothing
+      //    to scroll), which is the only way to prevent the ~15px
+      //    vertical reflow the CSS spec doesn't give us a gutter
+      //    property for. Matches Chrome DevTools' Performance panel.
+      style={{scrollbarGutter: 'stable', overflowX: 'scroll'}}
     >
       <div
         ref={setEventTarget}
@@ -338,7 +387,18 @@ export default function Timeline({timeline}: TimelineProps) {
         className="relative"
         style={{width: innerWidthPx, height: layout.totalHeightPx}}
       >
-        <TimelineAxis store={store} labelWidthPx={LABEL_WIDTH_PX} />
+        <TimelineOverview
+          overview={overviewUtilization}
+          store={store}
+          selectionStore={effectiveSelectionStore}
+          labelWidthPx={LABEL_WIDTH_PX}
+          canvasRef={overviewCanvasRef}
+        />
+        <TimelineAxis
+          store={store}
+          labelWidthPx={LABEL_WIDTH_PX}
+          stickyTopPx={TIMELINE_OVERVIEW_HEIGHT_PX}
+        />
         {visibleSystems.map(item => (
           <TimelineSystem
             key={item.system.id}
@@ -351,6 +411,12 @@ export default function Timeline({timeline}: TimelineProps) {
             onToggleTrack={toggleTrack}
           />
         ))}
+        <SelectionOverlay
+          store={store}
+          selectionStore={effectiveSelectionStore}
+          labelWidthPx={LABEL_WIDTH_PX}
+          totalHeightPx={layout.totalHeightPx}
+        />
       </div>
       {/*
         Floating tooltip. `position: fixed` keeps it pinned in viewport
