@@ -1,13 +1,13 @@
 import {
-  applyProfile,
-  BUILTIN_PROFILES,
-  detectProfile,
-  findProfile,
-  RAW_PROFILE,
-  WEB_DEV_PROFILE,
+  applyPersona,
+  BUILTIN_PERSONAS,
+  detectPersona,
+  findPersona,
+  RAW_PERSONA,
+  WEB_DEV_PERSONA,
   type Measure,
   type ParsedTrace,
-  type Profile,
+  type Persona,
   type System,
   type Track,
 } from '../core'
@@ -52,36 +52,36 @@ function makeTrace(systems: System[], start = 0, end = 100): ParsedTrace {
   }
 }
 
-describe('profile registry', () => {
+describe('persona registry', () => {
   it('includes raw and web-dev built-ins', () => {
-    expect(findProfile('raw')).toBe(RAW_PROFILE)
-    expect(findProfile('web-dev')).toBe(WEB_DEV_PROFILE)
-    expect(findProfile('bogus')).toBeUndefined()
-    expect(BUILTIN_PROFILES).toContain(RAW_PROFILE)
-    expect(BUILTIN_PROFILES).toContain(WEB_DEV_PROFILE)
+    expect(findPersona('raw')).toBe(RAW_PERSONA)
+    expect(findPersona('web-dev')).toBe(WEB_DEV_PERSONA)
+    expect(findPersona('bogus')).toBeUndefined()
+    expect(BUILTIN_PERSONAS).toContain(RAW_PERSONA)
+    expect(BUILTIN_PERSONAS).toContain(WEB_DEV_PERSONA)
   })
 
-  it('detects web-dev profile for Chrome-like traces', () => {
+  it('detects web-dev persona for Chrome-like traces', () => {
     const main = makeTrack('t1', 'CrRendererMain', [m('FunctionCall', 0, 10)])
     const trace = makeTrace([makeSystem('s1', 'Renderer', [main])])
-    expect(detectProfile(trace)).toBe(WEB_DEV_PROFILE)
+    expect(detectPersona(trace)).toBe(WEB_DEV_PERSONA)
   })
 
-  it('falls back to raw profile for non-Chrome traces', () => {
+  it('falls back to raw persona for non-Chrome traces', () => {
     const worker = makeTrack('t1', 'WorkerThread', [m('doWork', 0, 10)])
     const trace = makeTrace([makeSystem('s1', 'App', [worker])])
-    expect(detectProfile(trace)).toBe(RAW_PROFILE)
+    expect(detectPersona(trace)).toBe(RAW_PERSONA)
   })
 })
 
-describe('applyProfile (raw)', () => {
+describe('applyPersona (raw)', () => {
   it('leaves tracks in original order and colors at defaults', () => {
     const t1 = makeTrack('t1', 'Worker', [m('a', 0, 1)])
     const t2 = makeTrack('t2', 'CompositorTileWorker', [m('b', 2, 3)])
     const sys = makeSystem('s1', 'App', [t1, t2])
     const trace = makeTrace([sys])
 
-    const applied = applyProfile(trace, RAW_PROFILE)
+    const applied = applyPersona(trace, RAW_PERSONA)
     expect(applied.systems).toHaveLength(1)
     expect(applied.systems[0].tracks.map(t => t.id)).toEqual(['t1', 't2'])
     expect(applied.hiddenTracksBySystem).toEqual({})
@@ -91,7 +91,7 @@ describe('applyProfile (raw)', () => {
   })
 })
 
-describe('applyProfile (web-dev)', () => {
+describe('applyPersona (web-dev)', () => {
   function buildChromeTrace(): ParsedTrace {
     const rendererMain = makeTrack('tm', 'CrRendererMain', [
       m('FunctionCall', 0, 10),
@@ -108,7 +108,7 @@ describe('applyProfile (web-dev)', () => {
 
   it('pins CrRendererMain to the top and relabels it "Main"', () => {
     const trace = buildChromeTrace()
-    const applied = applyProfile(trace, WEB_DEV_PROFILE)
+    const applied = applyPersona(trace, WEB_DEV_PERSONA)
     const tracks = applied.systems[0].tracks
     expect(tracks[0].id).toBe('tm')
     expect(tracks[0].name).toBe('Main')
@@ -116,15 +116,15 @@ describe('applyProfile (web-dev)', () => {
 
   it('hides ThreadPool tracks by default', () => {
     const trace = buildChromeTrace()
-    const applied = applyProfile(trace, WEB_DEV_PROFILE)
+    const applied = applyPersona(trace, WEB_DEV_PERSONA)
     const visibleIds = applied.systems[0].tracks.map(t => t.id)
     expect(visibleIds).not.toContain('tp')
     expect(applied.hiddenTracksBySystem.s1?.map(t => t.id)).toContain('tp')
   })
 
-  it('paints slices with the profile palette', () => {
+  it('paints slices with the persona palette', () => {
     const trace = buildChromeTrace()
-    applyProfile(trace, WEB_DEV_PROFILE)
+    applyPersona(trace, WEB_DEV_PERSONA)
     const renderer = trace.timeline.systems[0].tracks.find(t => t.id === 'tm')!
     const buf = renderer.buffers!
     // Uint32Array stores unsigned; `packColor` can return signed for
@@ -138,7 +138,7 @@ describe('applyProfile (web-dev)', () => {
 
   it('sets default expand state for the renderer main thread and its system', () => {
     const trace = buildChromeTrace()
-    const applied = applyProfile(trace, WEB_DEV_PROFILE)
+    const applied = applyPersona(trace, WEB_DEV_PERSONA)
     expect(applied.defaultTrackExpanded.tm).toBe(true)
     expect(applied.defaultTrackExpanded.tc).toBe(false)
     expect(applied.defaultSystemExpanded.s1).toBe(true)
@@ -151,7 +151,7 @@ describe('applyProfile (web-dev)', () => {
       makeSystem('kernel', 'Process 0', [swapper]),
       makeSystem('renderer', 'Renderer', [rendererMain]),
     ])
-    const applied = applyProfile(trace, WEB_DEV_PROFILE)
+    const applied = applyPersona(trace, WEB_DEV_PERSONA)
     expect(applied.systems.map(s => s.id)).toEqual(['renderer'])
     expect(applied.hiddenSystems.map(s => s.name)).toEqual(['Process 0'])
   })
@@ -162,7 +162,7 @@ describe('applyProfile (web-dev)', () => {
     const trace = makeTrace([
       makeSystem('s1', 'Renderer', [rendererMain, asyncTrack]),
     ])
-    const applied = applyProfile(trace, WEB_DEV_PROFILE)
+    const applied = applyPersona(trace, WEB_DEV_PERSONA)
     const visibleIds = applied.systems[0].tracks.map(t => t.id)
     expect(visibleIds).not.toContain('ta')
     expect(applied.hiddenTracksBySystem.s1?.map(t => t.id)).toContain('ta')
@@ -172,8 +172,8 @@ describe('applyProfile (web-dev)', () => {
     const rendererMain = makeTrack('tm', 'CrRendererMain', [m('FunctionCall', 0, 10)])
     const worker = makeTrack('tw', 'SomeWorker', [m('w', 0, 10)])
     const trace = makeTrace([makeSystem('s1', 'Renderer', [rendererMain, worker])])
-    const applied = applyProfile(trace, WEB_DEV_PROFILE)
-    // No TrackRule touches `SomeWorker`, so the profile-wide
+    const applied = applyPersona(trace, WEB_DEV_PERSONA)
+    // No TrackRule touches `SomeWorker`, so the persona-wide
     // `defaultTracksExpanded: false` should drive it closed.
     expect(applied.defaultTrackExpanded.tw).toBe(false)
   })
@@ -185,16 +185,16 @@ describe('applyProfile (web-dev)', () => {
       makeSystem('renderer', 'Renderer', [rendererMain]),
       makeSystem('browser', 'Browser', [browserMain]),
     ])
-    const applied = applyProfile(trace, WEB_DEV_PROFILE)
+    const applied = applyPersona(trace, WEB_DEV_PERSONA)
     expect(applied.defaultSystemExpanded.renderer).toBe(true)
     expect(applied.defaultSystemExpanded.browser).toBe(false)
   })
 
-  it('switching profiles restores colors deterministically', () => {
+  it('switching personas restores colors deterministically', () => {
     const trace = buildChromeTrace()
-    applyProfile(trace, WEB_DEV_PROFILE)
+    applyPersona(trace, WEB_DEV_PERSONA)
     // Back to raw: slices should reset to the default measure color.
-    applyProfile(trace, RAW_PROFILE)
+    applyPersona(trace, RAW_PERSONA)
     const renderer = trace.timeline.systems[0].tracks.find(t => t.id === 'tm')!
     for (let i = 0; i < renderer.buffers!.count; i++) {
       expect(renderer.buffers!.colors[i]).toBe(DEFAULT_MEASURE_COLOR)
@@ -203,7 +203,7 @@ describe('applyProfile (web-dev)', () => {
 })
 
 describe('buildOverviewBands', () => {
-  it('produces one series per profile band, each summing to ≤ 1', () => {
+  it('produces one series per persona band, each summing to ≤ 1', () => {
     const rendererMain = makeTrack('tm', 'CrRendererMain', [
       m('FunctionCall', 0, 25),
       m('Layout', 25, 50),
@@ -211,9 +211,9 @@ describe('buildOverviewBands', () => {
       m('ParseHTML', 75, 100),
     ])
     const trace = makeTrace([makeSystem('s1', 'Renderer', [rendererMain])])
-    const applied = applyProfile(trace, WEB_DEV_PROFILE)
+    const applied = applyPersona(trace, WEB_DEV_PERSONA)
     const bands = buildOverviewBands(trace.timeline, applied, 32)
-    expect(bands.bands).toHaveLength(WEB_DEV_PROFILE.overviewBands.length)
+    expect(bands.bands).toHaveLength(WEB_DEV_PERSONA.overviewBands.length)
     for (let i = 0; i < bands.bucketCount; i++) {
       let total = 0
       for (const b of bands.bands) total += b.buckets[i]
@@ -222,7 +222,7 @@ describe('buildOverviewBands', () => {
   })
 
   it('ignores categories not mapped to any band', () => {
-    const orphan: Profile = {
+    const orphan: Persona = {
       id: 'orphan',
       name: 'Orphan',
       description: '',
@@ -234,7 +234,7 @@ describe('buildOverviewBands', () => {
     }
     const t = makeTrack('t1', 'w', [m('a', 0, 50)])
     const trace = makeTrace([makeSystem('s1', 'App', [t])])
-    const applied = applyProfile(trace, orphan)
+    const applied = applyPersona(trace, orphan)
     const bands = buildOverviewBands(trace.timeline, applied, 16)
     expect(bands.bands).toHaveLength(0)
   })

@@ -1,8 +1,8 @@
 import type {ParsedTrace} from '../../types'
-import type {Profile} from '../types'
+import type {Persona} from '../types'
 
 /**
- * "Web Developer" profile. Interprets a Chrome / Chromium trace the way
+ * "Web Developer" persona. Interprets a Chrome / Chromium trace the way
  * Chrome DevTools' Performance panel does:
  *
  *   - colorize slices by high-level activity (Loading, Scripting,
@@ -15,7 +15,7 @@ import type {Profile} from '../types'
  *
  * Designed for Chrome JSON traces where thread names are `CrRendererMain`,
  * `CrBrowserMain`, `Compositor`, etc. Non-Chrome traces score 0 on
- * `match` and fall back to the `raw` profile.
+ * `match` and fall back to the `raw` persona.
  */
 
 const CAT = {
@@ -29,7 +29,7 @@ const CAT = {
   other: 'other',
 } as const
 
-export const WEB_DEV_PROFILE: Profile = {
+export const WEB_DEV_PERSONA: Persona = {
   id: 'web-dev',
   name: 'Web Developer',
   description:
@@ -158,7 +158,7 @@ export const WEB_DEV_PROFILE: Profile = {
     // expand to drill in.
     {trackName: /^CrBrowserMain$/, sortPriority: 10},
     // Compositor / GPU main — visible but collapsed by default
-    // (redundant with the profile baseline, kept for self-documentation).
+    // (redundant with the persona baseline, kept for self-documentation).
     {trackName: /^Compositor$/, sortPriority: 20, defaultExpanded: false},
     {trackName: /^CrGpuMain$/, sortPriority: 20, defaultExpanded: false},
     // I/O threads — visible, collapsed.

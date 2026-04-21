@@ -11,7 +11,7 @@ interface TimelineOverviewProps {
   /**
    * Optional stacked-category bands. When provided, the overview renders
    * them as stacked area layers instead of the single utilization
-   * mountain. Used by profiles with `overviewBands` defined.
+   * mountain. Used by personas with `overviewBands` defined.
    */
   bands?: OverviewBandsResult
   store: ViewportStore
@@ -121,7 +121,7 @@ function TimelineOverviewBase({
 
       if (bands && bands.bands.length > 0) {
         // ------------------------------------------------------------------
-        // Stacked-band mode (profile-driven).
+        // Stacked-band mode (persona-driven).
         // ------------------------------------------------------------------
         // Each band's [0,1] normalized signal is drawn as an area stacked
         // on top of the previous bands. We sample each band at one
@@ -171,7 +171,7 @@ function TimelineOverviewBase({
         ctx.stroke()
       } else {
         // ------------------------------------------------------------------
-        // Single-curve mode (Raw profile / no bands configured).
+        // Single-curve mode (Raw persona / no bands configured).
         // ------------------------------------------------------------------
         const buckets = overview.buckets
         const bucketCount = buckets.length
@@ -425,7 +425,7 @@ function sampleSignal(
 }
 
 /**
- * Quick `#rrggbb` → `rgba(...)` expansion so we can tint a profile's
+ * Quick `#rrggbb` → `rgba(...)` expansion so we can tint a persona's
  * category palette at draw time. Falls back to the original color if
  * the input isn't a simple hex — canvas accepts the string as-is.
  */

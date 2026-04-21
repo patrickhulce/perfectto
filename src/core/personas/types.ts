@@ -1,24 +1,24 @@
 import type {Measure, ParsedTrace, System, Track} from '../types'
 
 /**
- * A profile is a pluggable interpretation of a trace. Given a parsed trace,
- * a profile tells the viewer how to colorize slices, which tracks matter
+ * A persona is a pluggable interpretation of a trace. Given a parsed trace,
+ * a persona tells the viewer how to colorize slices, which tracks matter
  * (and in what order), which should be hidden or expanded by default, and
  * which categories stack into the overview band chart.
  *
- * Profiles never mutate the raw {@link ParsedTrace}. {@link applyProfile}
- * produces an {@link AppliedProfile} with derived views the UI consumes.
+ * Personas never mutate the raw {@link ParsedTrace}. {@link applyPersona}
+ * produces an {@link AppliedPersona} with derived views the UI consumes.
  */
-export interface Profile {
+export interface Persona {
   /** Stable machine id, e.g. `'web-dev'`, `'raw'`. */
   id: string
-  /** Human-facing name for the profile picker. */
+  /** Human-facing name for the persona picker. */
   name: string
   /** One-line description shown in the picker / tooltip. */
   description: string
 
   /**
-   * Auto-detection score. Higher wins; 0 means "does not apply". Profiles
+   * Auto-detection score. Higher wins; 0 means "does not apply". Personas
    * should look at track/system names, metadata, and other stable
    * features of the trace. Must not mutate the trace.
    */
@@ -32,7 +32,7 @@ export interface Profile {
   trackRules: TrackRule[]
   /**
    * Ordered list of system-level rules. All matching rules apply,
-   * last-write wins per field. Lets a profile hide / reorder / default-
+   * last-write wins per field. Lets a persona hide / reorder / default-
    * collapse entire processes (e.g. the kernel's pid-0 system).
    */
   systemRules?: SystemRule[]
@@ -40,14 +40,14 @@ export interface Profile {
   overviewBands: OverviewBand[]
   /**
    * Baseline expand-state for tracks that no {@link TrackRule} touches.
-   * Undefined → UI default (expanded). A profile can flip this to
+   * Undefined → UI default (expanded). A persona can flip this to
    * `false` to collapse everything except explicitly-opted-in tracks.
    */
   defaultTracksExpanded?: boolean
   /**
    * Baseline expand-state for systems that no {@link SystemRule} or
    * {@link TrackRule.defaultSystemExpanded} touches. Same semantics as
-   * {@link Profile.defaultTracksExpanded}.
+   * {@link Persona.defaultTracksExpanded}.
    */
   defaultSystemsExpanded?: boolean
 }
@@ -138,23 +138,23 @@ export interface OverviewBand {
 }
 
 // ---------------------------------------------------------------------------
-// Applied profile (output of applyProfile)
+// Applied persona (output of applyPersona)
 // ---------------------------------------------------------------------------
 
 /**
- * The UI-facing view produced by {@link applyProfile}. Contains derived
+ * The UI-facing view produced by {@link applyPersona}. Contains derived
  * systems/tracks (filtered, reordered, relabeled), default expand maps,
  * and the plumbing the overview chart needs to compute stacked bands.
  *
  * Each track inside `systems` keeps its original `id` so React keys and
- * expand-state keys remain stable across profile switches. The underlying
+ * expand-state keys remain stable across persona switches. The underlying
  * `Track.buffers.colors` / `Track.mipmap.levels[i].colors` arrays have
- * been repainted in place by `applyProfile` — the canvas renderer
+ * been repainted in place by `applyPersona` — the canvas renderer
  * consumes them unchanged.
  */
-export interface AppliedProfile {
-  profile: Profile
-  /** Profile-filtered, profile-sorted, profile-relabeled view of systems. */
+export interface AppliedPersona {
+  persona: Persona
+  /** Persona-filtered, persona-sorted, persona-relabeled view of systems. */
   systems: System[]
   /**
    * Tracks hidden by default, grouped by their parent system id. The UI
@@ -176,13 +176,13 @@ export interface AppliedProfile {
   /**
    * Resolver that returns the `CategoryDef.id` for any measure in the
    * trace. Exposed for the overview aggregator. Measures with no matching
-   * rule resolve to the profile's catch-all category (typically `'other'`)
-   * or `undefined` if the profile defines none.
+   * rule resolve to the persona's catch-all category (typically `'other'`)
+   * or `undefined` if the persona defines none.
    */
   resolveCategoryId(measure: Measure, track: Track, system: System): string | undefined
   /**
    * Precomputed category → overview band id lookup, derived from
-   * {@link Profile.overviewBands}. `undefined` means the category is not
+   * {@link Persona.overviewBands}. `undefined` means the category is not
    * stacked in the overview (contributes to "idle" / unaccounted time).
    */
   bandForCategory: Record<string, string>

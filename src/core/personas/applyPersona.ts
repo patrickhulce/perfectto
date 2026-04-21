@@ -8,29 +8,29 @@ import {
   type CompiledTrackRule,
 } from './ruleMatchers'
 import {packCategoryPalette, rebuildTrackColors} from './rebuildTrackColors'
-import type {AppliedProfile, Profile} from './types'
+import type {AppliedPersona, Persona} from './types'
 
 /**
- * Apply a profile to a parsed trace. Returns a UI-facing view
- * ({@link AppliedProfile}) and, as a side effect, repaints every
- * track's color buffers in place using the profile's color rules. The
+ * Apply a persona to a parsed trace. Returns a UI-facing view
+ * ({@link AppliedPersona}) and, as a side effect, repaints every
+ * track's color buffers in place using the persona's color rules. The
  * raw trace structure (measures, starts, ends, systems, tracks) is
  * never mutated.
  *
- * Re-calling `applyProfile` with a different profile is safe and is the
- * intended way to switch profiles at runtime — the color arrays are
+ * Re-calling `applyPersona` with a different persona is safe and is the
+ * intended way to switch personas at runtime — the color arrays are
  * overwritten with new values, no structural work happens.
  *
- * The raw profile (no color rules, no track rules, no bands) is a
+ * The raw persona (no color rules, no track rules, no bands) is a
  * fast path: we still recompute colors from Measure.color defaults so
  * that switching away from Web Developer back to Raw restores the
  * original palette.
  */
-export function applyProfile(trace: ParsedTrace, profile: Profile): AppliedProfile {
-  const compiledColorRules = profile.colorRules.map(compileColorRule)
-  const compiledTrackRules = profile.trackRules.map(compileTrackRule)
-  const compiledSystemRules = (profile.systemRules ?? []).map(compileSystemRule)
-  const palette = packCategoryPalette(profile.categories)
+export function applyPersona(trace: ParsedTrace, persona: Persona): AppliedPersona {
+  const compiledColorRules = persona.colorRules.map(compileColorRule)
+  const compiledTrackRules = persona.trackRules.map(compileTrackRule)
+  const compiledSystemRules = (persona.systemRules ?? []).map(compileSystemRule)
+  const palette = packCategoryPalette(persona.categories)
 
   // Build a reusable measure-resolver that only depends on the compiled
   // rules and the palette. Looked up per-slice during the repaint.
@@ -55,7 +55,7 @@ export function applyProfile(trace: ParsedTrace, profile: Profile): AppliedProfi
     // No rule matched or the category id isn't defined in the palette:
     // fall back to the measure's own color, or the default gray. Matches
     // what sliceBuffers.buildSliceBuffers does at parse time so Raw
-    // profile is exactly "what the parser produced".
+    // persona is exactly "what the parser produced".
     return packMeasureDefaultColor(m)
   }
 
@@ -78,8 +78,8 @@ export function applyProfile(trace: ParsedTrace, profile: Profile): AppliedProfi
   const trackLabels: Record<string, string> = {}
   const systemLabels: Record<string, string> = {}
 
-  const defaultTracksExpanded = profile.defaultTracksExpanded
-  const defaultSystemsExpanded = profile.defaultSystemsExpanded
+  const defaultTracksExpanded = persona.defaultTracksExpanded
+  const defaultSystemsExpanded = persona.defaultSystemsExpanded
 
   interface SystemCandidate {
     system: System
@@ -108,7 +108,7 @@ export function applyProfile(trace: ParsedTrace, profile: Profile): AppliedProfi
       if (effects.defaultExpanded !== undefined) {
         defaultTrackExpanded[track.id] = effects.defaultExpanded
       } else if (defaultTracksExpanded === false) {
-        // Profile-wide baseline: unmatched tracks collapse by default.
+        // Persona-wide baseline: unmatched tracks collapse by default.
         defaultTrackExpanded[track.id] = false
       }
       if (effects.defaultSystemExpanded !== undefined) {
@@ -201,14 +201,14 @@ export function applyProfile(trace: ParsedTrace, profile: Profile): AppliedProfi
   // ---------------------------------------------------------------------
 
   const bandForCategory: Record<string, string> = {}
-  for (const band of profile.overviewBands) {
+  for (const band of persona.overviewBands) {
     for (const catId of band.categoryIds) {
       bandForCategory[catId] = band.id
     }
   }
 
   return {
-    profile,
+    persona,
     systems: derivedSystems,
     hiddenTracksBySystem,
     hiddenSystems,
@@ -217,7 +217,7 @@ export function applyProfile(trace: ParsedTrace, profile: Profile): AppliedProfi
     trackLabels,
     resolveCategoryId,
     bandForCategory,
-    bands: profile.overviewBands,
+    bands: persona.overviewBands,
   }
 }
 
@@ -273,7 +273,7 @@ function matchTrackEffects(
 /**
  * Produce a lightweight shallow-clone of the track with a relabeled
  * display name. We intentionally keep `id` stable so React keys and
- * expand-state keys survive profile switches; only `name` changes.
+ * expand-state keys survive persona switches; only `name` changes.
  * `buffers`, `markBuffers`, `mipmap`, `marks`, `measures` pass through
  * unchanged so no typed-array churn.
  */

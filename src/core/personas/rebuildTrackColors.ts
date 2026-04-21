@@ -17,7 +17,7 @@ import type {Measure, System, Track} from '../types'
  *
  * Structural fields (`starts`, `ends`, `depths`, `counts`, `sourceStart`,
  * `maxEndsPrefix`) are untouched — this function is O(n slices) and
- * never allocates new typed arrays. Safe to call on every profile switch.
+ * never allocates new typed arrays. Safe to call on every persona switch.
  */
 export function rebuildTrackColors(
   track: Track,
@@ -90,7 +90,7 @@ export function rebuildTrackColors(
 
 /**
  * Utility: pack a CategoryDef color string once, memoized per-call site.
- * Exported for reuse in applyProfile where rules share a small palette.
+ * Exported for reuse in applyPersona where rules share a small palette.
  */
 export function packCategoryPalette(
   categories: Array<{id: string; color: string}>,

@@ -1,4 +1,4 @@
-import type {AppliedProfile} from '../profiles/types'
+import type {AppliedPersona} from '../personas/types'
 import type {Timeline} from '../types'
 
 /**
@@ -9,7 +9,7 @@ import type {Timeline} from '../types'
  *   - each band's `buckets[i] ∈ [0, 1]` after normalization,
  *   - bands sum to ≤ 1 (the residual is "idle / unaccounted").
  *
- * The band array is ordered as in {@link AppliedProfile.bands}, which
+ * The band array is ordered as in {@link AppliedPersona.bands}, which
  * the renderer stacks bottom-up.
  */
 export interface OverviewBandsResult {
@@ -32,7 +32,7 @@ const DEFAULT_BUCKET_COUNT = 2048
 /**
  * Build per-category stacked bands for the overview chart. Mirrors
  * {@link buildOverviewUtilization}'s bucketing logic but splits the
- * depth-0 wall-clock contribution across profile-assigned bands.
+ * depth-0 wall-clock contribution across persona-assigned bands.
  *
  *   - Measures whose resolved category maps to a band accumulate into
  *     that band's bucket.
@@ -46,7 +46,7 @@ const DEFAULT_BUCKET_COUNT = 2048
  */
 export function buildOverviewBands(
   timeline: Timeline,
-  applied: AppliedProfile,
+  applied: AppliedPersona,
   bucketCount: number = DEFAULT_BUCKET_COUNT,
 ): OverviewBandsResult {
   const startMs = timeline.start

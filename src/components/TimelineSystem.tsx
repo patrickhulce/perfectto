@@ -9,7 +9,7 @@ interface TimelineSystemProps {
   viewportTopPx: number
   viewportBottomPx: number
   store: ViewportStore
-  /** Number of tracks the active profile hid by default for this system. */
+  /** Number of tracks the active persona hid by default for this system. */
   hiddenTrackCount?: number
   /** Whether those hidden tracks are currently revealed. */
   hiddenTracksShown?: boolean
