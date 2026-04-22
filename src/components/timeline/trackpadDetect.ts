@@ -112,6 +112,23 @@ export function classifyWheel(
   // binding matrix applies.
   if (e.deltaMode !== 0) return 'mouse-wheel'
 
+  // If a real zoom modifier is physically held (Cmd, or Ctrl that
+  // isn't the synthetic pinch Ctrl filtered above), the user is
+  // explicitly invoking their bound wheel gesture — we must route
+  // through the binding matrix regardless of delta magnitude.
+  //
+  // Without this short-circuit, macOS Chrome's smooth-scroll
+  // decomposes a single physical wheel notch into a leading ~100px
+  // event followed by several small (~5–30px) momentum/smoothing
+  // events. The leading event routes to the `cmd+wheel` binding as
+  // expected, but the trailing events fall into the delta-magnitude
+  // branch below, get tagged as `trackpad-scroll`, and are silently
+  // dropped. From the user's perspective the timeline zooms once per
+  // scroll flick instead of continuously — that's the bug we're
+  // fixing here. Keeping this check narrow (Cmd / physical Ctrl)
+  // preserves existing Shift+trackpad two-finger behavior.
+  if (e.metaKey || (e.ctrlKey && ctrlDown)) return 'mouse-wheel'
+
   // Diagonal scroll (both axes non-zero) is a trackpad signature —
   // physical wheels produce exactly one axis at a time.
   if (e.deltaX !== 0 && e.deltaY !== 0) return 'trackpad-scroll'

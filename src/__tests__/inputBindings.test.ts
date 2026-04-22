@@ -342,4 +342,24 @@ describe('classifyWheel', () => {
   test('threshold matches the documented value', () => {
     expect(trackpadTest.TRACKPAD_DELTA_THRESHOLD).toBe(50)
   })
+
+  test('Cmd + small-delta wheel is mouse-wheel (macOS smooth-scroll momentum)', () => {
+    // macOS Chrome decomposes a single physical wheel notch under
+    // cmd+wheel into a leading large event plus several small
+    // momentum/smoothing events. The small ones must still route
+    // through the binding matrix so the user sees continuous zoom
+    // across the flick instead of a single step.
+    expect(
+      classifyWheel(makeWheel({metaKey: true, deltaY: 12}), false),
+    ).toBe('mouse-wheel')
+    expect(
+      classifyWheel(makeWheel({metaKey: true, deltaY: 3.5}), false),
+    ).toBe('mouse-wheel')
+  })
+
+  test('real Ctrl + small-delta wheel is mouse-wheel (same smooth-scroll case)', () => {
+    expect(
+      classifyWheel(makeWheel({ctrlKey: true, deltaY: 12}), true),
+    ).toBe('mouse-wheel')
+  })
 })
