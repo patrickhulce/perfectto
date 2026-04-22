@@ -329,7 +329,11 @@ function CanvasTrackRendererBase({
           position: 'sticky',
           left: 0,
           top: 0,
-          zIndex: 1,
+          // Above SelectionOverlay (z=1) so the yellow selection tint
+          // and hover highlight slide *behind* the label gutter when the
+          // user scrolls right, matching how the flame-chart canvas
+          // naturally tucks behind the sticky label column.
+          zIndex: 3,
           flexShrink: 0,
           width: labelWidthPx,
           height: heightPx,

@@ -34,6 +34,66 @@ export const ASYNC_BEGIN = 'b'
 export const ASYNC_END = 'e'
 export const ASYNC_INSTANT = 'n'
 export const COUNTER = 'C'
+export const SAMPLE = 'P'
+
+/**
+ * Options accepted by {@link ChromeParser}. Defaults are chosen to match what
+ * Chrome DevTools shows out of the box — callers who want the raw trace tree
+ * (the "raw" persona, a debugging tool, …) can flip these off.
+ */
+export interface ChromeParserOptions {
+  /**
+   * When true (default), drop events whose name starts with `V8.GC_` during
+   * ingest so `MinorGC` / `V8.GCScavenger` render as single leaves instead of
+   * towers of internal GC phase slices. DevTools hides these by default.
+   */
+  collapseGcInternals?: boolean
+}
+
+/**
+ * V8 CPU-profile call-frame node as shipped inside a `ProfileChunk`'s
+ * `args.data.cpuProfile.nodes[]`. Nodes arrive in delta batches; we accumulate
+ * them in a `Map<id, CpuNode>` keyed by id and follow `parent` at synthesis
+ * time to reconstruct stacks.
+ */
+export interface CpuNode {
+  id: number
+  parent?: number
+  callFrame: CpuCallFrame
+}
+
+export interface CpuCallFrame {
+  functionName: string
+  url?: string
+  scriptId?: number | string
+  lineNumber?: number
+  columnNumber?: number
+  codeType?: string
+}
+
+/**
+ * Accumulated state for one V8 CPU profile (`Profile` + all its `ProfileChunk`s).
+ * DevTools associates samples with the thread the `Profile` event was emitted on
+ * (the owning main thread), not the profiler thread the chunks arrive on.
+ */
+export interface CpuProfile {
+  key: string
+  pid: number
+  ownerTid: number
+  startTs: number
+  nodes: Map<number, CpuNode>
+  samples: number[]
+  timeDeltas: number[]
+}
+
+export function isSamplePh(ph: string): boolean {
+  return ph === SAMPLE
+}
+
+export function cpuProfileKey(pid: number, id: unknown): string {
+  const raw = typeof id === 'string' || typeof id === 'number' ? String(id) : '0x1'
+  return `${pid}|${raw}`
+}
 
 export function isDurationBegin(ph: string): boolean {
   return ph === DURATION_BEGIN

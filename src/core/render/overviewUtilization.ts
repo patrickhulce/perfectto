@@ -1,4 +1,4 @@
-import type {Timeline} from '../types'
+import type {System, Timeline} from '../types'
 
 /**
  * Output of {@link buildOverviewUtilization}. Represents a smoothed
@@ -40,6 +40,14 @@ const DEFAULT_BUCKET_COUNT = 2048
 export function buildOverviewUtilization(
   timeline: Timeline,
   bucketCount: number = DEFAULT_BUCKET_COUNT,
+  /**
+   * Optional override for the systems the signal should aggregate over.
+   * Callers with an applied persona pass `appliedPersona.systems` so
+   * tracks the persona hides (async / plumbing) don't paint into the
+   * overview. Defaults to the raw trace's full system list, which is
+   * the right thing for the Raw persona / no-persona case.
+   */
+  systems: readonly System[] = timeline.systems,
 ): OverviewUtilization {
   const startMs = timeline.start
   const endMs = timeline.end
@@ -54,7 +62,7 @@ export function buildOverviewUtilization(
   const raw = new Float64Array(n)
 
   let trackCount = 0
-  for (const system of timeline.systems) {
+  for (const system of systems) {
     for (const track of system.tracks) {
       trackCount += 1
       const buffers = track.buffers

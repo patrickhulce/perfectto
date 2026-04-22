@@ -39,7 +39,10 @@ function TimelineSystem({
     >
       <div
         className="absolute left-0 right-0 top-0 flex items-center bg-[#1a202c] text-left text-sm font-semibold text-[#e2e8f0]"
-        style={{height: headerHeightPx, zIndex: 2}}
+        // Matches the track label's z=3 so the system-header row also
+        // tucks SelectionOverlay (z=1) behind its sticky left-gutter
+        // label instead of letting the selection tint bleed onto it.
+        style={{height: headerHeightPx, zIndex: 3}}
       >
         <button
           type="button"

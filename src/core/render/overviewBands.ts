@@ -1,5 +1,5 @@
 import type {AppliedPersona} from '../personas/types'
-import type {Timeline} from '../types'
+import type {Measure, System, Timeline, Track} from '../types'
 
 /**
  * Per-band, per-bucket utilization signal for the stacked overview
@@ -30,16 +30,26 @@ export interface OverviewBandSeries {
 const DEFAULT_BUCKET_COUNT = 2048
 
 /**
- * Build per-category stacked bands for the overview chart. Mirrors
- * {@link buildOverviewUtilization}'s bucketing logic but splits the
- * depth-0 wall-clock contribution across persona-assigned bands.
+ * Build per-category stacked bands for the overview chart.
  *
- *   - Measures whose resolved category maps to a band accumulate into
- *     that band's bucket.
- *   - Measures with no band (or no category) are dropped — they
- *     implicitly become "idle" in the stacked chart.
- *   - Same `1 / (bucketMs * trackCount)` normalization, so bands sum
- *     to ≤ 1 when all tracks are busy and well-categorized.
+ * Aggregation is *self-time*, not depth-0 wall time: each measure
+ * contributes the portion of its duration that isn't already covered
+ * by one of its children, to its own resolved category's band. This is
+ * essential for Chrome-style traces where a `RunTask` (system / gray)
+ * wraps an `EvaluateScript` (scripting / yellow) that wraps user JS —
+ * depth-0-only counting would show the whole thing as gray even though
+ * the actual work is yellow. Walking the full tree and giving each
+ * moment of wall time to the *deepest* measure that owns it produces
+ * the DevTools-style coloured silhouette.
+ *
+ *   - Categories that don't map to any overview band (idle / other /
+ *     uncategorized) drop out; their wall time becomes unaccounted
+ *     residual between the stacked bands.
+ *   - Gaps between top-level (depth-0) siblings are not attributed
+ *     to any band — there's no parent to own them — so a truly idle
+ *     main thread reads as a dark gap, matching DevTools.
+ *   - Same `1 / (bucketMs * trackCount)` normalization as before, so
+ *     a single busy track saturates its band at 1.0 per bucket.
  *
  * A small Gaussian smoothing pass runs per band so the stacked
  * silhouette matches the single-curve overview's visual smoothness.
@@ -87,46 +97,68 @@ export function buildOverviewBands(
   // output arrays at normalization.
   const raw: Float64Array[] = bands.map(() => new Float64Array(n))
 
+  const accumulate = (bandIdx: number, s: number, e: number): void => {
+    if (bandIdx < 0) return
+    if (e <= s) return
+    if (e <= startMs || s >= endMs) return
+    const s2 = s < startMs ? startMs : s
+    const e2 = e > endMs ? endMs : e
+    const firstBucket = Math.max(0, Math.floor((s2 - startMs) / bucketMs))
+    const lastBucketRaw = Math.floor((e2 - startMs) / bucketMs)
+    const lastBucket = Math.min(n - 1, e2 === endMs ? n - 1 : lastBucketRaw)
+    const target = raw[bandIdx]
+    if (firstBucket === lastBucket) {
+      target[firstBucket] += e2 - s2
+      return
+    }
+    const firstBucketEnd = startMs + (firstBucket + 1) * bucketMs
+    target[firstBucket] += firstBucketEnd - s2
+    for (let b = firstBucket + 1; b < lastBucket; b++) {
+      target[b] += bucketMs
+    }
+    const lastBucketStart = startMs + lastBucket * bucketMs
+    target[lastBucket] += e2 - lastBucketStart
+  }
+
+  const visit = (measure: Measure, track: Track, system: System): void => {
+    const catId = applied.resolveCategoryId(measure, track, system)
+    const bandIdx =
+      catId !== undefined ? bandForCategoryIdx.get(catId) ?? -1 : -1
+    // Self-time: walk children in start-order and attribute any gap
+    // between the running cursor and the next child's start to *this*
+    // measure's band. Children are sorted and non-overlapping by
+    // construction (finalizeContainer), so a single left-to-right pass
+    // is enough.
+    let cursor = measure.start
+    const kids = measure.measures
+    for (let i = 0; i < kids.length; i++) {
+      const child = kids[i]
+      if (cursor < child.start) {
+        accumulate(bandIdx, cursor, child.start)
+      }
+      visit(child, track, system)
+      if (child.end > cursor) cursor = child.end
+    }
+    if (cursor < measure.end) {
+      accumulate(bandIdx, cursor, measure.end)
+    }
+  }
+
+  // Aggregate only over `applied.overviewSystems` — the persona-declared
+  // subset of visible tracks that matter enough to paint into the
+  // overview (for Web Dev this is the Main thread alone). Falling back
+  // to every visible track, like we used to, washes the stacked chart
+  // out: a collapsed Compositor / IOThread / ThreadPool worker can post
+  // hundreds of small painting/system slices that dilute the main
+  // thread's silhouette and make the overview look flat. Scoping to
+  // what the user is reading keeps the bands aligned with the flame
+  // chart.
   let trackCount = 0
-  for (const system of timeline.systems) {
+  for (const system of applied.overviewSystems) {
     for (const track of system.tracks) {
       trackCount += 1
-      const buffers = track.buffers
-      if (!buffers || buffers.count === 0) continue
-      const count = buffers.count
-      const starts = buffers.starts
-      const ends = buffers.ends
-      const depths = buffers.depths
-      const measures = buffers.measures
-
-      for (let i = 0; i < count; i++) {
-        if (depths[i] !== 0) continue
-        const catId = applied.resolveCategoryId(measures[i], track, system)
-        if (catId === undefined) continue
-        const bandIdx = bandForCategoryIdx.get(catId)
-        if (bandIdx === undefined) continue
-
-        const s = starts[i]
-        const e = ends[i]
-        if (e <= startMs || s >= endMs) continue
-        const s2 = s < startMs ? startMs : s
-        const e2 = e > endMs ? endMs : e
-        const firstBucket = Math.max(0, Math.floor((s2 - startMs) / bucketMs))
-        const lastBucketRaw = Math.floor((e2 - startMs) / bucketMs)
-        const lastBucket = Math.min(n - 1, e2 === endMs ? n - 1 : lastBucketRaw)
-
-        const target = raw[bandIdx]
-        if (firstBucket === lastBucket) {
-          target[firstBucket] += e2 - s2
-          continue
-        }
-        const firstBucketEnd = startMs + (firstBucket + 1) * bucketMs
-        target[firstBucket] += firstBucketEnd - s2
-        for (let b = firstBucket + 1; b < lastBucket; b++) {
-          target[b] += bucketMs
-        }
-        const lastBucketStart = startMs + lastBucket * bucketMs
-        target[lastBucket] += e2 - lastBucketStart
+      for (const measure of track.measures) {
+        visit(measure, track, system)
       }
     }
   }

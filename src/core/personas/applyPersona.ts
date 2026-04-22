@@ -8,7 +8,7 @@ import {
   type CompiledTrackRule,
 } from './ruleMatchers'
 import {packCategoryPalette, rebuildTrackColors} from './rebuildTrackColors'
-import type {AppliedPersona, Persona} from './types'
+import type {AppliedPersona, CategoryDef, OverviewBand, Persona} from './types'
 
 /**
  * Apply a persona to a parsed trace. Returns a UI-facing view
@@ -199,17 +199,80 @@ export function applyPersona(trace: ParsedTrace, persona: Persona): AppliedPerso
   // ---------------------------------------------------------------------
   // Overview band plumbing.
   // ---------------------------------------------------------------------
+  //
+  // Bands are derived from the persona's root categories (those without a
+  // `parentId`) in the order given by `overviewOrder`. Subcategories are
+  // rolled up into their root ancestor's band by walking the `parentId`
+  // chain once, so `bandForCategory` always returns a root id — or is
+  // absent if the root isn't listed in `overviewOrder` (e.g. `idle`,
+  // `other`, which explicitly contribute no overview stripe).
+
+  const categoryById = new Map<string, CategoryDef>()
+  for (const c of persona.categories) categoryById.set(c.id, c)
+
+  const orderedBands = new Set(persona.overviewOrder)
+
+  // Nearest-ancestor band resolver: walks the parentId chain and
+  // returns the first category (self or ancestor) that's listed in
+  // `overviewOrder`. This way a subcategory that's explicitly
+  // promoted into `overviewOrder` keeps its own band instead of
+  // silently rolling up to a coarser root. Cycle-guarded.
+  const bandForId = (id: string): string | undefined => {
+    let cur = categoryById.get(id)
+    if (!cur) return undefined
+    const seen = new Set<string>()
+    while (cur) {
+      if (orderedBands.has(cur.id)) return cur.id
+      if (cur.parentId === undefined) return undefined
+      if (seen.has(cur.id)) return undefined
+      seen.add(cur.id)
+      cur = categoryById.get(cur.parentId)
+    }
+    return undefined
+  }
 
   const bandForCategory: Record<string, string> = {}
-  for (const band of persona.overviewBands) {
-    for (const catId of band.categoryIds) {
-      bandForCategory[catId] = band.id
+  for (const cat of persona.categories) {
+    const band = bandForId(cat.id)
+    if (band !== undefined) bandForCategory[cat.id] = band
+  }
+
+  const bands: OverviewBand[] = []
+  for (const rootId of persona.overviewOrder) {
+    const cat = categoryById.get(rootId)
+    if (!cat) continue
+    bands.push({id: cat.id, label: cat.label, color: cat.color})
+  }
+
+  // Overview scope: derive the subset of visible systems whose tracks
+  // the overview chart should aggregate over. A track "opts in" by
+  // ending up with `defaultTrackExpanded[id] === true`, which in
+  // practice means a TrackRule (or the persona's baseline) explicitly
+  // flagged it as important enough to start open.
+  //
+  // We deliberately don't just filter by "whatever the UI currently has
+  // expanded" — that would make the overview jitter as the user folds
+  // tracks open and closed. The persona-declared default is the stable
+  // signal the user picked when choosing this persona.
+  //
+  // If nothing opts in (raw persona, generic fallbacks), fall back to
+  // the full visible list so the overview isn't blank — matches the
+  // pre-scoping behaviour for personas that don't single any track out.
+  const scopedSystems: System[] = []
+  let anyExpanded = false
+  for (const sys of derivedSystems) {
+    const kept = sys.tracks.filter(t => defaultTrackExpanded[t.id] === true)
+    if (kept.length > 0) {
+      anyExpanded = true
+      scopedSystems.push({...sys, tracks: kept})
     }
   }
+  const overviewSystems: readonly System[] = anyExpanded ? scopedSystems : derivedSystems
 
   return {
     persona,
     systems: derivedSystems,
+    overviewSystems,
     hiddenTracksBySystem,
     hiddenSystems,
     defaultSystemExpanded,
@@ -217,7 +280,7 @@ export function applyPersona(trace: ParsedTrace, persona: Persona): AppliedPerso
     trackLabels,
     resolveCategoryId,
     bandForCategory,
-    bands: persona.overviewBands,
+    bands,
   }
 }
 

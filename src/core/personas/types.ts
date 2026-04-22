@@ -36,8 +36,15 @@ export interface Persona {
    * collapse entire processes (e.g. the kernel's pid-0 system).
    */
   systemRules?: SystemRule[]
-  /** Stacked overview bands, ordered bottom-to-top in the rendered chart. */
-  overviewBands: OverviewBand[]
+  /**
+   * Bottom-to-top order of category ids to stack in the overview chart.
+   * Every id here must reference a *root* {@link CategoryDef} (one
+   * without a `parentId`). Subcategories roll up into their parent's
+   * band automatically via their `parentId` chain — they never appear
+   * here. Categories not listed contribute no overview stripe (e.g.
+   * `idle`, `other`).
+   */
+  overviewOrder: string[]
   /**
    * Baseline expand-state for tracks that no {@link TrackRule} touches.
    * Undefined → UI default (expanded). A persona can flip this to
@@ -55,12 +62,28 @@ export interface Persona {
 /**
  * A named color bucket. Slices matching a {@link ColorRule} with a given
  * `categoryId` are all repainted to the corresponding {@link CategoryDef.color}.
+ *
+ * Categories form a shallow hierarchy via `parentId`. The flame chart
+ * always paints each slice with its own category's color (so e.g. a
+ * `userScript` subcategory can be visually distinct from generic
+ * `scripting`), while the overview chart rolls every subcategory up
+ * into its root ancestor's band — giving a single stripe per root
+ * category that captures total wall-time across the whole family.
+ * Root categories have `parentId === undefined`.
  */
 export interface CategoryDef {
   id: string
   label: string
   /** CSS color string (`#rrggbb`, `#rgb`, or `rgb()/rgba()`). */
   color: string
+  /**
+   * When set, this category is a *subcategory* of `parentId`. It uses
+   * its own {@link CategoryDef.color} in per-track flame chart rendering
+   * but rolls up into the parent's band for the overview chart. Chains
+   * resolve transitively at apply time; a cycle is rejected (falls back
+   * to treating the category as a root).
+   */
+  parentId?: string
 }
 
 /**
@@ -125,16 +148,20 @@ export interface SystemRule {
 }
 
 /**
- * One band of the stacked overview chart. Bands aggregate the wall-clock
- * contribution of every depth-0 measure whose resolved {@link CategoryDef}
- * falls into one of `categoryIds`, mirroring Chrome DevTools' per-category
- * stacked area in the performance overview.
+ * One band of the stacked overview chart. Bands are *derived* by
+ * {@link applyPersona} from the persona's root {@link CategoryDef}s
+ * (categories with no `parentId`) — one band per root — and stacked in
+ * the order given by {@link Persona.overviewOrder}. Every subcategory
+ * rolls up into its root ancestor's band.
+ *
+ * Lives on {@link AppliedPersona.bands}; {@link Persona}s never hand-
+ * author this list directly. Shape kept public so the overview
+ * renderer can read `id`/`label`/`color` without re-walking categories.
  */
 export interface OverviewBand {
   id: string
   label: string
   color: string
-  categoryIds: string[]
 }
 
 // ---------------------------------------------------------------------------
@@ -156,6 +183,21 @@ export interface AppliedPersona {
   persona: Persona
   /** Persona-filtered, persona-sorted, persona-relabeled view of systems. */
   systems: System[]
+  /**
+   * Subset of {@link systems} whose tracks contribute to the overview
+   * chart (stacked bands + utilization silhouette). Populated with the
+   * tracks whose {@link defaultTrackExpanded} is `true`, each system
+   * carrying only its expanded tracks. When no track opts in, falls
+   * back to the full `systems` list — personas that don't single any
+   * track out (e.g. Raw) keep today's "aggregate everything visible"
+   * behaviour and never hand the renderer an empty overview.
+   *
+   * The intent: the overview should reflect "what the user is looking
+   * at", not every plumbing track the persona merely chose not to
+   * hide. For Web Dev that collapses to the Main thread, since only
+   * `CrRendererMain` is `defaultExpanded: true`.
+   */
+  overviewSystems: readonly System[]
   /**
    * Tracks hidden by default, grouped by their parent system id. The UI
    * surfaces them behind a per-system "show hidden" toggle.
@@ -181,11 +223,18 @@ export interface AppliedPersona {
    */
   resolveCategoryId(measure: Measure, track: Track, system: System): string | undefined
   /**
-   * Precomputed category → overview band id lookup, derived from
-   * {@link Persona.overviewBands}. `undefined` means the category is not
-   * stacked in the overview (contributes to "idle" / unaccounted time).
+   * Precomputed category → overview band id lookup. The band id is the
+   * resolved *root* category id (walked via {@link CategoryDef.parentId}
+   * until a root is found), so subcategories automatically aggregate
+   * into their parent's band. Categories whose root isn't listed in
+   * {@link Persona.overviewOrder} are omitted and contribute to "idle"
+   * / unaccounted time in the chart.
    */
   bandForCategory: Record<string, string>
-  /** Ordered band metadata for the overview chart renderer. */
+  /**
+   * Ordered band metadata for the overview chart renderer. Derived from
+   * {@link Persona.overviewOrder} + the palette: one {@link OverviewBand}
+   * per listed root category, in the same order (bottom-to-top stack).
+   */
   bands: OverviewBand[]
 }

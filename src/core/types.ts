@@ -101,4 +101,10 @@ export interface ParseProgress {
 export interface ParseOptions {
   signal?: AbortSignal
   onProgress?: (progress: ParseProgress) => void
+  /**
+   * Chrome-parser knobs. Only consulted when the detected parser is the
+   * Chrome trace parser; other parsers ignore them. Defaults match what
+   * DevTools shows out of the box.
+   */
+  chromeParser?: import('./parsers/chrome/chrome-types').ChromeParserOptions
 }

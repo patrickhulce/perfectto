@@ -19,7 +19,7 @@ export async function parseTrace(
   source: TraceSource,
   options?: ParseOptions,
 ): Promise<ParsedTrace> {
-  const {signal, onProgress} = options ?? {}
+  const {signal, onProgress, chromeParser: chromeParserOptions} = options ?? {}
   throwIfAborted(signal)
 
   let parser: TraceParser | null = null
@@ -62,7 +62,7 @@ export async function parseTrace(
           sniffBuf = concatBytes(sniffBuf, value)
           const matched = findParser(sniffBuf)
           if (matched) {
-            parser = new matched()
+            parser = new matched(chromeParserOptions)
             const replay = sniffBuf
             sniffBuf = new Uint8Array(0)
             parser.write(replay)
@@ -92,7 +92,7 @@ export async function parseTrace(
     // Final chance: short stream that never crossed SNIFF_LIMIT.
     const matched = findParser(sniffBuf)
     if (matched) {
-      parser = new matched()
+      parser = new matched(chromeParserOptions)
       parser.write(sniffBuf)
     } else {
       throw unsupportedFormatError()

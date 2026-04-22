@@ -15,5 +15,5 @@ export const RAW_PERSONA: Persona = {
   categories: [],
   colorRules: [],
   trackRules: [],
-  overviewBands: [],
+  overviewOrder: [],
 }

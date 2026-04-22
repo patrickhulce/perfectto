@@ -11,7 +11,7 @@ interface TimelineOverviewProps {
   /**
    * Optional stacked-category bands. When provided, the overview renders
    * them as stacked area layers instead of the single utilization
-   * mountain. Used by personas with `overviewBands` defined.
+   * mountain. Used by personas with `overviewOrder` defined.
    */
   bands?: OverviewBandsResult
   store: ViewportStore

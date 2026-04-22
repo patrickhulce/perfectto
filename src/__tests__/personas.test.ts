@@ -144,6 +144,18 @@ describe('applyPersona (web-dev)', () => {
     expect(applied.defaultSystemExpanded.s1).toBe(true)
   })
 
+  it('scopes overviewSystems to the Main thread (only CrRendererMain is defaultExpanded)', () => {
+    // The Chrome fixture has Main + ThreadPool (hidden) + Compositor
+    // (visible but defaultExpanded: false). Only Main ends up with
+    // defaultTrackExpanded: true, so the overview aggregator should
+    // see just that one track — NOT the full visible list, which
+    // would drag the Compositor's work into the silhouette.
+    const trace = buildChromeTrace()
+    const applied = applyPersona(trace, WEB_DEV_PERSONA)
+    const overviewTrackIds = applied.overviewSystems.flatMap(s => s.tracks.map(t => t.id))
+    expect(overviewTrackIds).toEqual(['tm'])
+  })
+
   it('hides swapper / Process 0 systems and surfaces them in hiddenSystems', () => {
     const rendererMain = makeTrack('tm', 'CrRendererMain', [m('FunctionCall', 0, 10)])
     const swapper = makeTrack('tsw', 'swapper', [m('idle', 0, 10)])
@@ -213,12 +225,100 @@ describe('buildOverviewBands', () => {
     const trace = makeTrace([makeSystem('s1', 'Renderer', [rendererMain])])
     const applied = applyPersona(trace, WEB_DEV_PERSONA)
     const bands = buildOverviewBands(trace.timeline, applied, 32)
-    expect(bands.bands).toHaveLength(WEB_DEV_PERSONA.overviewBands.length)
+    expect(bands.bands).toHaveLength(WEB_DEV_PERSONA.overviewOrder.length)
     for (let i = 0; i < bands.bucketCount; i++) {
       let total = 0
       for (const b of bands.bands) total += b.buckets[i]
       expect(total).toBeLessThanOrEqual(1.0001)
     }
+  })
+
+  it('ignores tracks the persona hid so long-lived async slices do not paint a phantom band', () => {
+    // Regression: a hidden async track full of loading-categorized
+    // slices used to bleed into the overview and paint a persistent
+    // blue baseline across the whole trace even after the flame chart
+    // had gone quiet. Scoping the aggregator to applied.systems drops
+    // those contributions entirely.
+    const rendererMain = makeTrack('tm', 'CrRendererMain', [
+      m('FunctionCall', 0, 10),
+    ])
+    const asyncLoading = makeTrack(
+      'ta',
+      'Async',
+      [
+        {...m('ResourceReceiveData', 0, 100), category: 'loading,devtools.timeline'},
+      ],
+      'async',
+    )
+    const trace = makeTrace([
+      makeSystem('s1', 'Renderer', [rendererMain, asyncLoading]),
+    ])
+    const applied = applyPersona(trace, WEB_DEV_PERSONA)
+    const bands = buildOverviewBands(trace.timeline, applied, 32)
+    const loading = bands.bands.find(b => b.id === 'loading')
+    expect(loading).toBeDefined()
+    let maxLoading = 0
+    for (const v of loading!.buckets) if (v > maxLoading) maxLoading = v
+    expect(maxLoading).toBe(0)
+  })
+
+  it('attributes nested self-time to each measure\'s own band (not the depth-0 wrapper)', () => {
+    // Mirrors the Chrome case: a top-level `RunTask` (system / gray)
+    // wraps `EvaluateScript` (scripting / yellow) which wraps user JS
+    // (mint, rolled up to scripting). Depth-0-only aggregation used to
+    // paint the whole thing gray; self-time aggregation must yield
+    // essentially zero system-band contribution (RunTask has no
+    // self-time outside its children) and a saturated scripting band.
+    // Matches the real chrome parser: synthesized JS frames ship with
+    // trace category `jsFrame`, which webDev routes to `userScript`.
+    const userJs: Measure = {
+      id: 'uj',
+      name: 'doWork',
+      start: 2,
+      end: 98,
+      category: 'jsFrame',
+      events: [],
+      marks: [],
+      measures: [],
+    }
+    const evalScript: Measure = {
+      id: 'es',
+      name: 'EvaluateScript',
+      start: 1,
+      end: 99,
+      events: [],
+      marks: [],
+      measures: [userJs],
+    }
+    const runTask: Measure = {
+      id: 'rt',
+      name: 'RunTask',
+      start: 0,
+      end: 100,
+      events: [],
+      marks: [],
+      measures: [evalScript],
+    }
+    const tm = makeTrack('tm', 'CrRendererMain', [runTask])
+    const trace = makeTrace([makeSystem('s1', 'Renderer', [tm])])
+    const applied = applyPersona(trace, WEB_DEV_PERSONA)
+    const result = buildOverviewBands(trace.timeline, applied, 32)
+    const byId = (id: string) => result.bands.find(b => b.id === id)!
+    const maxOf = (arr: Float32Array): number => {
+      let m = 0
+      for (const v of arr) if (v > m) m = v
+      return m
+    }
+    const scripting = maxOf(byId('scripting').buckets)
+    const system = maxOf(byId('system').buckets)
+    // Almost all wall time is scripting (96ms of user JS inside a
+    // 98ms EvaluateScript inside a 100ms RunTask) so the scripting
+    // silhouette saturates. RunTask's self-time is just the 1ms
+    // wrapper gap on each edge — it must stay visibly smaller than
+    // the scripting band or we've regressed to depth-0-only counting
+    // (which would paint the whole thing system/gray).
+    expect(scripting).toBeGreaterThan(0.9)
+    expect(system).toBeLessThan(scripting * 0.5)
   })
 
   it('ignores categories not mapped to any band', () => {
@@ -230,12 +330,135 @@ describe('buildOverviewBands', () => {
       categories: [{id: 'orphanCat', label: 'X', color: '#ffffff'}],
       colorRules: [{categoryId: 'orphanCat'}],
       trackRules: [],
-      overviewBands: [], // nothing aggregates
+      overviewOrder: [], // nothing aggregates
     }
     const t = makeTrack('t1', 'w', [m('a', 0, 50)])
     const trace = makeTrace([makeSystem('s1', 'App', [t])])
     const applied = applyPersona(trace, orphan)
     const bands = buildOverviewBands(trace.timeline, applied, 16)
     expect(bands.bands).toHaveLength(0)
+  })
+
+  it('scopes aggregation to defaultExpanded tracks, ignoring visible-but-collapsed ones', () => {
+    // Regression: Web Dev used to wash out because it aggregated every
+    // visible track. Here the Compositor track is visible (not hidden
+    // by any rule) but starts collapsed, and it's packed with painting
+    // slices. The overview must only reflect the Main thread's Layout
+    // work — the Compositor's painting stays out entirely.
+    const rendererMain = makeTrack('tm', 'CrRendererMain', [
+      m('Layout', 0, 50),
+    ])
+    const compositor = makeTrack('tc', 'Compositor', [
+      m('CompositeLayers', 0, 100),
+    ])
+    const trace = makeTrace([
+      makeSystem('s1', 'Renderer', [rendererMain, compositor]),
+    ])
+    const applied = applyPersona(trace, WEB_DEV_PERSONA)
+    // Sanity check: Compositor is in the visible list but NOT in the
+    // overview list — the scoping precondition for this test.
+    expect(applied.systems[0].tracks.map(t => t.id)).toEqual(
+      expect.arrayContaining(['tm', 'tc']),
+    )
+    expect(applied.overviewSystems.flatMap(s => s.tracks.map(t => t.id))).toEqual(['tm'])
+
+    const bands = buildOverviewBands(trace.timeline, applied, 32)
+    const painting = bands.bands.find(b => b.id === 'painting')!
+    let maxPainting = 0
+    for (const v of painting.buckets) if (v > maxPainting) maxPainting = v
+    expect(maxPainting).toBe(0)
+    // And the Main thread's Layout work still registers — otherwise
+    // we've scoped the overview down to nothing.
+    const rendering = bands.bands.find(b => b.id === 'rendering')!
+    let maxRendering = 0
+    for (const v of rendering.buckets) if (v > maxRendering) maxRendering = v
+    expect(maxRendering).toBeGreaterThan(0)
+  })
+
+  it('falls back to all visible tracks when no track opts into defaultExpanded', () => {
+    // A persona that never flips any track to defaultExpanded: true
+    // would otherwise end up with an empty overviewSystems list and
+    // an empty overview. The fallback preserves today's behaviour for
+    // such personas — the aggregator sees every visible track.
+    const open: Persona = {
+      id: 'open',
+      name: 'Open',
+      description: '',
+      match: () => 0,
+      // No trackRules, no systemRules — nothing flips defaultExpanded.
+      categories: [{id: 'x', label: 'X', color: '#abcdef'}],
+      colorRules: [{categoryId: 'x'}],
+      trackRules: [],
+      overviewOrder: ['x'],
+    }
+    const t1 = makeTrack('t1', 'a', [m('w', 0, 50)])
+    const t2 = makeTrack('t2', 'b', [m('w', 0, 50)])
+    const trace = makeTrace([makeSystem('s1', 'App', [t1, t2])])
+    const applied = applyPersona(trace, open)
+    // Fallback: overviewSystems mirrors the full visible list.
+    expect(applied.overviewSystems).toBe(applied.systems)
+    expect(applied.overviewSystems.flatMap(s => s.tracks.map(t => t.id))).toEqual([
+      't1',
+      't2',
+    ])
+  })
+})
+
+describe('applyPersona (category hierarchy)', () => {
+  it('rolls subcategories into their parent band via parentId', () => {
+    const hierarchy: Persona = {
+      id: 'hier',
+      name: 'Hierarchy',
+      description: '',
+      match: () => 0,
+      categories: [
+        {id: 'scripting', label: 'Scripting', color: '#f0c000'},
+        {
+          id: 'userScript',
+          label: 'User JS',
+          color: '#8ed9c1',
+          parentId: 'scripting',
+        },
+        // No-band categories — present in the palette but absent from
+        // overviewOrder, so they must not appear in bandForCategory.
+        {id: 'idle', label: 'Idle', color: '#e5e5e5'},
+      ],
+      colorRules: [],
+      trackRules: [],
+      overviewOrder: ['scripting'],
+    }
+    const trace = makeTrace([makeSystem('s1', 'App', [])])
+    const applied = applyPersona(trace, hierarchy)
+    // Band list: one entry, rooted at `scripting`.
+    expect(applied.bands.map(b => b.id)).toEqual(['scripting'])
+    expect(applied.bands[0].color).toBe('#f0c000')
+    // Root maps to itself; subcategory rolls up to the same root id.
+    expect(applied.bandForCategory.scripting).toBe('scripting')
+    expect(applied.bandForCategory.userScript).toBe('scripting')
+    // Categories outside overviewOrder don't get a band mapping.
+    expect(applied.bandForCategory.idle).toBeUndefined()
+  })
+
+  it('tolerates a parentId cycle by treating the category as a root', () => {
+    const cycle: Persona = {
+      id: 'cycle',
+      name: 'Cycle',
+      description: '',
+      match: () => 0,
+      categories: [
+        {id: 'a', label: 'A', color: '#111', parentId: 'b'},
+        {id: 'b', label: 'B', color: '#222', parentId: 'a'},
+      ],
+      colorRules: [],
+      trackRules: [],
+      // Neither a nor b is a clean root; applyPersona must still
+      // terminate without hanging. Whichever id resolves first wins a
+      // band slot if listed here; neither listed → bandForCategory stays empty.
+      overviewOrder: [],
+    }
+    const trace = makeTrace([])
+    const applied = applyPersona(trace, cycle)
+    expect(applied.bands).toEqual([])
+    expect(applied.bandForCategory).toEqual({})
   })
 })

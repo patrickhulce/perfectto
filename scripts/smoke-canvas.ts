@@ -16,7 +16,7 @@ async function main(): Promise<void> {
   await page.getByTestId('timeline-event-surface').waitFor({timeout: 60_000})
   await page.waitForTimeout(750)
 
-  const before = path.resolve(__dirname, '../smoke-canvas-top.png')
+  const before = path.resolve(__dirname, '../test-results/smoke-canvas-top.png')
   await page.screenshot({path: before, fullPage: false})
   console.log('screenshot (top) ->', before)
 
@@ -32,7 +32,9 @@ async function main(): Promise<void> {
   await page.waitForTimeout(300)
 
   const state = await page.evaluate(() => {
-    const el = document.querySelector('[data-testid="timeline-event-surface"]') as HTMLElement | null
+    const el = document.querySelector(
+      '[data-testid="timeline-event-surface"]',
+    ) as HTMLElement | null
     const scroller = el?.parentElement as HTMLElement | null
     if (!scroller) return null
     scroller.scrollLeft = Math.max(0, Math.floor(scroller.scrollWidth * 0.35))
@@ -44,13 +46,15 @@ async function main(): Promise<void> {
   })
   console.log('scroll state ->', state)
   await page.waitForTimeout(400)
-  const shot = path.resolve(__dirname, '../smoke-canvas.png')
+  const shot = path.resolve(__dirname, '../test-results/smoke-canvas.png')
   await page.screenshot({path: shot, fullPage: false})
   console.log('screenshot (zoomed+scrolled) ->', shot)
 
   // Also probe DOM structure for the first track row to confirm layout.
   const diag = await page.evaluate(() => {
-    const canvases = Array.from(document.querySelectorAll('canvas[data-testid="track-canvas"]')) as HTMLCanvasElement[]
+    const canvases = Array.from(
+      document.querySelectorAll('canvas[data-testid="track-canvas"]'),
+    ) as HTMLCanvasElement[]
     return canvases.slice(0, 3).map(c => {
       const r = c.getBoundingClientRect()
       const parent = c.parentElement
@@ -66,7 +70,9 @@ async function main(): Promise<void> {
         left: cs.left,
         display: cs.display,
         parentDisplay: parent ? getComputedStyle(parent).display : null,
-        parentRect: parentRect ? {x: parentRect.x, y: parentRect.y, w: parentRect.width, h: parentRect.height} : null,
+        parentRect: parentRect
+          ? {x: parentRect.x, y: parentRect.y, w: parentRect.width, h: parentRect.height}
+          : null,
       }
     })
   })

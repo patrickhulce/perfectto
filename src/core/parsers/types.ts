@@ -15,7 +15,12 @@ export interface TraceParser {
 }
 
 export interface TraceParserConstructor {
-  new (): TraceParser
+  /**
+   * Parsers may accept an opaque options object forwarded by the universal
+   * entry. Each parser picks out the fields it recognises and ignores the
+   * rest; unrecognized options must not throw.
+   */
+  new (options?: unknown): TraceParser
   readonly MAGIC_PATTERN: Uint8Array
   readonly parserName: string
 }

@@ -21,6 +21,7 @@ import type {FinalizeOptions, TraceParser} from '../types'
 import {
   asyncKey,
   counterKey,
+  cpuProfileKey,
   isAsyncPh,
   isComplete,
   isCounterPh,
@@ -28,8 +29,32 @@ import {
   isDurationEnd,
   isInstantPh,
   isMetadataPh,
+  isSamplePh,
   type ChromeEvent,
+  type ChromeParserOptions,
+  type CpuCallFrame,
+  type CpuNode,
+  type CpuProfile,
 } from './chrome-types'
+
+const V8_GC_INTERNAL_NAME = /^V8\.GC_/
+const JS_FRAME_CATEGORY = 'jsFrame'
+const JS_FRAME_TRACE_CATEGORY = 'disabled-by-default-v8.cpu_profiler'
+
+/**
+ * Names of synthetic CPU-profile nodes that should not be rendered as their
+ * own frames. `(root)` is the tree root; `(garbage collector)` is V8's
+ * internal GC pseudo-frame that DevTools typically folds into the parent GC
+ * slice rather than drawing at call-stack depth.
+ */
+const HIDDEN_CPU_NODE_NAMES = new Set(['(root)', '(garbage collector)'])
+
+/**
+ * Names treated as "no JS running" — when the entire remaining call stack
+ * resolves to just one of these, we close any open JS frames instead of
+ * opening a new one. Matches DevTools' treatment of `(program)` / `(idle)`.
+ */
+const IDLE_CPU_NODE_NAMES = new Set(['(program)', '(idle)'])
 
 const MAGIC = new TextEncoder().encode('"traceEvents"')
 const ROOT_METADATA_FIELDS = new Set([
@@ -74,15 +99,19 @@ interface Frame {
  * element is delivered one-by-one. On {@link finalize} we sort per-thread event
  * streams, build nested Measure trees, and produce a {@link ParsedTrace}.
  *
- * Supported phases in this v1: B/E/X (durations), I/i/R (instants), M (metadata,
- * populates process/thread names), b/e/n (async), C (counter). Flows, samples,
- * object-lifetime, and clock-sync events are ignored for now.
+ * Supported phases: B/E/X (durations), I/i/R (instants), M (metadata,
+ * populates process/thread names), b/e/n (async), C (counter), and P
+ * (samples) — `Profile` opens a V8 CPU profile, `ProfileChunk`s carry its
+ * node tree + delta-encoded samples, both merged at finalize into
+ * synthesized JS-frame Measures on the owning thread. Flow, object-lifetime,
+ * and clock-sync events are still ignored.
  */
 export class ChromeParser implements TraceParser {
   static readonly MAGIC_PATTERN: Uint8Array = MAGIC
   static readonly parserName = 'chrome'
 
   private readonly _json_parser: JSONParser
+  private readonly _options: Required<ChromeParserOptions>
   private _error: Error | null = null
   private _rootMetadata: Record<string, unknown> = {}
   private _processes = new Map<number, ProcessInfo>()
@@ -91,12 +120,17 @@ export class ChromeParser implements TraceParser {
   private _asyncPidByKey = new Map<string, number>()
   private _countersByKey = new Map<string, ChromeEvent[]>()
   private _counterPidByKey = new Map<string, number>()
+  private _cpuProfiles = new Map<string, CpuProfile>()
   private _eventCount = 0
   private _minTs = Number.POSITIVE_INFINITY
   private _maxTs = Number.NEGATIVE_INFINITY
   private _idCounter = 0
 
-  constructor() {
+  constructor(options?: unknown) {
+    const opts = isChromeParserOptions(options) ? options : {}
+    this._options = {
+      collapseGcInternals: opts.collapseGcInternals ?? true,
+    }
     this._json_parser = new JSONParser({
       paths: [
         '$.traceEvents.*',
@@ -157,17 +191,36 @@ export class ChromeParser implements TraceParser {
     ev.pid = pid
     ev.tid = tid
 
-    this._eventCount += 1
-
     if (isMetadataPh(ph)) {
+      this._eventCount += 1
       this._ingestMetadata(ev)
       return
     }
+
+    // V8 internal GC phase slices (V8.GC_HEAP_*, V8.GC_SCAVENGER_*, …)
+    // balloon the main-thread flame chart into a tower of sub-microsecond
+    // leaves under every MinorGC / V8.GCScavenger. DevTools hides these
+    // behind a single "Minor GC" bar; we do the same unless callers opt in
+    // to the raw tree via `collapseGcInternals: false`.
+    if (
+      this._options.collapseGcInternals &&
+      typeof ev.name === 'string' &&
+      V8_GC_INTERNAL_NAME.test(ev.name)
+    ) {
+      return
+    }
+
+    this._eventCount += 1
 
     if (typeof ev.ts === 'number' && Number.isFinite(ev.ts)) {
       if (ev.ts < this._minTs) this._minTs = ev.ts
       const end = ev.ts + (typeof ev.dur === 'number' ? ev.dur : 0)
       if (end > this._maxTs) this._maxTs = end
+    }
+
+    if (isSamplePh(ph)) {
+      this._ingestSample(ev)
+      return
     }
 
     if (isAsyncPh(ph)) {
@@ -190,6 +243,73 @@ export class ChromeParser implements TraceParser {
       const proc = this._touchProcess(pid)
       const thread = this._touchThread(proc, tid)
       thread.events.push(ev)
+    }
+  }
+
+  /**
+   * V8 CPU-profile frames arrive as a `Profile` event (opens a profile,
+   * specifies the thread it belongs to) plus a sequence of `ProfileChunk`
+   * events on the profiler's own thread carrying delta-encoded node
+   * definitions and sample indices. We accumulate both into a
+   * {@link CpuProfile} so finalize can synthesize JS-frame Measures on the
+   * owning thread.
+   */
+  private _ingestSample(ev: ChromeEvent): void {
+    const key = cpuProfileKey(ev.pid, ev.id)
+    const data = (ev.args as {data?: Record<string, unknown>} | undefined)?.data
+    if (ev.name === 'Profile') {
+      const existing = this._cpuProfiles.get(key)
+      const startTs =
+        typeof data?.startTime === 'number' ? (data.startTime as number) : ev.ts
+      if (existing) {
+        existing.ownerTid = ev.tid
+        existing.startTs = startTs
+      } else {
+        this._cpuProfiles.set(key, {
+          key,
+          pid: ev.pid,
+          ownerTid: ev.tid,
+          startTs,
+          nodes: new Map(),
+          samples: [],
+          timeDeltas: [],
+        })
+      }
+      const owner = this._touchProcess(ev.pid)
+      this._touchThread(owner, ev.tid)
+      return
+    }
+    if (ev.name === 'ProfileChunk') {
+      let profile = this._cpuProfiles.get(key)
+      if (!profile) {
+        // Missing `Profile` opener — rare but allowed by the spec. Use the
+        // chunk's own tid as a placeholder owner; a later `Profile` event
+        // with the same id will correct it.
+        profile = {
+          key,
+          pid: ev.pid,
+          ownerTid: ev.tid,
+          startTs: ev.ts,
+          nodes: new Map(),
+          samples: [],
+          timeDeltas: [],
+        }
+        this._cpuProfiles.set(key, profile)
+      }
+      const cpuProfile = data?.cpuProfile as
+        | {nodes?: CpuNode[]; samples?: number[]}
+        | undefined
+      if (cpuProfile?.nodes) {
+        for (const node of cpuProfile.nodes) {
+          if (typeof node?.id === 'number') profile.nodes.set(node.id, node)
+        }
+      }
+      if (Array.isArray(cpuProfile?.samples)) {
+        profile.samples.push(...(cpuProfile.samples as number[]))
+      }
+      if (Array.isArray(data?.timeDeltas)) {
+        profile.timeDeltas.push(...(data.timeDeltas as number[]))
+      }
     }
   }
 
@@ -415,12 +535,132 @@ export class ChromeParser implements TraceParser {
       currentContainer().measures.push(this._makeMeasureFromFrame(frame, end, null, toMs))
     }
 
+    // Merge any V8 CPU-profile samples whose Profile was opened on this
+    // thread. Produces synthesized JS-frame Measures and attaches each
+    // depth-0 root under the innermost X-slice that covers its start time,
+    // so the flame chart reads like DevTools' (EvaluateScript → (anonymous)
+    // → user fn → …).
+    this._attachJsFramesForThread(proc, thread, rootMeasures, toMs)
+
     return {
       id: `trk-${proc.pid}-${thread.tid}`,
       name: thread.name ?? `Thread ${thread.tid}`,
       category: 'thread',
       marks: rootMarks,
       measures: rootMeasures,
+    }
+  }
+
+  // --- CPU-profile synthesis ---------------------------------------------
+
+  private _attachJsFramesForThread(
+    proc: ProcessInfo,
+    thread: ThreadInfo,
+    rootMeasures: Measure[],
+    toMs: (ts: number) => number,
+  ): void {
+    for (const profile of this._cpuProfiles.values()) {
+      if (profile.pid !== proc.pid || profile.ownerTid !== thread.tid) continue
+      if (profile.samples.length === 0) continue
+      const jsRoots = this._buildJsFrameTree(profile, toMs)
+      for (const jsRoot of jsRoots) {
+        const host = findDeepestContaining(rootMeasures, jsRoot.start)
+        if (host) host.measures.push(jsRoot)
+        else rootMeasures.push(jsRoot)
+      }
+    }
+  }
+
+  /**
+   * Walks the profile's sample timeline and produces a tree of synthesized
+   * `Measure`s where each Measure represents a run of consecutive samples
+   * whose call stack agrees at that depth. Mirrors the stack-diff algorithm
+   * DevTools uses in `CPUProfileDataModel.forEachFrame`.
+   *
+   * Returns the depth-0 roots; each has nested children at depth 1..N. The
+   * returned Measures carry microsecond-domain `ts` values already mapped
+   * to milliseconds via `toMs`.
+   */
+  private _buildJsFrameTree(
+    profile: CpuProfile,
+    toMs: (ts: number) => number,
+  ): Measure[] {
+    interface OpenJsFrame {
+      node: CpuNode
+      startTs: number
+      children: Measure[]
+    }
+    const openStack: OpenJsFrame[] = []
+    const roots: Measure[] = []
+
+    const closeFromDepth = (depth: number, ts: number): void => {
+      while (openStack.length > depth) {
+        const open = openStack.pop()!
+        const endTs = ts > open.startTs ? ts : open.startTs
+        const measure = this._makeJsFrameMeasure(open.node, open.startTs, endTs, open.children, toMs)
+        if (openStack.length === 0) roots.push(measure)
+        else openStack[openStack.length - 1].children.push(measure)
+      }
+    }
+
+    let cumTs = profile.startTs
+    for (let i = 0; i < profile.samples.length; i++) {
+      cumTs += profile.timeDeltas[i] ?? 0
+      const ts = cumTs
+      const stack = buildCpuStack(profile.nodes, profile.samples[i])
+
+      if (isIdleStack(stack)) {
+        closeFromDepth(0, ts)
+        continue
+      }
+
+      let lcp = 0
+      const limit = Math.min(openStack.length, stack.length)
+      while (lcp < limit && openStack[lcp].node.id === stack[lcp].id) lcp++
+
+      closeFromDepth(lcp, ts)
+
+      for (let d = lcp; d < stack.length; d++) {
+        openStack.push({node: stack[d], startTs: ts, children: []})
+      }
+    }
+
+    // Close any still-open frames at the end of the profile.
+    const endTs = cumTs
+    closeFromDepth(0, endTs)
+    return roots
+  }
+
+  private _makeJsFrameMeasure(
+    node: CpuNode,
+    startTs: number,
+    endTs: number,
+    children: Measure[],
+    toMs: (ts: number) => number,
+  ): Measure {
+    const cf: CpuCallFrame = node.callFrame ?? {functionName: ''}
+    const rawEvent: RawEvent = {
+      ph: 'JS_FRAME',
+      cat: JS_FRAME_TRACE_CATEGORY,
+      name: cf.functionName,
+      ts: startTs,
+      dur: endTs - startTs,
+      functionName: cf.functionName,
+      url: cf.url,
+      scriptId: cf.scriptId,
+      lineNumber: cf.lineNumber,
+      columnNumber: cf.columnNumber,
+      nodeId: node.id,
+    }
+    return {
+      id: this._nextId('js'),
+      name: cf.functionName || '(anonymous)',
+      start: toMs(startTs),
+      end: toMs(endTs),
+      category: JS_FRAME_CATEGORY,
+      events: [rawEvent],
+      marks: [],
+      measures: children,
     }
   }
 
@@ -548,6 +788,70 @@ function throwIfAborted(signal: AbortSignal | undefined): void {
   if (!signal?.aborted) return
   const reason = signal.reason
   throw reason ?? new DOMException('Aborted', 'AbortError')
+}
+
+function isChromeParserOptions(value: unknown): value is ChromeParserOptions {
+  return typeof value === 'object' && value !== null
+}
+
+/**
+ * Walk a sample's leaf node back to root, producing a root→leaf stack with
+ * synthetic nodes (`(root)`) filtered out. Nodes whose parent pointer is
+ * missing from the map act as roots themselves — benign for malformed
+ * chunks.
+ */
+function buildCpuStack(nodes: Map<number, CpuNode>, leafId: number): CpuNode[] {
+  const reversed: CpuNode[] = []
+  let cursor: CpuNode | undefined = nodes.get(leafId)
+  let guard = 0
+  // The 1024 guard protects against a corrupt chunk that accidentally forms a
+  // parent cycle — not a real shape, but cheap insurance against an infinite
+  // loop on the main parse path.
+  while (cursor && guard < 1024) {
+    reversed.push(cursor)
+    if (cursor.parent === undefined) break
+    const parent: CpuNode | undefined = nodes.get(cursor.parent)
+    if (!parent) break
+    cursor = parent
+    guard += 1
+  }
+  const out: CpuNode[] = []
+  for (let i = reversed.length - 1; i >= 0; i--) {
+    const node = reversed[i]
+    const name = node.callFrame?.functionName ?? ''
+    if (HIDDEN_CPU_NODE_NAMES.has(name)) continue
+    out.push(node)
+  }
+  return out
+}
+
+/**
+ * True when the remaining stack represents "V8 has no user JS running right
+ * now" — either empty (root-only sample) or exactly one of the synthetic
+ * `(program)` / `(idle)` pseudo-frames. DevTools treats these as gaps in the
+ * JS flame chart; we do too, closing any open JS frames at the sample ts.
+ */
+function isIdleStack(stack: CpuNode[]): boolean {
+  if (stack.length === 0) return true
+  if (stack.length !== 1) return false
+  const name = stack[0].callFrame?.functionName ?? ''
+  return IDLE_CPU_NODE_NAMES.has(name)
+}
+
+/**
+ * Linear-time search for the deepest existing Measure whose time range
+ * covers `ts`. Used to pick the X-slice a synthesized JS-frame subtree
+ * should attach under. Measures at this point are unsorted (finalize
+ * happens later), so we do a naive descent; the tree is shallow enough on
+ * real traces that the cost is negligible next to parse.
+ */
+function findDeepestContaining(measures: Measure[], ts: number): Measure | null {
+  for (const m of measures) {
+    if (ts < m.start || ts > m.end) continue
+    const deeper = findDeepestContaining(m.measures, ts)
+    return deeper ?? m
+  }
+  return null
 }
 
 /**

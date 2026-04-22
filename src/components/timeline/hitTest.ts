@@ -9,8 +9,11 @@ import {lowerBoundF32} from '../../core/render/sliceBuffers'
  * Kept in sync with `ROW_VPAD_PX` in `canvas2d.ts`. Imported here as a
  * literal because re-exporting from `canvas2d.ts` would drag the canvas
  * draw module into hit-test consumers (workers, tests) for no benefit.
+ *
+ * Exported so the hover overlay can position itself on the exact same
+ * [y, y+h] band the renderer paints into.
  */
-const ROW_VPAD_PX = 4
+export const ROW_VPAD_PX = 4
 
 /**
  * Result of a single track-local hit test. `index` is `-1` on a miss; on a
@@ -128,3 +131,4 @@ export function hitTestTrack(
 
 // Visible for tests.
 export const __test__ = {ROW_VPAD_PX}
+

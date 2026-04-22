@@ -21,6 +21,11 @@ import type {Persona} from '../types'
 const CAT = {
   loading: 'loading',
   scripting: 'scripting',
+  // User JS call-stack frames synthesized from V8 CPU-profile samples.
+  // Visually distinct from `scripting` so the deep user-code tower reads
+  // apart from the EvaluateScript / v8.run / Compile infrastructure that
+  // wraps it. Same overview band, different flame-chart color.
+  userScript: 'userScript',
   rendering: 'rendering',
   painting: 'painting',
   gpu: 'gpu',
@@ -50,13 +55,27 @@ export const WEB_DEV_PERSONA: Persona = {
   },
 
   categories: [
-    // Colors chosen to closely match Chrome DevTools' Performance panel.
+    // Root categories (no `parentId`) — each defines both the flame-chart
+    // color and the overview stripe color. Colors chosen to closely match
+    // Chrome DevTools' Performance panel.
     {id: CAT.loading, label: 'Loading', color: '#4398f0'},
     {id: CAT.scripting, label: 'Scripting', color: '#f0c000'},
+    // Subcategory of Scripting: the flame chart paints user JS in a
+    // light mint distinct from the yellow EvaluateScript / v8.run /
+    // Compile infrastructure that wraps it, but the overview still
+    // rolls this wall time into the Scripting band via `parentId`.
+    {id: CAT.userScript, label: 'User JS', color: '#8ed9c1', parentId: CAT.scripting},
     {id: CAT.rendering, label: 'Rendering', color: '#9a4ca2'},
     {id: CAT.painting, label: 'Painting', color: '#4e9a06'},
-    {id: CAT.gpu, label: 'GPU', color: '#b66dff'},
+    // Warm rose, deliberately far from the Rendering violet it used to
+    // sit next to in the overview stack — the two purples blurred into
+    // a single stripe at low zoom. Pink also matches the "GPU /
+    // presentation" hue most perf tools reach for.
+    {id: CAT.gpu, label: 'GPU', color: '#e8457f'},
     {id: CAT.system, label: 'System', color: '#9e9e9e'},
+    // Deliberately omitted from `overviewOrder` below so they contribute
+    // no overview stripe — idle / unclassified time reads as the dark
+    // gap between bands, matching DevTools.
     {id: CAT.idle, label: 'Idle', color: '#e5e5e5'},
     {id: CAT.other, label: 'Other', color: '#4a5568'},
   ],
@@ -67,6 +86,20 @@ export const WEB_DEV_PERSONA: Persona = {
   // https://chromium.googlesource.com/chromium/src/+/main/docs/devtools/debugger-protocol.md
   // and the blink/v8/cc categories those events ship with.
   colorRules: [
+    // JS-frame slices synthesized from V8 CPU-profile samples. The parser
+    // tags them with `category: 'jsFrame'`; route them into their own
+    // mint-green `userScript` bucket so the deep user-code call stack
+    // reads apart from the yellow EvaluateScript / v8.run / Compile
+    // infrastructure wrapping it.
+    {traceCategory: /^jsFrame$/, categoryId: CAT.userScript},
+
+    // Scheduler plumbing. `RunTask` (and its aliases) are the generic
+    // "the main thread ran a task" wrappers Chrome posts around every
+    // unit of work — timers, input, IPC, etc. DevTools renders them in
+    // a neutral gray because they're not meaningful "scripting" by
+    // themselves, and they'd otherwise wash the chart out in yellow.
+    {measureName: /^(RunTask|ThreadControllerImpl::RunTask)$/, categoryId: CAT.system},
+
     // Loading / network.
     {
       measureName:
@@ -182,16 +215,17 @@ export const WEB_DEV_PERSONA: Persona = {
     {trackName: /^Media$/, hidden: true},
   ],
 
-  overviewBands: [
-    // Rendered bottom-to-top. System at the bottom (narrow band of
-    // scheduling overhead), then GPU, Painting, Rendering, Scripting,
-    // Loading on top — so the "what users feel" categories are visually
-    // dominant, matching DevTools' emphasis.
-    {id: 'system', label: 'System', color: '#9e9e9e', categoryIds: [CAT.system]},
-    {id: 'gpu', label: 'GPU', color: '#b66dff', categoryIds: [CAT.gpu]},
-    {id: 'painting', label: 'Painting', color: '#4e9a06', categoryIds: [CAT.painting]},
-    {id: 'rendering', label: 'Rendering', color: '#9a4ca2', categoryIds: [CAT.rendering]},
-    {id: 'scripting', label: 'Scripting', color: '#f0c000', categoryIds: [CAT.scripting]},
-    {id: 'loading', label: 'Loading', color: '#4398f0', categoryIds: [CAT.loading]},
+  // Rendered bottom-to-top. System at the bottom (narrow band of
+  // scheduling overhead), then GPU, Painting, Rendering, Scripting,
+  // Loading on top — so the "what users feel" categories are visually
+  // dominant, matching DevTools' emphasis. `userScript` is intentionally
+  // absent: it rolls into `scripting` via its `parentId` at apply time.
+  overviewOrder: [
+    CAT.system,
+    CAT.gpu,
+    CAT.painting,
+    CAT.rendering,
+    CAT.scripting,
+    CAT.loading,
   ],
 }

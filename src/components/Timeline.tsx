@@ -125,6 +125,11 @@ export default function Timeline({
   // outer scroller (not inside any TimelineSystem) so it can be positioned
   // in viewport coordinates without escaping the row's stacking context.
   const tooltipRef = useRef<HTMLDivElement | null>(null)
+  // Hover-highlight outline. Mutated imperatively by `useTimelineHover`
+  // (zero React renders per cursor move), drawn over the hovered slice
+  // so you can see which rect the tooltip is describing — border-only
+  // variant, no canvas repaint, no re-render of other tracks.
+  const hoverHighlightRef = useRef<HTMLDivElement | null>(null)
 
   // The viewport store is the single source of truth for pxPerMs /
   // scrollLeft / viewport dimensions that canvases need. It's created once
@@ -374,9 +379,17 @@ export default function Timeline({
   // memoizing on it is equivalent to "compute on parse". Runs on the
   // main thread; O(total depth-0 slices) plus a 7-tap smoothing pass,
   // well inside a frame. Used when the persona doesn't define bands.
+  //
+  // Scopes to the persona's `overviewSystems` (tracks marked
+  // defaultExpanded) so the silhouette tracks the same subset as the
+  // stacked bands rendered in front of it — otherwise the two layers
+  // disagree visually: bands paint only the Main thread while the
+  // silhouette still reflects every visible track's wall time, making
+  // the silhouette look like a phantom mountain with nothing stacked
+  // on top of it.
   const overviewUtilization = useMemo(
-    () => buildOverviewUtilization(timeline),
-    [timeline],
+    () => buildOverviewUtilization(timeline, undefined, appliedPersona?.overviewSystems),
+    [timeline, appliedPersona],
   )
 
   // Stacked category bands, computed on demand when the applied persona
@@ -486,6 +499,7 @@ export default function Timeline({
     trackRows: hoverTrackRows,
     tooltipRef,
     selectionStore: effectiveSelectionStore,
+    highlightRef: hoverHighlightRef,
   })
 
   // Separate ref for the overview canvas so the selection hook can wire
@@ -610,6 +624,36 @@ export default function Timeline({
         aria-hidden="true"
         className="pointer-events-none fixed left-0 top-0 z-50 max-w-xs whitespace-nowrap rounded border border-[#2d3748] bg-[#0b0f17]/95 px-2 py-1 text-xs text-[#e2e8f0] shadow-lg transition-opacity duration-75"
         style={{opacity: 0, transform: 'translate(0px, 0px)'}}
+      />
+      {/*
+        Hover highlight overlay. Fixed-positioned and pointer-events:none
+        so it sits on top of the canvas without blocking hit-tests or
+        scroll. `useTimelineHover` imperatively sets `transform`,
+        `width`, `height`, and `opacity`; React never re-renders this
+        node on cursor moves. Rendered below the tooltip in z-order so
+        the tooltip text stays readable if it overlaps the outline.
+      */}
+      <div
+        ref={hoverHighlightRef}
+        data-testid="timeline-hover-highlight"
+        aria-hidden="true"
+        className="pointer-events-none fixed left-0 top-0 z-40 rounded-sm transition-opacity duration-75"
+        style={{
+          opacity: 0,
+          transform: 'translate(0px, 0px)',
+          width: 0,
+          height: 0,
+          // `outline` paints outside the element's box and never reserves
+          // layout space, so the highlight wraps the slice rect without
+          // eating into its interior (a `border` with `box-sizing:
+          // border-box` would shave 2px off every edge of the painted
+          // rect). A 1px dark halo via non-inset box-shadow keeps the
+          // stroke readable on both bright yellow scripting and dark mint
+          // user-JS backgrounds.
+          outline: '2px solid rgba(255, 255, 255, 0.85)',
+          outlineOffset: 0,
+          boxShadow: '0 0 0 1px rgba(0, 0, 0, 0.7)',
+        }}
       />
     </div>
   )
