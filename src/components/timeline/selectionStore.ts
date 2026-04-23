@@ -32,15 +32,37 @@ export interface InProgressSelection extends SelectionRange {
   anchorMs: number
 }
 
+/**
+ * Minimal identifier for a single slice in the timeline. Sufficient for
+ * the tree-highlight affordance: start/end/depth uniquely determine the
+ * pre-order descendant range (depth >= this.depth and span ⊆ [start,end]),
+ * and trackId scopes that check to one track's canvas.
+ */
+export interface SliceRef {
+  trackId: string
+  startMs: number
+  endMs: number
+  depth: number
+}
+
 export interface SelectionState {
   committed: SelectionRange | null
   inProgress: InProgressSelection | null
+  /** Sticky slice chosen by click. Cleared by clicking empty canvas. */
+  selectedSlice: SliceRef | null
+  /** Transient slice under the cursor. Cleared on pointerleave / pan. */
+  hoveredSlice: SliceRef | null
 }
 
 export type SelectionListener = (state: SelectionState) => void
 
 export class SelectionStore {
-  private state: SelectionState = {committed: null, inProgress: null}
+  private state: SelectionState = {
+    committed: null,
+    inProgress: null,
+    selectedSlice: null,
+    hoveredSlice: null,
+  }
   private listeners = new Set<SelectionListener>()
 
   get(): SelectionState {
@@ -59,6 +81,18 @@ export class SelectionStore {
     this.emit()
   }
 
+  setHoveredSlice(next: SliceRef | null): void {
+    if (slicesEqual(this.state.hoveredSlice, next)) return
+    this.state = {...this.state, hoveredSlice: next}
+    this.emit()
+  }
+
+  setSelectedSlice(next: SliceRef | null): void {
+    if (slicesEqual(this.state.selectedSlice, next)) return
+    this.state = {...this.state, selectedSlice: next}
+    this.emit()
+  }
+
   /** Drop the in-progress drag without committing. */
   cancel(): void {
     if (this.state.inProgress === null) return
@@ -71,13 +105,25 @@ export class SelectionStore {
     const ip = this.state.inProgress
     if (ip === null) return
     const committed: SelectionRange = {startMs: ip.startMs, endMs: ip.endMs}
-    this.state = {committed, inProgress: null}
+    this.state = {...this.state, committed, inProgress: null}
     this.emit()
   }
 
   clear(): void {
-    if (this.state.committed === null && this.state.inProgress === null) return
-    this.state = {committed: null, inProgress: null}
+    if (
+      this.state.committed === null &&
+      this.state.inProgress === null &&
+      this.state.selectedSlice === null &&
+      this.state.hoveredSlice === null
+    ) {
+      return
+    }
+    this.state = {
+      committed: null,
+      inProgress: null,
+      selectedSlice: null,
+      hoveredSlice: null,
+    }
     this.emit()
   }
 
@@ -108,5 +154,19 @@ function rangesEqual(
     a.endMs === b.endMs &&
     (a as InProgressSelection).anchorMs ===
       (b as InProgressSelection).anchorMs
+  )
+}
+
+function slicesEqual(
+  a: SliceRef | null | undefined,
+  b: SliceRef | null | undefined,
+): boolean {
+  if (a === b) return true
+  if (!a || !b) return false
+  return (
+    a.trackId === b.trackId &&
+    a.startMs === b.startMs &&
+    a.endMs === b.endMs &&
+    a.depth === b.depth
   )
 }

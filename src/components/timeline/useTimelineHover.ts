@@ -1,6 +1,6 @@
 import {useEffect, type RefObject} from 'react'
 import type {Track as TrackModel} from '../../core'
-import {hitTestTrack, ROW_VPAD_PX} from './hitTest'
+import {hitTestTrack} from './hitTest'
 import {ROW_HEIGHT} from './trackLayout'
 import type {SelectionStore} from './selectionStore'
 import type {ViewportStore} from './viewportStore'
@@ -45,30 +45,26 @@ export interface UseTimelineHoverOptions {
    */
   tooltipRef: RefObject<HTMLElement | null>
   /**
-   * Optional selection store. When a drag-selection is in progress the
-   * hover tooltip suppresses itself so the selection's duration tooltip
-   * (owned by `useTimelineSelection`) is the only one visible.
+   * Selection store. We publish the hovered slice into it so every
+   * track canvas can subscribe and repaint the (slice + descendants)
+   * subtree opaque while dimming everything else. Also read to suppress
+   * the tooltip during an active drag-selection.
    */
-  selectionStore?: SelectionStore
-  /**
-   * Optional hover-highlight overlay. When provided, we imperatively
-   * translate/size it to outline the slice under the cursor (same
-   * zero-React-renders pattern as the tooltip). Passing `undefined`
-   * degrades gracefully to tooltip-only behavior.
-   */
-  highlightRef?: RefObject<HTMLElement | null>
+  selectionStore: SelectionStore
 }
 
 /**
- * Wires up a `pointermove`/`pointerleave`-driven tooltip.
+ * Wires up a `pointermove`/`pointerleave`-driven tooltip AND the
+ * hovered-slice store channel that drives the tree-highlight affordance.
  *
- * - Zero React renders per cursor move: we mutate the tooltip element
- *   imperatively using refs.
+ * - Zero React renders per cursor move: the tooltip is mutated
+ *   imperatively via refs, and the store writes are skipped when the
+ *   hovered slice hasn't changed.
  * - Hit-test reads the *raw* `track.buffers` (not the mipmap), so even
- *   sub-pixel slices that visually merge into a density bucket can still be
- *   inspected on hover.
- * - Hides the tooltip during pointer captures (drag-pan) by listening for
- *   `pointerdown` / `pointerup` and gating updates accordingly.
+ *   sub-pixel slices that visually merge into a density bucket can still
+ *   be inspected on hover.
+ * - Hides the tooltip during pointer captures (drag-pan) by listening
+ *   for `pointerdown` / `pointerup` and gating updates accordingly.
  */
 export function useTimelineHover(options: UseTimelineHoverOptions): void {
   const {
@@ -78,7 +74,6 @@ export function useTimelineHover(options: UseTimelineHoverOptions): void {
     trackRows,
     tooltipRef,
     selectionStore,
-    highlightRef,
   } = options
 
   useEffect(() => {
@@ -88,7 +83,6 @@ export function useTimelineHover(options: UseTimelineHoverOptions): void {
 
     let panning = false
     let lastShown = false
-    let lastHighlightShown = false
 
     const hideTooltip = (): void => {
       const tip = tooltipRef.current
@@ -99,17 +93,13 @@ export function useTimelineHover(options: UseTimelineHoverOptions): void {
       lastShown = false
     }
 
-    const hideHighlight = (): void => {
-      const el = highlightRef?.current
-      if (!el) return
-      if (!lastHighlightShown) return
-      el.style.opacity = '0'
-      lastHighlightShown = false
+    const clearHover = (): void => {
+      selectionStore.setHoveredSlice(null)
     }
 
     const hideAll = (): void => {
       hideTooltip()
-      hideHighlight()
+      clearHover()
     }
 
     const showTooltip = (
@@ -132,58 +122,6 @@ export function useTimelineHover(options: UseTimelineHoverOptions): void {
       }
     }
 
-    const showHighlight = (
-      rect: DOMRect,
-      state: {
-        pxPerMs: number
-        scrollLeft: number
-        scrollTop: number
-        timelineStart: number
-        labelWidthPx: number
-      },
-      rowTopPx: number,
-      depth: number,
-      startMs: number,
-      endMs: number,
-    ): void => {
-      const el = highlightRef?.current
-      if (!el) return
-      // Canvas draws slice rects at
-      //   y = depth * ROW_HEIGHT + ROW_VPAD_PX/2, h = ROW_HEIGHT - ROW_VPAD_PX
-      // within the track's content band. Mirror that exactly so the
-      // outline sits pixel-aligned over the painted rect rather than
-      // floating above/below it.
-      const rowTopClient = rect.top + rowTopPx - state.scrollTop
-      const sliceTop = rowTopClient + depth * ROW_HEIGHT + ROW_VPAD_PX / 2
-      const sliceHeight = ROW_HEIGHT - ROW_VPAD_PX
-
-      const gutterLeft = rect.left + state.labelWidthPx
-      const sliceLeftRaw =
-        gutterLeft + (startMs - state.timelineStart) * state.pxPerMs - state.scrollLeft
-      const sliceRightRaw =
-        gutterLeft + (endMs - state.timelineStart) * state.pxPerMs - state.scrollLeft
-
-      // Clamp horizontally: never paint the highlight over the label
-      // gutter, and don't leak past the scroller's right edge.
-      const left = Math.max(gutterLeft, sliceLeftRaw)
-      const right = Math.min(rect.right, sliceRightRaw)
-      if (right <= gutterLeft || left >= rect.right) {
-        hideHighlight()
-        return
-      }
-      // Minimum visual width of 2px so sub-pixel slices still get a
-      // visible outline instead of collapsing to a single hairline.
-      const width = Math.max(2, right - left)
-
-      el.style.transform = `translate(${Math.round(left)}px, ${Math.round(sliceTop)}px)`
-      el.style.width = `${Math.round(width)}px`
-      el.style.height = `${Math.round(sliceHeight)}px`
-      if (!lastHighlightShown) {
-        el.style.opacity = '1'
-        lastHighlightShown = true
-      }
-    }
-
     const onPointerDown = (): void => {
       panning = true
       hideAll()
@@ -199,7 +137,7 @@ export function useTimelineHover(options: UseTimelineHoverOptions): void {
       }
       // Suppress the hover tooltip during an active drag-selection so
       // the selection's duration readout is the only one visible.
-      if (selectionStore && selectionStore.get().inProgress) {
+      if (selectionStore.get().inProgress) {
         hideAll()
         return
       }
@@ -268,11 +206,16 @@ export function useTimelineHover(options: UseTimelineHoverOptions): void {
         return
       }
       showTooltip(
-        formatTooltip(measure.name, measure.end - measure.start),
+        formatTooltip(measure.name, measure.end - measure.start, measure.id),
         e.clientX,
         e.clientY,
       )
-      showHighlight(rect, state, row.topPx, hit.depth, measure.start, measure.end)
+      selectionStore.setHoveredSlice({
+        trackId: row.track.id,
+        startMs: measure.start,
+        endMs: measure.end,
+        depth: hit.depth,
+      })
     }
 
     const onPointerLeave = (): void => {
@@ -293,7 +236,7 @@ export function useTimelineHover(options: UseTimelineHoverOptions): void {
       eventEl.removeEventListener('pointercancel', onPointerUp)
       hideAll()
     }
-  }, [eventTargetRef, scrollerRef, store, trackRows, tooltipRef, selectionStore, highlightRef])
+  }, [eventTargetRef, scrollerRef, store, trackRows, tooltipRef, selectionStore])
 }
 
 /**
@@ -318,8 +261,11 @@ function findRowAt(
 const MS_PER_S = 1000
 const MS_PER_US = 0.001
 
-function formatTooltip(name: string, durationMs: number): string {
-  return `${name} · ${formatDuration(durationMs)}`
+function formatTooltip(name: string, durationMs: number, id: string): string {
+  // The `#<id>` suffix is the parser-assigned short hex id. It doubles as
+  // a deep-link handle (`?selection=<id>`) so users can cite the exact
+  // measure in bug reports without copy-pasting three numbers.
+  return `${name} · ${formatDuration(durationMs)} · #${id}`
 }
 
 /** Compact ms → human duration matching how the rest of the UI talks about time. */

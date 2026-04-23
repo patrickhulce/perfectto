@@ -3,6 +3,9 @@ import type {SelectionStore} from './selectionStore'
 import type {ViewportStore} from './viewportStore'
 import type {InputBindingsStore} from './inputBindingsStore'
 import {matchGesture, modsFromEvent} from './inputBindings'
+import {hitTestTrack} from './hitTest'
+import {ROW_HEIGHT} from './trackLayout'
+import type {HoverTrackLayout} from './useTimelineHover'
 
 export interface UseTimelineSelectionOptions {
   /** Outer scroll container — its bounding rect maps client coords. */
@@ -20,6 +23,14 @@ export interface UseTimelineSelectionOptions {
    */
   tooltipRef: RefObject<HTMLElement | null>
   /**
+   * Track-row layout (same list `useTimelineHover` consumes). Used to
+   * hit-test a sub-threshold click on the main surface and promote it
+   * to a slice-level selection so the tree-highlight affordance has
+   * something sticky to latch onto after the cursor moves away.
+   * Optional for the overview-only and test-only call sites.
+   */
+  trackRows?: HoverTrackLayout[]
+  /**
    * Input-binding store. When provided, the main-surface left-drag
    * only starts a selection if the current binding for `leftDrag`
    * (with the active modifiers) resolves to `selection.selectRange`.
@@ -28,6 +39,12 @@ export interface UseTimelineSelectionOptions {
    */
   bindingsStore?: InputBindingsStore
 }
+
+/**
+ * Same generous hit-box the hover hook uses. Kept in sync so a click
+ * lands on exactly the slice the user's cursor visually indicated.
+ */
+const MIN_HITBOX_PX = 3
 
 /** Minimum pointer movement (in CSS px) before a click promotes to a drag. */
 const MIN_DRAG_PX = 3
@@ -62,6 +79,7 @@ export function useTimelineSelection(
     store,
     selectionStore,
     tooltipRef,
+    trackRows,
     bindingsStore,
   } = options
 
@@ -218,7 +236,6 @@ export function useTimelineSelection(
       if (!drag || e.pointerId !== drag.pointerId) return
       const host = drag.host
       const wasPromoted = drag.promoted
-      const anchorMs = drag.anchorMs
       try {
         host.releasePointerCapture(e.pointerId)
       } catch {
@@ -228,33 +245,12 @@ export function useTimelineSelection(
       if (wasPromoted) {
         selectionStore.commit()
       } else {
-        // Sub-threshold click (no drag). Two things to do:
-        //  1. Drop any in-progress draft so it doesn't linger.
-        //  2. If the click landed outside an existing committed
-        //     selection, clear the selection — the common "click away
-        //     to deselect" gesture. Clicks inside the committed range
-        //     are preserved so the user can still click through to
-        //     inspect slices within their selection.
-        //
-        // The deselect step is gated on the `click` binding matching
-        // `selection.deselect` so users who rebind click to something
-        // else (or to `none`) don't lose their selection on incidental
-        // clicks. All built-in presets keep this binding as deselect.
+        // Sub-threshold click via the range-drag path. The dedicated
+        // click tracker below handles slice-select + click-action
+        // dispatch uniformly for every preset (it's attached whether or
+        // not `leftDrag` resolves to `selection.selectRange`), so this
+        // branch only has to drop any in-progress range draft.
         selectionStore.cancel()
-        const clickAction = bindingsStore
-          ? matchGesture('click', modsFromEvent(e), bindingsStore.get().bindings)
-          : 'selection.deselect'
-        if (clickAction === 'selection.deselect') {
-          const committed = selectionStore.get().committed
-          if (committed !== null) {
-            const inside = anchorMs >= committed.startMs && anchorMs <= committed.endMs
-            if (!inside) {
-              selectionStore.setCommitted(null)
-            }
-          }
-        } else if (clickAction === 'selection.clearSelection') {
-          selectionStore.clear()
-        }
       }
       hideTooltip()
     }
@@ -269,6 +265,95 @@ export function useTimelineSelection(
     const onDownOverview = (e: PointerEvent): void => onPointerDown(e, 'overview')
     const onDownMain = (e: PointerEvent): void => onPointerDown(e, 'main')
 
+    // --- Click tracker (main surface only) -------------------------------
+    // Click-to-select-slice and click-away-to-deselect need to work on
+    // EVERY preset, not just the ones that bind `leftDrag` to
+    // `selection.selectRange`. The range-drag path above early-returns
+    // on `onPointerDown` when the binding doesn't match (because the
+    // viewport hook then owns the left-drag for panning), which would
+    // otherwise silently break click-to-select on the default preset.
+    //
+    // This lightweight tracker records the pointerdown anchor without
+    // calling `preventDefault()` or setting pointer capture, so it
+    // never conflicts with the viewport hook's pan gesture or the
+    // range-drag logic. On pointerup we check if movement stayed below
+    // `MIN_DRAG_PX`; if so it's a click and we:
+    //   1. Hit-test the slice under the cursor and write it into
+    //      `selectionStore.selectedSlice` (or `null` for empty-space
+    //      clicks, which clears any previous slice selection).
+    //   2. If the `click` binding is `selection.deselect`, also clear
+    //      the committed time range when the click landed outside it.
+    //
+    // Middle-click and right-click are ignored so scroll-wheel pans and
+    // context menus still behave normally.
+    interface ClickTracker {
+      pointerId: number
+      startClientX: number
+      startClientY: number
+    }
+    let clickTracker: ClickTracker | null = null
+
+    const onClickDown = (e: PointerEvent): void => {
+      if (e.button !== 0) return
+      // Row-chrome controls (expand buttons, track header inputs) must
+      // keep their own click semantics; mirroring the same filter the
+      // drag path uses keeps the two in sync.
+      const target = e.target as HTMLElement | null
+      if (target?.closest('button, input, textarea, [data-no-pan]')) return
+      clickTracker = {
+        pointerId: e.pointerId,
+        startClientX: e.clientX,
+        startClientY: e.clientY,
+      }
+    }
+
+    const onClickMove = (e: PointerEvent): void => {
+      if (!clickTracker || clickTracker.pointerId !== e.pointerId) return
+      const dx = e.clientX - clickTracker.startClientX
+      const dy = e.clientY - clickTracker.startClientY
+      if (Math.abs(dx) >= MIN_DRAG_PX || Math.abs(dy) >= MIN_DRAG_PX) {
+        // Crossed the drag threshold — this isn't a click anymore.
+        clickTracker = null
+      }
+    }
+
+    const onClickUp = (e: PointerEvent): void => {
+      if (!clickTracker || clickTracker.pointerId !== e.pointerId) return
+      const tracker = clickTracker
+      clickTracker = null
+      const dx = e.clientX - tracker.startClientX
+      const dy = e.clientY - tracker.startClientY
+      if (Math.abs(dx) >= MIN_DRAG_PX || Math.abs(dy) >= MIN_DRAG_PX) return
+      const anchorMs = clientXToMs(e.clientX, 'main')
+      if (trackRows && trackRows.length > 0) {
+        const hit = hitTestSliceAtClick(
+          trackRows,
+          anchorMs,
+          e.clientY,
+          scroller,
+          store,
+        )
+        selectionStore.setSelectedSlice(hit)
+      }
+      const clickAction = bindingsStore
+        ? matchGesture('click', modsFromEvent(e), bindingsStore.get().bindings)
+        : 'selection.deselect'
+      if (clickAction === 'selection.deselect') {
+        const committed = selectionStore.get().committed
+        if (committed !== null) {
+          const inside = anchorMs >= committed.startMs && anchorMs <= committed.endMs
+          if (!inside) selectionStore.setCommitted(null)
+        }
+      } else if (clickAction === 'selection.clearSelection') {
+        selectionStore.clear()
+      }
+    }
+
+    const onClickCancel = (e: PointerEvent): void => {
+      if (!clickTracker || clickTracker.pointerId !== e.pointerId) return
+      clickTracker = null
+    }
+
     overviewCanvas?.addEventListener('pointerdown', onDownOverview)
     eventSurface?.addEventListener('pointerdown', onDownMain)
     // Pointer capture routes moves/ups back to the host element. We
@@ -281,6 +366,10 @@ export function useTimelineSelection(
     eventSurface?.addEventListener('pointermove', onPointerMove)
     eventSurface?.addEventListener('pointerup', onPointerUp)
     eventSurface?.addEventListener('pointercancel', onPointerCancel)
+    eventSurface?.addEventListener('pointerdown', onClickDown)
+    eventSurface?.addEventListener('pointermove', onClickMove)
+    eventSurface?.addEventListener('pointerup', onClickUp)
+    eventSurface?.addEventListener('pointercancel', onClickCancel)
 
     return () => {
       overviewCanvas?.removeEventListener('pointerdown', onDownOverview)
@@ -291,6 +380,10 @@ export function useTimelineSelection(
       eventSurface?.removeEventListener('pointermove', onPointerMove)
       eventSurface?.removeEventListener('pointerup', onPointerUp)
       eventSurface?.removeEventListener('pointercancel', onPointerCancel)
+      eventSurface?.removeEventListener('pointerdown', onClickDown)
+      eventSurface?.removeEventListener('pointermove', onClickMove)
+      eventSurface?.removeEventListener('pointerup', onClickUp)
+      eventSurface?.removeEventListener('pointercancel', onClickCancel)
       hideTooltip()
     }
   }, [
@@ -300,8 +393,68 @@ export function useTimelineSelection(
     store,
     selectionStore,
     tooltipRef,
+    trackRows,
     bindingsStore,
   ])
+}
+
+/**
+ * Resolve the slice under a click on the main event surface. Returns a
+ * {@link SliceRef}-shaped object suitable for `selectionStore.setSelectedSlice`,
+ * or `null` if the click missed the slice content entirely (over the
+ * label gutter, empty row, outside any row, or on a sub-pixel gap).
+ *
+ * Mirrors the hit-test `useTimelineHover` runs on pointermove, including
+ * the `MIN_HITBOX_PX` widening so sub-ms slices remain clickable.
+ */
+function hitTestSliceAtClick(
+  rows: HoverTrackLayout[],
+  timelineMs: number,
+  clientY: number,
+  scroller: HTMLElement,
+  store: ViewportStore,
+): import('./selectionStore').SliceRef | null {
+  const rect = scroller.getBoundingClientRect()
+  const state = store.get()
+  if (state.pxPerMs <= 0) return null
+  const contentY = state.scrollTop + (clientY - rect.top)
+  const row = findRowAt(rows, contentY)
+  if (!row) return null
+  const buffers = row.track.buffers
+  if (!buffers || buffers.count === 0) return null
+  const trackLocalY = contentY - row.topPx
+  const maxDepthExclusive = row.expanded ? Number.POSITIVE_INFINITY : 1
+  const minHitboxMs = MIN_HITBOX_PX / state.pxPerMs
+  const hit = hitTestTrack(
+    buffers,
+    timelineMs,
+    trackLocalY,
+    ROW_HEIGHT,
+    maxDepthExclusive,
+    minHitboxMs,
+  )
+  if (hit.index < 0) return null
+  const measure = buffers.measures[hit.index]
+  if (!measure) return null
+  return {
+    trackId: row.track.id,
+    startMs: measure.start,
+    endMs: measure.end,
+    depth: hit.depth,
+  }
+}
+
+function findRowAt(
+  rows: HoverTrackLayout[],
+  contentY: number,
+): HoverTrackLayout | null {
+  for (let i = 0; i < rows.length; i++) {
+    const r = rows[i]
+    if (contentY < r.topPx) continue
+    if (contentY >= r.topPx + r.heightPx) continue
+    return r
+  }
+  return null
 }
 
 const MS_PER_S = 1000
@@ -317,4 +470,4 @@ function formatDuration(ms: number): string {
   return `${(ms / MS_PER_S).toFixed(2)} s`
 }
 
-export const __test__ = {formatDuration, MIN_DRAG_PX}
+export const __test__ = {formatDuration, MIN_DRAG_PX, hitTestSliceAtClick}

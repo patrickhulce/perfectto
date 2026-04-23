@@ -51,6 +51,16 @@ export interface UseTimelineZoomResult {
   pxPerMs: number
   /** Attach to the element that should receive wheel + pointer gestures. */
   eventTargetRef: (el: HTMLElement | null) => void
+  /**
+   * Imperative handle to zoom the viewport to a time range. Populated
+   * by the hook once it has mounted its event surface and cleared to
+   * `null` on unmount. Callers should null-check before invoking.
+   *
+   * Exposed primarily for one-shot deep-link URL handling (see
+   * `urlParams.ts`); every interactive zoom path inside the hook
+   * continues to call the local closure directly.
+   */
+  zoomToRangeRef: RefObject<((startMs: number, endMs: number) => void) | null>
 }
 
 const MIN_SPAN_MS = 0.01
@@ -184,6 +194,12 @@ export function useTimelineZoom(
   const eventTargetRef = (el: HTMLElement | null): void => {
     setEventEl(el)
   }
+
+  // Imperative handle for `zoomToRange`. Populated inside the main
+  // effect below once the event element has mounted; consumers
+  // (Timeline's URL-deep-link effect) read `.current` lazily so they
+  // naturally no-op before the hook is ready.
+  const zoomToRangeRef = useRef<((startMs: number, endMs: number) => void) | null>(null)
 
   useEffect(() => {
     const el = eventEl
@@ -818,6 +834,11 @@ export function useTimelineZoom(
       if (e.button === 1) e.preventDefault()
     }
 
+    // Publish the imperative zoom handle now that the event surface
+    // has mounted and the closure above has captured stable refs for
+    // scroller / store / bounds.
+    zoomToRangeRef.current = zoomToRange
+
     el.addEventListener('wheel', onWheel, {passive: false})
     el.addEventListener('pointerdown', onPointerDown)
     el.addEventListener('pointermove', onPointerMove)
@@ -845,8 +866,9 @@ export function useTimelineZoom(
       el.removeEventListener('gestureend', onGestureEnd as EventListener)
       window.removeEventListener('keydown', onKeyDown)
       ctrlTracker.dispose()
+      zoomToRangeRef.current = null
     }
   }, [eventEl, scrollerRef])
 
-  return {pxPerMs, eventTargetRef}
+  return {pxPerMs, eventTargetRef, zoomToRangeRef}
 }

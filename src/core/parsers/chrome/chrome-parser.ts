@@ -553,6 +553,38 @@ export class ChromeParser implements TraceParser {
 
   // --- CPU-profile synthesis ---------------------------------------------
 
+  /**
+   * Stitch each JS-frame root from the CPU profile into the existing B/E/X
+   * tree. `findDeepestContaining(start)` alone is not enough: the sampler
+   * keeps running past the end of the innermost trace event (typical tail
+   * is tens of µs of overshoot), so a blind attach produces a child whose
+   * `end` extends past its parent. It also produces same-depth overlap
+   * between the JS root and whatever V8 Console / Debugger slices the host
+   * already holds — all of which should nest *inside* the JS function that
+   * was on the call stack while they fired.
+   *
+   * The algorithm:
+   *
+   *   1. Pick the innermost existing Measure whose start-range covers
+   *      `jsRoot.start`. This is the "anchor" depth at which JS was known
+   *      to be running.
+   *   2. Walk up from the anchor until an ancestor's bounds fully contain
+   *      `[jsRoot.start, jsRoot.end]`. Use that as the host if found;
+   *      otherwise fall back to the anchor and clip the JS subtree to its
+   *      bounds.
+   *   3. Clip any Measure in the JS subtree whose bounds escape the host.
+   *      This trims sampler overshoot and keeps the parent-wider-than-
+   *      children invariant every downstream consumer (mipmap builder,
+   *      renderer, aggregator) expects.
+   *   4. Re-parent any pre-existing host children whose bounds fall within
+   *      the JS root's span under the JS root itself. Those siblings were
+   *      logged while the JS function was on the stack; this reproduces the
+   *      correct flame-chart nesting rather than treating them as peers.
+   *
+   * Runs once per JS root. Must be called before `finalizeContainer` so the
+   * per-container `sort(compareByStart)` and `maxEnd` computation see the
+   * final tree.
+   */
   private _attachJsFramesForThread(
     proc: ProcessInfo,
     thread: ThreadInfo,
@@ -564,9 +596,7 @@ export class ChromeParser implements TraceParser {
       if (profile.samples.length === 0) continue
       const jsRoots = this._buildJsFrameTree(profile, toMs)
       for (const jsRoot of jsRoots) {
-        const host = findDeepestContaining(rootMeasures, jsRoot.start)
-        if (host) host.measures.push(jsRoot)
-        else rootMeasures.push(jsRoot)
+        attachJsRoot(rootMeasures, jsRoot)
       }
     }
   }
@@ -653,7 +683,7 @@ export class ChromeParser implements TraceParser {
       nodeId: node.id,
     }
     return {
-      id: this._nextId('js'),
+      id: this._nextId(),
       name: cf.functionName || '(anonymous)',
       start: toMs(startTs),
       end: toMs(endTs),
@@ -737,7 +767,7 @@ export class ChromeParser implements TraceParser {
     const events: RawEvent[] = [toRawEvent(begin)]
     if (endEvent) events.push(toRawEvent(endEvent))
     return {
-      id: this._nextId('m'),
+      id: this._nextId(),
       name: begin.name,
       start: toMs(begin.ts),
       end: toMs(endTs),
@@ -757,7 +787,7 @@ export class ChromeParser implements TraceParser {
     const events: RawEvent[] = [toRawEvent(begin)]
     if (endEvent) events.push(toRawEvent(endEvent))
     return {
-      id: this._nextId('m-async'),
+      id: this._nextId(),
       name: begin.name,
       start: toMs(begin.ts),
       end: toMs(endTs),
@@ -770,7 +800,7 @@ export class ChromeParser implements TraceParser {
 
   private _makeMark(ev: ChromeEvent, toMs: (ts: number) => number): Mark {
     return {
-      id: this._nextId('mk'),
+      id: this._nextId(),
       name: ev.name,
       time: toMs(ev.ts),
       category: ev.cat,
@@ -778,9 +808,16 @@ export class ChromeParser implements TraceParser {
     }
   }
 
-  private _nextId(prefix: string): string {
+  /**
+   * Mint a short, URL-friendly id for a parsed Measure or Mark. Single
+   * monotonically increasing global counter formatted as lowercase hex (no
+   * prefix, no zero-padding). For typical traces (<1M events) ids stay
+   * ≤ 5 characters, which keeps deep-link URLs short enough to paste into
+   * bug reports without wrapping.
+   */
+  private _nextId(): string {
     this._idCounter += 1
-    return `${prefix}-${this._idCounter}`
+    return this._idCounter.toString(16)
   }
 }
 
@@ -840,18 +877,159 @@ function isIdleStack(stack: CpuNode[]): boolean {
 
 /**
  * Linear-time search for the deepest existing Measure whose time range
- * covers `ts`. Used to pick the X-slice a synthesized JS-frame subtree
- * should attach under. Measures at this point are unsorted (finalize
- * happens later), so we do a naive descent; the tree is shallow enough on
- * real traces that the cost is negligible next to parse.
+ * covers `ts`, plus the chain of ancestors from root to that leaf. Used by
+ * {@link attachJsRoot} so we can walk up from the deepest start-containing
+ * Measure to find one whose bounds also cover the JS root's end.
+ *
+ * Measures at this point are unsorted (finalize happens later), so we do a
+ * naive descent; the tree is shallow enough on real traces that the cost
+ * is negligible next to parse.
+ *
+ * Returns the chain root → deepest. Empty array means no existing Measure
+ * contains `ts` at all.
  */
-function findDeepestContaining(measures: Measure[], ts: number): Measure | null {
+function findAncestorChain(measures: Measure[], ts: number): Measure[] {
   for (const m of measures) {
     if (ts < m.start || ts > m.end) continue
-    const deeper = findDeepestContaining(m.measures, ts)
-    return deeper ?? m
+    const deeper = findAncestorChain(m.measures, ts)
+    if (deeper.length > 0) return [m, ...deeper]
+    return [m]
   }
-  return null
+  return []
+}
+
+/**
+ * Stitch `jsRoot` into `rootMeasures`, clipping its subtree and re-parenting
+ * any pre-existing host children whose bounds fall within the JS root's
+ * span. See {@link ChromeParser._attachJsFramesForThread} for the rationale.
+ *
+ * `parent` is `null` when the host is the track root; otherwise it's the
+ * Measure whose `measures` array receives `jsRoot`.
+ */
+function attachJsRoot(rootMeasures: Measure[], jsRoot: Measure): void {
+  const chain = findAncestorChain(rootMeasures, jsRoot.start)
+
+  // Pick the innermost ancestor whose bounds also cover jsRoot.end. If
+  // none does (sampler tail extends past every ancestor), fall back to the
+  // deepest start-containing Measure and clip.
+  let hostChildren: Measure[] = rootMeasures
+  let hostEnd = Number.POSITIVE_INFINITY
+  let hostStart = Number.NEGATIVE_INFINITY
+  for (let i = chain.length - 1; i >= 0; i--) {
+    const ancestor = chain[i]
+    if (ancestor.end >= jsRoot.end) {
+      hostChildren = ancestor.measures
+      hostEnd = ancestor.end
+      hostStart = ancestor.start
+      break
+    }
+    if (i === 0) {
+      // No ancestor fully contains the JS root. Use the deepest
+      // start-containing Measure as the host and clip.
+      const deepest = chain[chain.length - 1]
+      hostChildren = deepest.measures
+      hostEnd = deepest.end
+      hostStart = deepest.start
+    }
+  }
+
+  // Clip the JS subtree's bounds so no descendant escapes the host. The
+  // jsRoot itself gets clipped too in case of tail overshoot.
+  clipSubtreeToBounds(jsRoot, hostStart, hostEnd)
+
+  // Re-parent any pre-existing host children whose bounds fall inside the
+  // (clipped) JS root's span. Those were logged while the JS function was
+  // on the stack and belong as descendants of the JS frame, not peers.
+  // For each sibling, descend into the JS subtree and attach at the
+  // deepest JS descendant whose bounds still contain it — otherwise a
+  // sibling that fires inside (say) `flushPassiveEffects` ends up as a
+  // peer of `flushPassiveEffects` rather than a child, reintroducing the
+  // same same-depth overlap we just fixed at the host level.
+  const remaining: Measure[] = []
+  const reparented: Measure[] = []
+  for (const existing of hostChildren) {
+    if (existing.start >= jsRoot.start && existing.end <= jsRoot.end) {
+      reparented.push(existing)
+    } else {
+      remaining.push(existing)
+    }
+  }
+  for (const r of reparented) {
+    attachUnderDeepestJsDescendant(jsRoot, r)
+  }
+
+  // Mutate in place: hostChildren is a live reference to either a
+  // Measure.measures array or the track's rootMeasures.
+  hostChildren.length = 0
+  for (const r of remaining) hostChildren.push(r)
+  hostChildren.push(jsRoot)
+}
+
+/**
+ * Walk down `parent.measures` and attach `sibling` at the deepest JS
+ * descendant whose bounds fully contain `sibling`'s bounds. This mirrors
+ * the DevTools semantic where `v8::Debugger::*` / `V8Console::*` events
+ * nest under whatever JS function was on the call stack when they fired.
+ *
+ * When no descendant fully contains the sibling (i.e. the sibling
+ * straddles two JS sub-frames — e.g. the debugger hook started during
+ * `fooA` but the sampler closed `fooA` and opened `fooB` mid-call), pick
+ * the descendant with the largest time overlap, clip the sibling to that
+ * descendant's bounds (plus clip the sibling's own subtree), and descend
+ * into it. Straddling without clipping reintroduces same-depth overlap at
+ * the parent level, which is exactly what broke the mint-vs-gray bleed in
+ * the first place.
+ */
+function attachUnderDeepestJsDescendant(parent: Measure, sibling: Measure): void {
+  for (const child of parent.measures) {
+    if (sibling.start >= child.start && sibling.end <= child.end) {
+      attachUnderDeepestJsDescendant(child, sibling)
+      return
+    }
+  }
+  let best: Measure | null = null
+  let bestOverlap = 0
+  for (const child of parent.measures) {
+    const lo = Math.max(sibling.start, child.start)
+    const hi = Math.min(sibling.end, child.end)
+    const overlap = hi - lo
+    if (overlap > bestOverlap) {
+      bestOverlap = overlap
+      best = child
+    }
+  }
+  if (best) {
+    if (sibling.start < best.start) sibling.start = best.start
+    if (sibling.end > best.end) sibling.end = best.end
+    clipSubtreeToBounds(sibling, sibling.start, sibling.end)
+    attachUnderDeepestJsDescendant(best, sibling)
+    return
+  }
+  parent.measures.push(sibling)
+}
+
+/**
+ * Recursively clip a Measure and every descendant so their bounds stay
+ * within `[minStart, maxEnd]`. Clipping only narrows `start`/`end`; a
+ * Measure whose bounds would collapse (start >= end after clipping) is
+ * dropped from its parent. The clipping is parent-anchored, so children
+ * that escape a freshly-clipped parent are re-clipped on the recursive
+ * call.
+ */
+function clipSubtreeToBounds(m: Measure, minStart: number, maxEnd: number): void {
+  if (m.start < minStart) m.start = minStart
+  if (m.end > maxEnd) m.end = maxEnd
+  if (m.measures.length === 0) return
+  const kept: Measure[] = []
+  for (const child of m.measures) {
+    if (child.end <= m.start || child.start >= m.end) continue
+    clipSubtreeToBounds(child, m.start, m.end)
+    if (child.start < child.end) kept.push(child)
+  }
+  if (kept.length !== m.measures.length) {
+    m.measures.length = 0
+    for (const c of kept) m.measures.push(c)
+  }
 }
 
 /**

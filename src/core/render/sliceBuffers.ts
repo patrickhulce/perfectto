@@ -37,6 +37,15 @@ export interface SliceBuffers {
    * scrolls past any of its children's start times.
    */
   maxEndsPrefix: Float32Array
+  /**
+   * Direct parent's end time in ms, per slice. Depth-0 slices use their
+   * own `ends[i]` as a sentinel (they have no flame-chart parent). The
+   * mipmap uses this as a parent-identity key so it won't merge two
+   * same-depth siblings that live under different parents into a single
+   * wide bucket — which would otherwise render a rect that visually
+   * "bridges" two parents.
+   */
+  parentEnds: Float32Array
 }
 
 /** Same shape as {@link SliceBuffers} but keyed on a single `time` per mark. */
@@ -60,6 +69,7 @@ export const EMPTY_SLICE_BUFFERS: SliceBuffers = {
   colors: EMPTY_U32,
   measures: [],
   maxEndsPrefix: EMPTY_F32,
+  parentEnds: EMPTY_F32,
 }
 
 export const EMPTY_MARK_BUFFERS: MarkBuffers = {
@@ -85,20 +95,36 @@ export function buildSliceBuffers(root: TimelineContainer): SliceBuffers {
   const depths = new Uint16Array(total)
   const colors = new Uint32Array(total)
   const measures = new Array<Measure>(total)
+  // Direct parent's end time per slice, used by the mipmap as a
+  // parent-identity key. Depth-0 roots all share a single sentinel (0)
+  // because they're all peers under the track itself; refusing to merge
+  // them would over-split rows that have no flame-chart parent. Depth-1+
+  // slices store their direct ancestor's F32-rounded `end`, which is
+  // byte-identical across every child of that ancestor.
+  const parentEnds = new Float32Array(total)
+  const PARENT_END_ROOT = 0
 
   let i = 0
-  const visit = (container: TimelineContainer, depth: number): void => {
+  const visit = (
+    container: TimelineContainer,
+    depth: number,
+    parentEnd: number,
+  ): void => {
     for (const m of container.measures) {
       starts[i] = m.start
       ends[i] = m.end
       depths[i] = depth > 0xffff ? 0xffff : depth
       colors[i] = packColor(m.color, DEFAULT_MEASURE_COLOR)
       measures[i] = m
+      parentEnds[i] = parentEnd
       i += 1
-      if (m.measures.length > 0) visit(m, depth + 1)
+      // Pass `ends[i-1]` (F32-rounded, exactly as it will appear in any
+      // sibling's parentEnds slot) so every child of this measure stores
+      // the identical key.
+      if (m.measures.length > 0) visit(m, depth + 1, ends[i - 1])
     }
   }
-  visit(root, 0)
+  visit(root, 0, PARENT_END_ROOT)
 
   const maxEndsPrefix = new Float32Array(i)
   let running = -Infinity
@@ -108,7 +134,16 @@ export function buildSliceBuffers(root: TimelineContainer): SliceBuffers {
     maxEndsPrefix[k] = running
   }
 
-  return {count: i, starts, ends, depths, colors, measures, maxEndsPrefix}
+  return {
+    count: i,
+    starts,
+    ends,
+    depths,
+    colors,
+    measures,
+    maxEndsPrefix,
+    parentEnds,
+  }
 }
 
 /**
@@ -342,6 +377,7 @@ function buildMipmapLevel(
   const starts = base.starts
   const ends = base.ends
   const colors = base.colors
+  const parentEnds = base.parentEnds
 
   // Worst case: no merges happen at this level and we emit base.count buckets.
   // We allocate tight arrays at the end from the final count.
@@ -364,6 +400,11 @@ function buildMipmapLevel(
     let bCount = 0
     let bSourceStart = 0
     let bDominantDur = -1
+    // Parent-identity key of the currently open bucket. Only slices that
+    // share this key may extend the bucket — otherwise two same-depth
+    // siblings under different parents would be collapsed into one wide
+    // rect that visually "bridges" two parents.
+    let bParentEnd = 0
 
     const flush = (): void => {
       if (!bucketOpen) return
@@ -382,6 +423,7 @@ function buildMipmapLevel(
       const s = starts[i]
       const e = ends[i]
       const width = e - s
+      const parentEnd = parentEnds[i]
 
       if (width >= resolutionMs) {
         // Wide slice: flush any open merged bucket, then emit this slice as a
@@ -396,7 +438,11 @@ function buildMipmapLevel(
         continue
       }
 
-      if (bucketOpen && s - bEnd < resolutionMs) {
+      if (
+        bucketOpen &&
+        s - bEnd < resolutionMs &&
+        parentEnd === bParentEnd
+      ) {
         if (e > bEnd) bEnd = e
         bCount += 1
         if (width > bDominantDur) {
@@ -412,6 +458,7 @@ function buildMipmapLevel(
         bCount = 1
         bSourceStart = i
         bDominantDur = width
+        bParentEnd = parentEnd
       }
     }
 

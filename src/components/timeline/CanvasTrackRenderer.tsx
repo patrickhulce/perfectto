@@ -5,8 +5,9 @@ import {
   EMPTY_SLICE_BUFFERS,
   pickMipmapLevel,
 } from '../../core/render/sliceBuffers'
-import {drawFrame} from './canvas2d'
+import {drawFrame, drawHighlightFrame} from './canvas2d'
 import type {ViewportStore} from './viewportStore'
+import type {SelectionStore} from './selectionStore'
 import {ROW_HEIGHT} from './trackLayout'
 import {isSkirtEnabled} from './skirtFlag'
 import {computeAxisTicks} from './timeAxis'
@@ -16,6 +17,13 @@ interface CanvasTrackRendererProps {
   heightPx: number
   labelWidthPx: number
   store: ViewportStore
+  /**
+   * Selection store consulted each frame to compute the tree-highlight
+   * region for this track. Hovered slice takes precedence over selected
+   * slice; both are scoped by `trackId` so a hover/click on one track
+   * doesn't cause every other track to repaint.
+   */
+  selectionStore: SelectionStore
   onToggle?: () => void
   expanded: boolean
 }
@@ -42,9 +50,12 @@ const SKIRT_FACTOR = 3
 const SKIRT_EDGE_THRESHOLD_FRACTION = 0.5
 
 /**
- * Snapshot of what the canvas currently has painted on it. Updated every
- * time we redraw; consulted every frame to decide between a cheap
- * `translateX` update and a full repaint.
+ * Snapshot of what the base canvas currently has painted on it. Updated
+ * every time we redraw the base; consulted every frame to decide between
+ * a cheap `translateX` update and a full repaint. The base canvas is
+ * selection-agnostic — dimming for the tree-highlight affordance lives
+ * entirely on the sibling overlay canvas (see {@link OverlayPaint}), so
+ * selection changes never invalidate this snapshot.
  */
 interface LoadedRange {
   /** `pxPerMs` the canvas was painted at. Any change forces a full redraw. */
@@ -65,6 +76,24 @@ interface LoadedRange {
 }
 
 /**
+ * Snapshot of what the overlay canvas currently has painted. Null when
+ * the overlay is empty (no highlight). We repaint the overlay whenever
+ * either the base anchor moves (so the drawn highlight keeps tracking
+ * its logical ms positions across skirt pans) or the highlight span
+ * itself changes, and we clear the canvas when the highlight goes away.
+ */
+interface OverlayPaint {
+  pxPerMs: number
+  scrollLeftAnchor: number
+  widthCss: number
+  heightCss: number
+  expanded: boolean
+  trackId: string
+  /** Stable string key for the currently painted highlight. */
+  highlightKey: string
+}
+
+/**
  * Per-track canvas. Owns a single `<canvas>` sized to the track's content
  * area (everything right of the sticky label), subscribes to the shared
  * `ViewportStore`, and repaints on RAF whenever pxPerMs / scrollLeft /
@@ -78,38 +107,91 @@ function CanvasTrackRendererBase({
   heightPx,
   labelWidthPx,
   store,
+  selectionStore,
   onToggle,
   expanded,
 }: CanvasTrackRendererProps) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null)
+  const overlayRef = useRef<HTMLCanvasElement | null>(null)
   const wrapperRef = useRef<HTMLDivElement | null>(null)
   const rafRef = useRef<number | null>(null)
 
   useEffect(() => {
     const canvas = canvasRef.current
+    const overlay = overlayRef.current
     const wrapper = wrapperRef.current
-    if (!canvas || !wrapper) return
+    if (!canvas || !overlay || !wrapper) return
     const ctx = canvas.getContext('2d')
-    if (!ctx) return
+    const overlayCtx = overlay.getContext('2d')
+    if (!ctx || !overlayCtx) return
 
     const skirtEnabled = isSkirtEnabled()
     let lastWrapperWidthCss = -1
 
     // Cache the last applied backing size so we skip the (somewhat
     // expensive) resize + `setTransform(dpr, ...)` work when nothing has
-    // changed about geometry. Tracks the canvas's actual pixel buffer
-    // dimensions, not the wrapper's.
+    // changed about geometry. Tracks both canvases' actual pixel buffer
+    // dimensions — they stay in lockstep so CSS-pixel draw coords align.
     let lastBackingWidthCss = -1
     let lastBackingHeightCss = -1
     let lastDpr = -1
-    /**
-     * What the canvas currently has painted. `null` means "must redraw" —
-     * either we haven't drawn yet, or geometry changed in a way the
-     * translate-only path can't handle.
-     */
     let loaded: LoadedRange | null = null
+    let overlayPainted: OverlayPaint | null = null
 
-    const fullRedraw = (
+    /**
+     * Resolve which (if any) slice on *this* track should drive the
+     * overlay's highlight draw. Hover wins over click-selection — if
+     * both exist at once the cursor is over the hover target, so it's
+     * the more immediate intent. Returns `undefined` when no slice on
+     * this track is active, which empties the overlay.
+     */
+    const currentHighlight = ():
+      | {startMs: number; endMs: number; minDepth: number}
+      | undefined => {
+      const sel = selectionStore.get()
+      const hl = sel.hoveredSlice ?? sel.selectedSlice
+      if (!hl || hl.trackId !== track.id) return undefined
+      return {startMs: hl.startMs, endMs: hl.endMs, minDepth: hl.depth}
+    }
+
+    const highlightKeyOf = (
+      hl: {startMs: number; endMs: number; minDepth: number} | undefined,
+    ): string =>
+      hl === undefined
+        ? ''
+        : `${hl.startMs}|${hl.endMs}|${hl.minDepth}`
+
+    /**
+     * Keep both canvases' backing stores identical. The overlay sits
+     * directly over the base and uses the same CSS-pixel coordinate
+     * space, so they must share width, height, and the DPR transform.
+     */
+    const resizeBackingStores = (
+      canvasWidthCss: number,
+      heightCss: number,
+    ): void => {
+      const dpr = window.devicePixelRatio || 1
+      if (
+        canvasWidthCss === lastBackingWidthCss &&
+        heightCss === lastBackingHeightCss &&
+        dpr === lastDpr
+      ) {
+        return
+      }
+      for (const c of [canvas, overlay]) {
+        c.style.width = `${canvasWidthCss}px`
+        c.style.height = `${heightCss}px`
+        c.width = Math.max(1, Math.round(canvasWidthCss * dpr))
+        c.height = Math.max(1, Math.round(heightCss * dpr))
+      }
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
+      overlayCtx.setTransform(dpr, 0, 0, dpr, 0, 0)
+      lastBackingWidthCss = canvasWidthCss
+      lastBackingHeightCss = heightCss
+      lastDpr = dpr
+    }
+
+    const fullRedrawBase = (
       contentWidthCss: number,
       heightCss: number,
       pxPerMs: number,
@@ -121,23 +203,7 @@ function CanvasTrackRendererBase({
       const canvasWidthCss = skirtEnabled
         ? contentWidthCss * SKIRT_FACTOR
         : contentWidthCss
-      const dpr = window.devicePixelRatio || 1
-
-      if (
-        canvasWidthCss !== lastBackingWidthCss ||
-        heightCss !== lastBackingHeightCss ||
-        dpr !== lastDpr
-      ) {
-        canvas.style.width = `${canvasWidthCss}px`
-        canvas.style.height = `${heightCss}px`
-        canvas.width = Math.max(1, Math.round(canvasWidthCss * dpr))
-        canvas.height = Math.max(1, Math.round(heightCss * dpr))
-        // setTransform so draw commands use CSS pixels regardless of dpr.
-        ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
-        lastBackingWidthCss = canvasWidthCss
-        lastBackingHeightCss = heightCss
-        lastDpr = dpr
-      }
+      resizeBackingStores(canvasWidthCss, heightCss)
 
       const state = store.get()
       const msAtCanvasLeft =
@@ -193,12 +259,59 @@ function CanvasTrackRendererBase({
         expanded,
         trackId: track.id,
       }
-      // Apply the matching translate so the drawn region aligns with the
-      // current scroll position. Outside skirt mode this is always 0
-      // (anchor = scrollLeft).
-      canvas.style.transform = `translateX(${
-        scrollLeftAnchor - state.scrollLeft
-      }px)`
+      // Moving the base anchor invalidates any previously painted
+      // overlay (its drawn coords were anchored to the old scrollLeft).
+      // Clearing forces the overlay repaint below.
+      overlayPainted = null
+    }
+
+    const redrawOverlay = (
+      pxPerMs: number,
+      scrollLeftAnchor: number,
+      canvasWidthCss: number,
+      heightCss: number,
+      highlight: ReturnType<typeof currentHighlight>,
+    ): void => {
+      if (!highlight) {
+        overlayCtx.clearRect(0, 0, canvasWidthCss, heightCss)
+        overlayPainted = null
+        return
+      }
+      const state = store.get()
+      const msAtCanvasLeft =
+        state.timelineStart + scrollLeftAnchor / pxPerMs
+      const visibleDurationMs = canvasWidthCss / pxPerMs
+      const slices = track.mipmap
+        ? pickMipmapLevel(track.mipmap, pxPerMs)
+        : track.buffers ?? EMPTY_SLICE_BUFFERS
+      const baseMeasures = track.mipmap
+        ? track.mipmap.base.measures
+        : track.buffers?.measures
+
+      drawHighlightFrame({
+        ctx: overlayCtx,
+        slices,
+        widthCss: canvasWidthCss,
+        heightCss,
+        rowHeight: ROW_HEIGHT,
+        pxPerMs,
+        visibleStartMs: msAtCanvasLeft,
+        visibleEndMs: msAtCanvasLeft + visibleDurationMs,
+        canvasStartMs: msAtCanvasLeft,
+        maxDepthExclusive: expanded ? Number.POSITIVE_INFINITY : 1,
+        baseMeasures,
+        highlight,
+      })
+
+      overlayPainted = {
+        pxPerMs,
+        scrollLeftAnchor,
+        widthCss: canvasWidthCss,
+        heightCss,
+        expanded,
+        trackId: track.id,
+        highlightKey: highlightKeyOf(highlight),
+      }
     }
 
     const render = (): void => {
@@ -206,9 +319,11 @@ function CanvasTrackRendererBase({
       const state = store.get()
       const pxPerMs = state.pxPerMs
       if (pxPerMs <= 0) {
-        // Parse not finished yet; clear and bail.
+        // Parse not finished yet; clear both canvases and bail.
         ctx.clearRect(0, 0, canvas.width, canvas.height)
+        overlayCtx.clearRect(0, 0, overlay.width, overlay.height)
         loaded = null
+        overlayPainted = null
         return
       }
       const contentWidthCss = Math.max(
@@ -228,35 +343,65 @@ function CanvasTrackRendererBase({
       const heightCss = heightPx
       const edgeThresholdPx = contentWidthCss * SKIRT_EDGE_THRESHOLD_FRACTION
 
-      // Decide between cheap translate and full redraw.
-      const mustRedraw =
+      // Base-canvas invalidation. Selection state deliberately does not
+      // appear here — the overlay handles that entirely.
+      const baseMustRedraw =
         !skirtEnabled ||
         loaded === null ||
         loaded.pxPerMs !== pxPerMs ||
         loaded.heightCss !== heightCss ||
         loaded.expanded !== expanded ||
         loaded.trackId !== track.id ||
-        // Approaching the left edge of the painted canvas.
         state.scrollLeft - loaded.scrollLeftAnchor < edgeThresholdPx ||
-        // Approaching the right edge of the painted canvas.
         loaded.scrollLeftAnchor + loaded.widthCss -
           (state.scrollLeft + contentWidthCss) <
           edgeThresholdPx
 
-      if (mustRedraw) {
+      if (baseMustRedraw) {
         // Recenter so we have one viewport of skirt on each side. Outside
         // skirt mode anchor === scrollLeft (no overdraw, no transform).
         const anchor = skirtEnabled
           ? state.scrollLeft - contentWidthCss
           : state.scrollLeft
-        fullRedraw(contentWidthCss, heightCss, pxPerMs, anchor)
-      } else if (loaded) {
-        // Cheap path: just slide the already-painted canvas. No fillRect
-        // calls, no clearRect, no React work — this is the whole point of
-        // the skirt.
-        canvas.style.transform = `translateX(${
-          loaded.scrollLeftAnchor - state.scrollLeft
-        }px)`
+        fullRedrawBase(contentWidthCss, heightCss, pxPerMs, anchor)
+      }
+
+      if (!loaded) return
+
+      // Both canvases always share the same transform so overlay content
+      // stays pinned to the same logical ms positions as the base rects
+      // underneath it. One write per frame, no layout.
+      const translate = `translateX(${
+        loaded.scrollLeftAnchor - state.scrollLeft
+      }px)`
+      canvas.style.transform = translate
+      overlay.style.transform = translate
+
+      // Overlay repaint decisions are orthogonal to the base's skirt
+      // logic: we repaint whenever the selection changes, whenever the
+      // base's anchor moves (which happens on zoom / skirt recenter),
+      // or when expansion / track identity flips. Content-drift-only
+      // scrolls (base translate, no redraw) leave the overlay
+      // untouched — its drawn rects are already anchored correctly.
+      const highlight = currentHighlight()
+      const highlightKey = highlightKeyOf(highlight)
+      const overlayMustRedraw =
+        overlayPainted === null ||
+        overlayPainted.pxPerMs !== loaded.pxPerMs ||
+        overlayPainted.scrollLeftAnchor !== loaded.scrollLeftAnchor ||
+        overlayPainted.widthCss !== loaded.widthCss ||
+        overlayPainted.heightCss !== loaded.heightCss ||
+        overlayPainted.expanded !== expanded ||
+        overlayPainted.trackId !== track.id ||
+        overlayPainted.highlightKey !== highlightKey
+      if (overlayMustRedraw) {
+        redrawOverlay(
+          loaded.pxPerMs,
+          loaded.scrollLeftAnchor,
+          loaded.widthCss,
+          loaded.heightCss,
+          highlight,
+        )
       }
     }
 
@@ -271,6 +416,12 @@ function CanvasTrackRendererBase({
     const unsubscribe = store.subscribe(() => {
       schedule()
     })
+    // Selection-store subscriptions are coalesced into the same RAF as
+    // viewport updates via `schedule()`, so rapid hover writes collapse
+    // to one repaint per frame — never one per pointermove.
+    const unsubscribeSelection = selectionStore.subscribe(() => {
+      schedule()
+    })
 
     const dprMedia =
       typeof window.matchMedia === 'function'
@@ -281,13 +432,14 @@ function CanvasTrackRendererBase({
 
     return () => {
       unsubscribe()
+      unsubscribeSelection()
       dprMedia?.removeEventListener?.('change', onDprChange)
       if (rafRef.current !== null) {
         cancelAnimationFrame(rafRef.current)
         rafRef.current = null
       }
     }
-  }, [track, store, heightPx, expanded])
+  }, [track, store, selectionStore, heightPx, expanded])
 
   const canToggle = !!onToggle
   // Screen-reader summary for the gutter button. The canvas is non-
@@ -330,9 +482,9 @@ function CanvasTrackRendererBase({
           left: 0,
           top: 0,
           // Above SelectionOverlay (z=1) so the yellow selection tint
-          // and hover highlight slide *behind* the label gutter when the
-          // user scrolls right, matching how the flame-chart canvas
-          // naturally tucks behind the sticky label column.
+          // slides *behind* the label gutter when the user scrolls
+          // right, matching how the flame-chart canvas naturally tucks
+          // behind the sticky label column.
           zIndex: 3,
           flexShrink: 0,
           width: labelWidthPx,
@@ -395,6 +547,32 @@ function CanvasTrackRendererBase({
             display: 'block',
             // willChange hints the compositor to keep this on its own
             // layer so translateX during pan never paints.
+            willChange: 'transform',
+            // Dimming for the tree-highlight affordance lives here as a
+            // CSS property: the full-opacity overlay canvas stacked on
+            // top will render the currently highlighted tree at 1.0,
+            // while everything drawn on this canvas sits at 0.75. This
+            // avoids the alpha-composition bugs the previous in-canvas
+            // dim pass kept running into.
+            opacity: 0.75,
+          }}
+        />
+        <canvas
+          ref={overlayRef}
+          data-testid="track-canvas-overlay"
+          className="pointer-events-none"
+          style={{
+            // Stacks directly over the base canvas. Shares the same
+            // CSS-pixel coordinate space and transform (applied each
+            // frame from the useEffect above), so rects painted here
+            // register against the underlying base rects pixel-for-
+            // pixel. Cleared + redrawn on every hover/selection
+            // change; untouched during skirt-translate pans.
+            position: 'absolute',
+            left: 0,
+            top: 0,
+            height: heightPx,
+            display: 'block',
             willChange: 'transform',
           }}
         />

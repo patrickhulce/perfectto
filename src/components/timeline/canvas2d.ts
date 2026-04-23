@@ -58,6 +58,39 @@ export interface DrawFrameArgs {
   minorGridTicksMs?: Float64Array
 }
 
+/**
+ * Inputs for the overlay canvas's highlight draw. Mirrors the per-frame
+ * subset of {@link DrawFrameArgs} that drives positioning (viewport, DPR-
+ * independent CSS geometry, mipmap level), plus the tree-highlight region
+ * the caller wants drawn on top at full opacity. Gridlines, marks, and
+ * non-highlighted slices all belong on the base canvas — this function
+ * only ever paints the anchor slice plus its pre-order descendants.
+ */
+export interface DrawHighlightFrameArgs {
+  ctx: CanvasRenderingContext2D
+  slices: SliceView
+  widthCss: number
+  heightCss: number
+  rowHeight: number
+  pxPerMs: number
+  visibleStartMs: number
+  visibleEndMs: number
+  canvasStartMs: number
+  maxDepthExclusive: number
+  baseMeasures?: Measure[]
+  /**
+   * Tree region to repaint at full opacity. Slices fully contained in
+   * `[startMs, endMs]` at `depth >= minDepth` are the pre-order
+   * descendants of the anchor (including the anchor itself).
+   */
+  highlight: {
+    startMs: number
+    endMs: number
+    /** Inclusive minimum depth; the anchor's own depth. */
+    minDepth: number
+  }
+}
+
 /** Vertical padding inside a row (mirrors the old DOM renderer). */
 const ROW_VPAD_PX = 4
 
@@ -82,33 +115,9 @@ const LABEL_COLOR = '#0b0f17'
 const LABEL_BASELINE: CanvasTextBaseline = 'middle'
 
 /**
- * Density alpha stops for merged mipmap buckets. Keyed on
- * `min(ALPHA_STOPS.length - 1, floor(log2(count)))`. Denser buckets render
- * *lighter* so hotspot density is legible against the dark UI without
- * producing an indistinguishable dark blob.
- *
- * Index 0 is the opaque stop — it's what singleton buckets and raw slices
- * get. Indices 1..4 are reserved for merged buckets where `count >= 2`.
- */
-const ALPHA_STOPS = [1.0, 0.75, 0.55, 0.4, 0.28] as const
-const ALPHA_OPAQUE = 0
-
-function quantizeAlpha(count: number): number {
-  if (count <= 1) return ALPHA_OPAQUE
-  // floor(log2(count)) clamped into [1, ALPHA_STOPS.length - 1].
-  let stop = 0
-  let c = count
-  while (c > 1 && stop < ALPHA_STOPS.length - 1) {
-    c >>>= 1
-    stop += 1
-  }
-  return stop
-}
-
-/**
- * Batched fillRect renderer. Groups slices by packed color AND density stop
- * so we only assign `ctx.fillStyle` once per (color, alpha) pair, which is
- * the dominant cost for large traces (setting fillStyle re-parses the color
+ * Batched fillRect renderer. Groups slices by packed color so we only
+ * assign `ctx.fillStyle` once per distinct color per frame, which is the
+ * dominant cost for large traces (setting fillStyle re-parses the color
  * every time).
  *
  * Complexity per frame: O(visible_slices), with visible_slices bounded by
@@ -183,6 +192,13 @@ export function drawFrame(args: DrawFrameArgs): void {
   // into a scratch buffer during the main loop instead of re-running the
   // culler. Collection is gated on `baseMeasures` being supplied AND the
   // bucket being a singleton wide enough to fit at least one glyph.
+  //
+  // Dimming for the tree-highlight affordance now lives OUTSIDE this
+  // function: the bottom canvas (which calls drawFrame) is CSS-dimmed to
+  // 0.75 via `opacity`, and a sibling overlay canvas renders the
+  // highlighted tree at full opacity on top (see drawHighlightFrame).
+  // This function is a straight single-pass renderer — no alpha
+  // manipulation, no containment predicate.
   const labelScratch = baseMeasures ? getScratchLabels() : null
   if (slices.count > 0) {
     // Binary-search the running-max-of-ends prefix to find the earliest
@@ -198,6 +214,9 @@ export function drawFrame(args: DrawFrameArgs): void {
       visibleStartMs,
     )
 
+    // One batch per distinct color — setting ctx.fillStyle is the dominant
+    // per-call cost in this path, so coalescing all rects of the same color
+    // into a single assignment is the win.
     const batches = getScratchBatches()
     const densityView = hasDensityCounts(slices) ? slices : null
     const counts = densityView?.counts
@@ -229,13 +248,10 @@ export function drawFrame(args: DrawFrameArgs): void {
       if (bucketCount === 1 && wCssRaw < 1) continue
       const wCss = wCssRaw < 1.5 ? 1 : wCssRaw
       const y = d * rowHeight + ROW_VPAD_PX / 2
-      const alphaStop = counts ? quantizeAlpha(bucketCount) : ALPHA_OPAQUE
-      // Pack (color, alphaStop) into one number so we can key a Map<number>
-      // without string concat per slice. 3 bits of alphaStop is plenty.
-      const batchKey = (colors[i] >>> 0) * 8 + alphaStop
+      const batchKey = colors[i] >>> 0
       let batch = batches.get(batchKey)
       if (!batch) {
-        batch = {x: [], y: [], w: [], h: [], color: colors[i], alphaStop}
+        batch = {x: [], y: [], w: [], h: [], color: colors[i]}
         batches.set(batchKey, batch)
       }
       batch.x.push(xCss)
@@ -266,7 +282,7 @@ export function drawFrame(args: DrawFrameArgs): void {
     }
 
     for (const batch of batches.values()) {
-      ctx.fillStyle = styleForBatch(batch.color, batch.alphaStop)
+      ctx.fillStyle = unpackColorToCss(batch.color)
       const len = batch.x.length
       for (let k = 0; k < len; k++) {
         ctx.fillRect(batch.x[k], batch.y[k], batch.w[k], batch.h[k])
@@ -296,10 +312,10 @@ export function drawFrame(args: DrawFrameArgs): void {
       const y = d * rowHeight + 2
       const h = rowHeight
       const color = mColors[i]
-      const batchKey = (color >>> 0) * 8 + ALPHA_OPAQUE
+      const batchKey = color >>> 0
       let batch = batches.get(batchKey)
       if (!batch) {
-        batch = {x: [], y: [], w: [], h: [], color, alphaStop: ALPHA_OPAQUE}
+        batch = {x: [], y: [], w: [], h: [], color}
         batches.set(batchKey, batch)
       }
       batch.x.push(xCss)
@@ -309,7 +325,7 @@ export function drawFrame(args: DrawFrameArgs): void {
     }
 
     for (const batch of batches.values()) {
-      ctx.fillStyle = styleForBatch(batch.color, batch.alphaStop)
+      ctx.fillStyle = unpackColorToCss(batch.color)
       const len = batch.x.length
       for (let k = 0; k < len; k++) {
         ctx.fillRect(batch.x[k], batch.y[k], batch.w[k], batch.h[k])
@@ -321,7 +337,9 @@ export function drawFrame(args: DrawFrameArgs): void {
   // Drawn after every fillRect pass so the glyphs sit on top of their
   // rects. One ctx.font / textBaseline / fillStyle assignment for the
   // whole pass — measureText and cropText results are cached across
-  // frames so wide traces don't re-shape strings every paint.
+  // frames so wide traces don't re-shape strings every paint. The
+  // canvas-wide CSS opacity (applied by CanvasTrackRenderer when no
+  // highlight is active) dims labels with their rects.
   if (labelScratch && labelScratch.length > 0) {
     ctx.font = LABEL_FONT
     ctx.textBaseline = LABEL_BASELINE
@@ -337,14 +355,169 @@ export function drawFrame(args: DrawFrameArgs): void {
   }
 }
 
-function styleForBatch(packedColor: number, alphaStop: number): string {
-  if (alphaStop === ALPHA_OPAQUE) return unpackColorToCss(packedColor)
-  const r = (packedColor >>> 24) & 0xff
-  const g = (packedColor >>> 16) & 0xff
-  const b = (packedColor >>> 8) & 0xff
-  const baseA = (packedColor & 0xff) / 255
-  const a = baseA * ALPHA_STOPS[alphaStop]
-  return `rgba(${r},${g},${b},${a.toFixed(3)})`
+/**
+ * Overlay draw. Clears `ctx` and paints only the slices whose span is
+ * fully contained in the highlight range at `depth >= minDepth` — i.e.
+ * the anchor slice plus its pre-order descendants. Runs on a separate
+ * canvas stacked over the (CSS-dimmed) base canvas, so the highlighted
+ * tree visually sits at full opacity against a 0.75-dimmed background.
+ *
+ * Gridlines, marks, non-highlighted slices, and the "dim" pass all live
+ * on the base canvas via {@link drawFrame}; this function owns none of
+ * them. Labels for wide singletons inside the tree are still emitted so
+ * they read at full opacity, matching the rects they sit on.
+ */
+export function drawHighlightFrame(args: DrawHighlightFrameArgs): void {
+  const {
+    ctx,
+    slices,
+    widthCss,
+    heightCss,
+    rowHeight,
+    pxPerMs,
+    visibleStartMs,
+    visibleEndMs,
+    canvasStartMs,
+    maxDepthExclusive,
+    baseMeasures,
+    highlight,
+  } = args
+
+  ctx.clearRect(0, 0, widthCss, heightCss)
+  if (pxPerMs <= 0 || slices.count === 0) return
+
+  // `starts[i]` / `ends[i]` come from Float32Arrays. The highlight
+  // bounds arrive as F64 doubles from the hovered / selected Measure.
+  // Snap them into F32 so the containment test compares values in a
+  // single precision regime. Without this:
+  //   - the anchor's own F32 `starts[anchorIdx]` can be microscopically
+  //     less than its F64 `startMs`, so `s >= hiStart` fails for the
+  //     anchor and the whole subtree drops out;
+  //   - an adjacent sibling whose F64 end sits past the anchor's F64
+  //     end still passes `e <= hiEnd` after F32 rounding, so a bar
+  //     spanning into the parent's region gets painted.
+  const hiStart = Math.fround(highlight.startMs)
+  const hiEnd = Math.fround(highlight.endMs)
+  const hiMinDepth = highlight.minDepth
+
+  const first = lowerBoundF32(
+    slices.maxEndsPrefix,
+    slices.count,
+    visibleStartMs,
+  )
+
+  const densityView = hasDensityCounts(slices) ? slices : null
+  const counts = densityView?.counts
+  const sourceStart = densityView?.sourceStart
+
+  const rowH = rowHeight - ROW_VPAD_PX
+  const starts = slices.starts
+  const ends = slices.ends
+  const depths = slices.depths
+  const colors = slices.colors
+  const count = slices.count
+  const labelScratch = baseMeasures ? getScratchLabels() : null
+
+  // Match the base's color-batching z-order, exactly. Here's why: the
+  // base's drawFrame groups rects by `colors[i]` and emits batches in
+  // first-seen-color order. The `Map.values()` iteration then paints
+  // all rects of the first-seen color, then the next, and so on. For a
+  // typical viewport this means broad ancestor categories (System,
+  // Other — gray) get seen early in the start-sorted scan and end up
+  // as the *first* batch — i.e. painted *first*, i.e. covered by later
+  // batches (mint, yellow…). The user sees solid-mint rows because
+  // mint is batched later than the greys underneath it.
+  //
+  // The overlay needs that same "gray behind mint" story. If we just
+  // iterated the hovered subtree in slice order, the first color to
+  // show up would be the anchor's color — whatever it happens to be —
+  // which flips the stack and lets tiny gray density buckets bleed
+  // through the middle of a wide mint parent bucket (the reported
+  // `performWorkUntilDeadline` bug).
+  //
+  // So we do a two-pass walk over the *same* visible-slice window the
+  // base sees. Pass 1 establishes the batch map and its insertion
+  // order using every visible slice (so the color order matches the
+  // base exactly). Pass 2 — actually, folded into the same loop — only
+  // pushes a rect when the slice also passes the containment filter.
+  // Empty batches are a no-op at emit time, so there's no wasted
+  // fillRect; only the first-seen-per-color key insertion costs
+  // anything for filtered-out slices.
+  const batches = getScratchBatches()
+
+  for (let i = first; i < count; i++) {
+    const s = starts[i]
+    if (s > visibleEndMs) break
+    const e = ends[i]
+    if (e < visibleStartMs) continue
+    const d = depths[i]
+    if (d >= maxDepthExclusive) continue
+
+    const color = colors[i] >>> 0
+    // Ensure the batch key is inserted the first time we see this
+    // color in the *visible* window — this is what makes the overlay's
+    // emit order match the base's. Done BEFORE the containment check.
+    let batch = batches.get(color)
+    if (!batch) {
+      batch = {x: [], y: [], w: [], h: [], color}
+      batches.set(color, batch)
+    }
+
+    if (s < hiStart || e > hiEnd || d < hiMinDepth) continue
+
+    const xCss = (s - canvasStartMs) * pxPerMs
+    const wCssRaw = (e - s) * pxPerMs
+    const bucketCount = counts ? counts[i] : 1
+    if (bucketCount === 1 && wCssRaw < 1) continue
+    const wCss = wCssRaw < 1.5 ? 1 : wCssRaw
+    const y = d * rowHeight + ROW_VPAD_PX / 2
+    batch.x.push(xCss)
+    batch.y.push(y)
+    batch.w.push(wCss)
+    batch.h.push(rowH)
+
+    if (
+      labelScratch &&
+      bucketCount === 1 &&
+      wCss >= LABEL_MIN_WIDTH_PX &&
+      baseMeasures
+    ) {
+      const baseIdx = sourceStart ? sourceStart[i] : i
+      const measure = baseMeasures[baseIdx]
+      if (measure !== undefined) {
+        labelScratch.push({
+          x: xCss,
+          y: y + rowH / 2,
+          w: wCss,
+          h: rowH,
+          name: measure.name,
+        })
+      }
+    }
+  }
+
+  for (const batch of batches.values()) {
+    if (batch.x.length === 0) continue
+    ctx.fillStyle = unpackColorToCss(batch.color)
+    const len = batch.x.length
+    for (let k = 0; k < len; k++) {
+      ctx.fillRect(batch.x[k], batch.y[k], batch.w[k], batch.h[k])
+    }
+  }
+
+  if (labelScratch && labelScratch.length > 0) {
+    ctx.font = LABEL_FONT
+    ctx.textBaseline = LABEL_BASELINE
+    ctx.fillStyle = LABEL_COLOR
+    for (let i = 0; i < labelScratch.length; i++) {
+      const item = labelScratch[i]
+      const avail = item.w - 2 * LABEL_PAD_PX
+      if (avail <= 0) continue
+      const text = cropText(ctx, item.name, avail)
+      if (text.length === 0) continue
+      ctx.fillText(text, item.x + LABEL_PAD_PX, item.y)
+    }
+  }
 }
 
 interface Batch {
@@ -352,8 +525,8 @@ interface Batch {
   y: number[]
   w: number[]
   h: number[]
+  /** Packed `0xRRGGBBAA` of the batch — one batch per distinct color. */
   color: number
-  alphaStop: number
 }
 
 // A single renderer only draws on the main thread, so a module-level scratch
@@ -445,9 +618,6 @@ function cropText(
 
 // Visible for tests.
 export const __test__ = {
-  quantizeAlpha,
-  ALPHA_STOPS,
-  styleForBatch,
   cropText,
   measureCache,
   cropCache,

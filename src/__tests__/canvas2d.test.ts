@@ -1,5 +1,5 @@
 import type {Measure, Track} from '../core'
-import {drawFrame, __test__} from '../components/timeline/canvas2d'
+import {drawFrame, drawHighlightFrame, __test__} from '../components/timeline/canvas2d'
 import {
   EMPTY_MARK_BUFFERS,
   buildSliceBuffers,
@@ -14,26 +14,6 @@ function m(id: string, start: number, end: number, children: Measure[] = [], col
 function track(measures: Measure[]): Track {
   return {id: 't', name: 't', marks: [], measures}
 }
-
-describe('quantizeAlpha', () => {
-  const {quantizeAlpha, ALPHA_STOPS} = __test__
-
-  it('maps singletons to the opaque stop', () => {
-    expect(quantizeAlpha(1)).toBe(0)
-    expect(quantizeAlpha(0)).toBe(0)
-  })
-
-  it('monotonically assigns denser buckets to later stops', () => {
-    const stops = [2, 4, 8, 16, 64, 1024].map(quantizeAlpha)
-    for (let i = 1; i < stops.length; i++) {
-      expect(stops[i]).toBeGreaterThanOrEqual(stops[i - 1])
-    }
-  })
-
-  it('saturates at the last stop for very dense buckets', () => {
-    expect(quantizeAlpha(10_000)).toBe(ALPHA_STOPS.length - 1)
-  })
-})
 
 describe('cropText', () => {
   const {cropText, measureCache, cropCache} = __test__
@@ -91,19 +71,6 @@ describe('cropText', () => {
   })
 })
 
-describe('styleForBatch', () => {
-  const {styleForBatch} = __test__
-
-  it('returns an opaque rgb() string at the opaque stop', () => {
-    expect(styleForBatch(0xff0000ff, 0)).toBe('rgb(255,0,0)')
-  })
-
-  it('applies fractional alpha for merged buckets', () => {
-    const css = styleForBatch(0xff0000ff, 1)
-    expect(css).toMatch(/^rgba\(255,0,0,0\./)
-  })
-})
-
 describe('drawFrame', () => {
   interface FillRectCall {
     x: number
@@ -157,9 +124,12 @@ describe('drawFrame', () => {
     expect(fills[0].fillStyle).toBe('rgb(255,0,0)')
   })
 
-  it('batches by (color, alphaStop) and applies density alpha to merged buckets', () => {
+  it('paints merged buckets at the same opaque color as singletons (alpha lives on globalAlpha)', () => {
     // Dense sub-pixel run — everything merges into one bucket at the finest
-    // level, so we should see exactly one fillRect with a fractional alpha.
+    // level. After the dim-flatten change the bucket renders with the base
+    // rgb(...) color (no fractional alpha in fillStyle); the dim factor
+    // rides on globalAlpha instead, so rows of singletons + merged buckets
+    // don't band.
     const children: Measure[] = []
     for (let i = 0; i < 50; i++) {
       children.push(m(`s${i}`, i * 0.01, i * 0.01 + 0.005, [], '#ff0000'))
@@ -186,7 +156,7 @@ describe('drawFrame', () => {
       maxDepthExclusive: Infinity,
     })
     expect(fills.length).toBe(1)
-    expect(fills[0].fillStyle).toMatch(/^rgba\(255,0,0,0\./)
+    expect(fills[0].fillStyle).toBe('rgb(255,0,0)')
     // Only one distinct fillStyle was assigned (no per-slice churn).
     expect(fillStyleAssignments.length).toBe(1)
   })
@@ -387,6 +357,259 @@ describe('drawFrame', () => {
       maxDepthExclusive: Infinity,
     })
     expect(fills.length).toBeGreaterThan(0)
+  })
+})
+
+describe('drawHighlightFrame', () => {
+  // Minimal ctx that records clearRect + fillRect geometry. The overlay
+  // path never touches globalAlpha or font state, so we can stay lean.
+  interface FillRectCall {
+    x: number
+    y: number
+    w: number
+    h: number
+    fillStyle: string
+  }
+  function makeOverlayCtx(): {
+    ctx: CanvasRenderingContext2D
+    fills: FillRectCall[]
+    fillTextCalls: Array<{text: string; x: number; y: number}>
+    clears: Array<{x: number; y: number; w: number; h: number}>
+  } {
+    const fills: FillRectCall[] = []
+    const fillTextCalls: Array<{text: string; x: number; y: number}> = []
+    const clears: Array<{x: number; y: number; w: number; h: number}> = []
+    let fillStyle = ''
+    const ctx = {
+      get fillStyle() {
+        return fillStyle
+      },
+      set fillStyle(v: string) {
+        fillStyle = v
+      },
+      set font(_v: string) {},
+      set textBaseline(_v: CanvasTextBaseline) {},
+      clearRect: (x: number, y: number, w: number, h: number): void => {
+        clears.push({x, y, w, h})
+      },
+      fillRect: (x: number, y: number, w: number, h: number): void => {
+        fills.push({x, y, w, h, fillStyle})
+      },
+      fillText: (text: string, x: number, y: number): void => {
+        fillTextCalls.push({text, x, y})
+      },
+      measureText: (s: string) => ({width: s.length * 7}) as TextMetrics,
+    } as unknown as CanvasRenderingContext2D
+    return {ctx, fills, fillTextCalls, clears}
+  }
+
+  it('clears the target canvas on every call', () => {
+    const base = buildSliceBuffers(track([m('a', 0, 100, [], '#ff0000')]))
+    const {ctx, clears} = makeOverlayCtx()
+    drawHighlightFrame({
+      ctx,
+      slices: base,
+      widthCss: 200,
+      heightCss: 20,
+      rowHeight: 20,
+      pxPerMs: 2,
+      visibleStartMs: 0,
+      visibleEndMs: 100,
+      canvasStartMs: 0,
+      maxDepthExclusive: Infinity,
+      highlight: {startMs: 0, endMs: 100, minDepth: 0},
+    })
+    expect(clears.length).toBe(1)
+    expect(clears[0]).toEqual({x: 0, y: 0, w: 200, h: 20})
+  })
+
+  it('paints only slices fully inside the highlight span at depth >= minDepth', () => {
+    // Tree: parent p [0,100], children c1 [10,30], c2 [40,90],
+    // grandchild g [50,80]. Highlight c2 → only c2 + g should paint.
+    const g = m('g', 50, 80)
+    const c1 = m('c1', 10, 30)
+    const c2 = m('c2', 40, 90, [g])
+    const p = m('p', 0, 100, [c1, c2])
+    const base = buildSliceBuffers(track([p]))
+
+    const {ctx, fills} = makeOverlayCtx()
+    drawHighlightFrame({
+      ctx,
+      slices: base,
+      widthCss: 400,
+      heightCss: 80,
+      rowHeight: 20,
+      pxPerMs: 2,
+      visibleStartMs: 0,
+      visibleEndMs: 100,
+      canvasStartMs: 0,
+      maxDepthExclusive: Infinity,
+      highlight: {startMs: 40, endMs: 90, minDepth: 1},
+    })
+
+    expect(fills.length).toBe(2)
+    const xs = fills.map(f => f.x).sort((a, b) => a - b)
+    expect(xs).toEqual([80, 100])
+  })
+
+  it('respects F32 snapping so the anchor and its descendants are included', () => {
+    // Same setup as the old "F32 snapping" regression test, but now
+    // scoped to drawHighlightFrame.
+    const anchorEnd = 0.3
+    expect(Math.fround(anchorEnd)).toBeGreaterThan(anchorEnd)
+    const child = m('child', 0.1, 0.2)
+    const anchor = m('anchor', 0, anchorEnd, [child])
+    const buffers = buildSliceBuffers(track([anchor]))
+
+    const {ctx, fills} = makeOverlayCtx()
+    drawHighlightFrame({
+      ctx,
+      slices: buffers,
+      widthCss: 400,
+      heightCss: 40,
+      rowHeight: 20,
+      pxPerMs: 1000,
+      visibleStartMs: 0,
+      visibleEndMs: 1,
+      canvasStartMs: 0,
+      maxDepthExclusive: Infinity,
+      highlight: {
+        startMs: anchor.start,
+        endMs: anchor.end,
+        minDepth: 0,
+      },
+    })
+    expect(fills.length).toBe(2)
+  })
+
+  it('emits no fillRects when the highlight span lies outside the viewport', () => {
+    const base = buildSliceBuffers(track([m('a', 0, 100, [], '#ff0000')]))
+    const {ctx, fills, clears} = makeOverlayCtx()
+    drawHighlightFrame({
+      ctx,
+      slices: base,
+      widthCss: 200,
+      heightCss: 20,
+      rowHeight: 20,
+      pxPerMs: 2,
+      visibleStartMs: 500,
+      visibleEndMs: 600,
+      canvasStartMs: 500,
+      maxDepthExclusive: Infinity,
+      highlight: {startMs: 0, endMs: 100, minDepth: 0},
+    })
+    // We still clear (so a stale previous highlight never lingers), but
+    // no rects land in the visible region.
+    expect(clears.length).toBe(1)
+    expect(fills.length).toBe(0)
+  })
+
+  it('emits labels for wide singletons inside the highlight tree', () => {
+    const anchor = m('myAnchor', 0, 100)
+    const base = buildSliceBuffers(track([anchor]))
+    const {ctx, fillTextCalls} = makeOverlayCtx()
+    drawHighlightFrame({
+      ctx,
+      slices: base,
+      widthCss: 400,
+      heightCss: 20,
+      rowHeight: 22,
+      pxPerMs: 2,
+      visibleStartMs: 0,
+      visibleEndMs: 100,
+      canvasStartMs: 0,
+      maxDepthExclusive: Infinity,
+      baseMeasures: base.measures,
+      highlight: {startMs: 0, endMs: 100, minDepth: 0},
+    })
+    expect(fillTextCalls.length).toBe(1)
+    expect(fillTextCalls[0].text).toBe('myAnchor')
+  })
+
+  it('matches the base renderer\'s batch-insertion order so same-depth overlaps stack identically', () => {
+    // Regression for the `performWorkUntilDeadline` hover bug: the
+    // overlay used to emit rects either in color-batched order (pre-
+    // change) or in strict iteration order (the first attempted fix).
+    // Both produced a z-order that disagreed with the base — letting
+    // narrow gray density buckets bleed through the middle of a wide
+    // mint userScript bucket that sits underneath them in the base
+    // canvas.
+    //
+    // The correct contract is: the overlay's emit order must equal the
+    // base's emit order. The base batches by color and emits batches
+    // in first-seen-color-in-visible-window order. So the overlay has
+    // to seed its batch map from the same visible window (not just the
+    // hovered tree) so the color insertion order matches, then only
+    // actually push rects for slices in the tree.
+    //
+    // Setup: depth-0 row with four "slices":
+    //   A @ [0, 40]   color #ff0000 (red)    — outside tree (anchor context)
+    //   H @ [50, 200] color #00ff00 (green)  — the hovered anchor, mint stand-in
+    //   X @ [60, 80]  color #0000ff (blue)   — inside tree, a different color
+    //   Y @ [100, 120] color #ff0000 (red)   — inside tree, same color as A
+    //
+    // The visible window includes A (outside tree). A's red color gets
+    // inserted into the batch map FIRST even though A itself is not
+    // emitted. That means red batches render before green which
+    // renders before blue. Inside the tree only H, X, Y exist —
+    // emission order: red (Y), green (H), blue (X). So Y (red) paints
+    // first, then H (green) second covering Y's area, then X (blue)
+    // last on top.
+    const rawMeasures: Measure[] = [
+      m('A', 0, 40, [], '#ff0000'),
+      m('H', 50, 200, [m('X', 60, 80, [], '#0000ff'), m('Y', 100, 120, [], '#ff0000')], '#00ff00'),
+    ]
+    const base = buildSliceBuffers(track(rawMeasures))
+
+    const {ctx, fills} = makeOverlayCtx()
+    drawHighlightFrame({
+      ctx,
+      slices: base,
+      widthCss: 400,
+      heightCss: 60,
+      rowHeight: 20,
+      pxPerMs: 1,
+      visibleStartMs: 0,
+      visibleEndMs: 200,
+      canvasStartMs: 0,
+      maxDepthExclusive: Infinity,
+      highlight: {startMs: 50, endMs: 200, minDepth: 0},
+    })
+
+    // A is outside the tree; H, X, Y are inside. Three rects emitted.
+    expect(fills.length).toBe(3)
+    // Batch order seeded by the visible window: red (from A) → green
+    // (from H) → blue (from X). Emission follows batch order.
+    // In that order: Y (red), H (green), X (blue).
+    expect(fills[0]).toMatchObject({fillStyle: 'rgb(255,0,0)', x: 100}) // Y
+    expect(fills[1]).toMatchObject({fillStyle: 'rgb(0,255,0)', x: 50}) // H
+    expect(fills[2]).toMatchObject({fillStyle: 'rgb(0,0,255)', x: 60}) // X
+  })
+
+  it('skips depths below minDepth', () => {
+    // Parent at depth 0 is excluded because the highlight anchor is its
+    // child at depth 1. The child + grandchild are still fully inside
+    // the highlight span and must paint.
+    const g = m('g', 50, 80)
+    const c2 = m('c2', 40, 90, [g])
+    const p = m('p', 0, 100, [c2])
+    const base = buildSliceBuffers(track([p]))
+
+    const {ctx, fills} = makeOverlayCtx()
+    drawHighlightFrame({
+      ctx,
+      slices: base,
+      widthCss: 400,
+      heightCss: 80,
+      rowHeight: 20,
+      pxPerMs: 2,
+      visibleStartMs: 0,
+      visibleEndMs: 100,
+      canvasStartMs: 0,
+      maxDepthExclusive: Infinity,
+      highlight: {startMs: 40, endMs: 90, minDepth: 1},
+    })
+    expect(fills.length).toBe(2)
   })
 })
 

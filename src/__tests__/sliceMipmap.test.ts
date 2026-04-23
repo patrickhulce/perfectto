@@ -175,6 +175,63 @@ describe('buildSliceMipmap', () => {
     expect(finest.counts[0]).toBe(6)
     expect(finest.colors[0] >>> 0).toBe(0x0000ffff)
   })
+
+  it('refuses to merge same-depth siblings across parent boundaries', () => {
+    // Two depth-0 parents, each with a pair of close sub-resolution
+    // children at depth 1. Without parent-aware merging the two pairs'
+    // time proximity (child of P1 ends at 0.2, child of P2 starts at
+    // 0.35 → gap 0.15 < resolutionMs 0.5) would collapse them into one
+    // bucket spanning [0, 0.5] that visually bridges both parents.
+    // With parent-aware merging the level must emit two depth-1
+    // buckets, one per parent.
+    const p1Children = [
+      m('p1a', 0.0, 0.1),
+      m('p1b', 0.15, 0.2),
+    ]
+    const p2Children = [
+      m('p2a', 0.35, 0.4),
+      m('p2b', 0.45, 0.5),
+    ]
+    const p1 = m('p1', 0, 0.3, p1Children)
+    const p2 = m('p2', 0.3, 0.6, p2Children)
+    const base = buildSliceBuffers(track([p1, p2]))
+    const mm = buildSliceMipmap(base)
+    const finest = mm.levels[0]
+    const depthOneBuckets: Array<{s: number; e: number; cnt: number}> = []
+    for (let i = 0; i < finest.count; i++) {
+      if (finest.depths[i] === 1) {
+        depthOneBuckets.push({
+          s: finest.starts[i],
+          e: finest.ends[i],
+          cnt: finest.counts[i],
+        })
+      }
+    }
+    expect(depthOneBuckets.length).toBe(2)
+    // Both merged buckets must live inside their own parent's span; no
+    // bucket may cross the P1→P2 boundary at t=0.3.
+    for (const b of depthOneBuckets) {
+      const spansBoundary = b.s < 0.3 && b.e > 0.3
+      expect(spansBoundary).toBe(false)
+    }
+  })
+
+  it('still merges same-depth siblings that share a parent', () => {
+    // Regression guard: if the parent-end key were off (e.g. F32
+    // precision mismatch) we'd accidentally split every child into its
+    // own bucket. Ensure two sub-resolution children under the same
+    // parent still collapse to a single merged bucket.
+    const kids = [m('a', 0.0, 0.05), m('b', 0.1, 0.15)]
+    const parent = m('parent', 0, 1, kids)
+    const base = buildSliceBuffers(track([parent]))
+    const mm = buildSliceMipmap(base)
+    const finest = mm.levels[0]
+    const depthOneBuckets: number[] = []
+    for (let i = 0; i < finest.count; i++) {
+      if (finest.depths[i] === 1) depthOneBuckets.push(finest.counts[i])
+    }
+    expect(depthOneBuckets).toEqual([2])
+  })
 })
 
 describe('pickMipmapLevel', () => {

@@ -8,11 +8,12 @@ import {useTimelineHover, type HoverTrackLayout} from './timeline/useTimelineHov
 import {useTimelineSelection} from './timeline/useTimelineSelection'
 import {containerDepth, ROW_HEIGHT} from './timeline/trackLayout'
 import {createViewportStore} from './timeline/viewportStore'
-import {createSelectionStore, type SelectionStore} from './timeline/selectionStore'
+import {createSelectionStore, type SelectionStore, type SliceRef} from './timeline/selectionStore'
 import type {InputBindingsStore} from './timeline/inputBindingsStore'
 import TimelineAxis, {TIMELINE_AXIS_HEIGHT_PX} from './timeline/TimelineAxis'
 import TimelineOverview, {TIMELINE_OVERVIEW_HEIGHT_PX} from './timeline/TimelineOverview'
 import SelectionOverlay from './timeline/SelectionOverlay'
+import type {InitialView} from './timeline/urlParams'
 
 interface TimelineProps {
   timeline: TimelineModel
@@ -31,6 +32,21 @@ interface TimelineProps {
    * Timeline usage can fall back to the historical default behavior.
    */
   bindingsStore?: InputBindingsStore
+  /**
+   * One-shot initial zoom to apply after the viewport has been
+   * measured. Sourced from URL query params (`?view[startMs]=...`)
+   * by the parent. Applied exactly once per mount so a later
+   * programmatic zoom by the user is never clobbered by a URL the
+   * page was originally loaded with.
+   */
+  initialView?: InitialView | null
+  /**
+   * One-shot initial slice to mark as `selectedSlice` — drives the
+   * tree-highlight overlay from the very first paint, matching what
+   * the user would see after clicking the slice manually. Resolved
+   * from URL params by the parent against the parsed trace.
+   */
+  initialSelectedSlice?: SliceRef | null
 }
 
 export interface PerfecttoTimelineSnapshot {
@@ -119,17 +135,14 @@ export default function Timeline({
   selectionStore,
   appliedPersona,
   bindingsStore,
+  initialView,
+  initialSelectedSlice,
 }: TimelineProps) {
   const scrollRef = useRef<HTMLDivElement | null>(null)
   // Single floating tooltip element shared by all tracks. Lives in the
   // outer scroller (not inside any TimelineSystem) so it can be positioned
   // in viewport coordinates without escaping the row's stacking context.
   const tooltipRef = useRef<HTMLDivElement | null>(null)
-  // Hover-highlight outline. Mutated imperatively by `useTimelineHover`
-  // (zero React renders per cursor move), drawn over the hovered slice
-  // so you can see which rect the tooltip is describing — border-only
-  // variant, no canvas repaint, no re-render of other tracks.
-  const hoverHighlightRef = useRef<HTMLDivElement | null>(null)
 
   // The viewport store is the single source of truth for pxPerMs /
   // scrollLeft / viewport dimensions that canvases need. It's created once
@@ -288,7 +301,7 @@ export default function Timeline({
     }
   }, [store])
 
-  const {pxPerMs, eventTargetRef} = useTimelineZoom({
+  const {pxPerMs, eventTargetRef, zoomToRangeRef} = useTimelineZoom({
     bounds: {start: timeline.start, end: timeline.end},
     labelWidthPx: LABEL_WIDTH_PX,
     containerWidthPx: viewportWidth,
@@ -297,6 +310,47 @@ export default function Timeline({
     selectionStore: effectiveSelectionStore,
     bindingsStore,
   })
+
+  // One-shot deep-link application. Fires exactly once per Timeline
+  // mount:
+  //   - `initialSelectedSlice` is written straight into the selection
+  //     store (no viewport dependency — the tree-highlight overlay
+  //     picks it up on the next canvas redraw).
+  //   - `initialView` has to wait until the viewport has been measured
+  //     (`viewportWidth > 0`) and the zoom hook has published its
+  //     imperative `zoomToRange` handle.
+  //
+  // Using refs keeps the effect from re-applying the URL view if the
+  // user later pans / zooms manually — Timeline re-renders, the effect
+  // observes `appliedRef.current === true`, and bails out.
+  const appliedInitialViewRef = useRef(false)
+  const appliedInitialSelectionRef = useRef(false)
+  useEffect(() => {
+    if (!appliedInitialSelectionRef.current && initialSelectedSlice) {
+      effectiveSelectionStore.setSelectedSlice(initialSelectedSlice)
+      appliedInitialSelectionRef.current = true
+    }
+    if (appliedInitialViewRef.current) return
+    if (!initialView) {
+      appliedInitialViewRef.current = true
+      return
+    }
+    // The zoom handle needs the event surface mounted + a non-zero
+    // viewport width; both are set the frame after the outer
+    // ResizeObserver fires, so this effect typically runs twice:
+    // once pre-measurement (bail) and once post-measurement (apply).
+    if (viewportWidth <= 0) return
+    const doZoom = zoomToRangeRef.current
+    if (!doZoom) return
+    doZoom(initialView.startMs, initialView.endMs)
+    appliedInitialViewRef.current = true
+  }, [
+    initialView,
+    initialSelectedSlice,
+    viewportWidth,
+    effectiveSelectionStore,
+    zoomToRangeRef,
+  ])
 
   // Base systems list (persona-derived if a persona is applied, else raw).
   // When the user has clicked the "show N hidden systems" footer
@@ -499,7 +553,6 @@ export default function Timeline({
     trackRows: hoverTrackRows,
     tooltipRef,
     selectionStore: effectiveSelectionStore,
-    highlightRef: hoverHighlightRef,
   })
 
   // Separate ref for the overview canvas so the selection hook can wire
@@ -515,6 +568,7 @@ export default function Timeline({
     store,
     selectionStore: effectiveSelectionStore,
     tooltipRef,
+    trackRows: hoverTrackRows,
     bindingsStore,
   })
 
@@ -566,6 +620,7 @@ export default function Timeline({
               viewportTopPx={visibleTop}
               viewportBottomPx={visibleBottom}
               store={store}
+              selectionStore={effectiveSelectionStore}
               hiddenTrackCount={hiddenCount}
               hiddenTracksShown={systemHiddenVisible[item.system.id] === true}
               onToggle={() => toggleSystem(item.system.id)}
@@ -624,36 +679,6 @@ export default function Timeline({
         aria-hidden="true"
         className="pointer-events-none fixed left-0 top-0 z-50 max-w-xs whitespace-nowrap rounded border border-[#2d3748] bg-[#0b0f17]/95 px-2 py-1 text-xs text-[#e2e8f0] shadow-lg transition-opacity duration-75"
         style={{opacity: 0, transform: 'translate(0px, 0px)'}}
-      />
-      {/*
-        Hover highlight overlay. Fixed-positioned and pointer-events:none
-        so it sits on top of the canvas without blocking hit-tests or
-        scroll. `useTimelineHover` imperatively sets `transform`,
-        `width`, `height`, and `opacity`; React never re-renders this
-        node on cursor moves. Rendered below the tooltip in z-order so
-        the tooltip text stays readable if it overlaps the outline.
-      */}
-      <div
-        ref={hoverHighlightRef}
-        data-testid="timeline-hover-highlight"
-        aria-hidden="true"
-        className="pointer-events-none fixed left-0 top-0 z-40 rounded-sm transition-opacity duration-75"
-        style={{
-          opacity: 0,
-          transform: 'translate(0px, 0px)',
-          width: 0,
-          height: 0,
-          // `outline` paints outside the element's box and never reserves
-          // layout space, so the highlight wraps the slice rect without
-          // eating into its interior (a `border` with `box-sizing:
-          // border-box` would shave 2px off every edge of the painted
-          // rect). A 1px dark halo via non-inset box-shadow keeps the
-          // stroke readable on both bright yellow scripting and dark mint
-          // user-JS backgrounds.
-          outline: '2px solid rgba(255, 255, 255, 0.85)',
-          outlineOffset: 0,
-          boxShadow: '0 0 0 1px rgba(0, 0, 0, 0.7)',
-        }}
       />
     </div>
   )

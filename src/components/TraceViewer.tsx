@@ -14,6 +14,11 @@ import {
   createInputBindingsStore,
   type InputBindingsStore,
 } from './timeline/inputBindingsStore'
+import {
+  parseTimelineUrlParams,
+  resolveInitialSelection,
+  type InitialView,
+} from './timeline/urlParams'
 
 /**
  * Input-binding settings are app-wide (a user's preferred matrix
@@ -38,6 +43,25 @@ export default function TraceViewer({trace, onBack}: TraceViewerProps) {
   // (which owns the drag-selection UX + overlays) and the Aggregator
   // panel (which displays the committed range).
   const selectionStore = useMemo(() => createSelectionStore(), [trace])
+
+  // Parse deep-link URL parameters (`?view[...]&selection[...]`) once
+  // per trace load. `view` is applied by the Timeline's zoom hook; the
+  // slice lookup for `selection` happens here so we only have to walk
+  // the track buffers a single time per mount. See `urlParams.ts` for
+  // the supported query syntax — this is primarily a debugging
+  // affordance so a bug report URL can pin a precise viewport +
+  // highlight state.
+  const initial: {view: InitialView | null; initialSelectedSlice:
+    ReturnType<typeof resolveInitialSelection>} = useMemo(() => {
+    if (typeof window === 'undefined') {
+      return {view: null, initialSelectedSlice: null}
+    }
+    const parsed = parseTimelineUrlParams(window.location.search)
+    const initialSelectedSlice = parsed.selection
+      ? resolveInitialSelection(trace.timeline, parsed.selection)
+      : null
+    return {view: parsed.view, initialSelectedSlice}
+  }, [trace])
 
   // Auto-detect the best persona for this trace on first mount. Users
   // can override via the picker; we keep the detected id around so the
@@ -71,6 +95,8 @@ export default function TraceViewer({trace, onBack}: TraceViewerProps) {
         selectionStore={selectionStore}
         appliedPersona={appliedPersona}
         bindingsStore={bindingsStore}
+        initialView={initial.view}
+        initialSelectedSlice={initial.initialSelectedSlice}
       />
       <Aggregator selectionStore={selectionStore} />
     </div>

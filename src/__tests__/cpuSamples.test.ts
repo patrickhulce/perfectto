@@ -237,6 +237,184 @@ describe('ChromeParser - CPU sample synthesis', () => {
   })
 })
 
+describe('ChromeParser - JS-frame nesting into existing B/E tree', () => {
+  // Helper: build a minimal trace with a configurable host slice plus one
+  // JS sample stream. Each sample stack is [foo] for the whole profile,
+  // so the synthesized JS root spans [profile.startTime, lastSampleTs].
+  // `hostBounds` controls the `X` host slice; `extraChildren` seeds
+  // pre-existing children of the host so we can test re-parenting.
+  const buildJsNestingTrace = async (opts: {
+    hostStart: number
+    hostDur: number
+    profileStart: number
+    timeDeltas: number[]
+    extraChildren?: Array<{name: string; ts: number; dur: number}>
+  }) => {
+    const extras = (opts.extraChildren ?? []).map((c, i) => ({
+      ph: 'X' as const,
+      name: c.name,
+      cat: 'v8',
+      pid: 1,
+      tid: 100,
+      ts: c.ts,
+      dur: c.dur,
+      _idx: i,
+    }))
+    return parseTrace(
+      streamFromString(
+        JSON.stringify({
+          traceEvents: [
+            {
+              ph: 'X',
+              name: 'Host',
+              cat: 'devtools.timeline',
+              pid: 1,
+              tid: 100,
+              ts: opts.hostStart,
+              dur: opts.hostDur,
+            },
+            ...extras,
+            {
+              ph: 'P',
+              name: 'Profile',
+              cat: 'disabled-by-default-v8.cpu_profiler',
+              pid: 1,
+              tid: 100,
+              id: '0x1',
+              ts: opts.profileStart,
+              args: {data: {startTime: opts.profileStart}},
+            },
+            {
+              ph: 'P',
+              name: 'ProfileChunk',
+              cat: 'disabled-by-default-v8.cpu_profiler',
+              pid: 1,
+              tid: 200,
+              id: '0x1',
+              ts: opts.profileStart,
+              args: {
+                data: {
+                  cpuProfile: {
+                    nodes: [
+                      {id: 1, callFrame: {functionName: '(root)', scriptId: 0, codeType: 'other'}},
+                      {
+                        id: 10,
+                        parent: 1,
+                        callFrame: {
+                          functionName: 'foo',
+                          scriptId: 42,
+                          url: 'app.js',
+                          lineNumber: 1,
+                          columnNumber: 1,
+                        },
+                      },
+                    ],
+                    samples: opts.timeDeltas.map(() => 10),
+                  },
+                  timeDeltas: opts.timeDeltas,
+                },
+              },
+            },
+          ],
+        }),
+      ),
+      SOURCE,
+    )
+  }
+
+  it('fully-contained JS root attaches under the host with bounds unchanged', async () => {
+    // Host [0, 500 µs], JS samples at 100..400 µs. Root fits cleanly.
+    const trace = await buildJsNestingTrace({
+      hostStart: 0,
+      hostDur: 500,
+      profileStart: 100,
+      timeDeltas: [0, 100, 100, 100],
+    })
+    const main = trace.timeline.systems
+      .flatMap(s => s.tracks)
+      .find(t => t.name.startsWith('Thread'))!
+    const host = findMeasure(main, m => m.name === 'Host')!
+    expect(host.measures).toHaveLength(1)
+    const foo = host.measures[0]
+    expect(foo.name).toBe('foo')
+    // 100 µs / 1000 = 0.1 ms start, 400 µs = 0.4 ms end.
+    expect(foo.start).toBeCloseTo(0.1, 6)
+    expect(foo.end).toBeCloseTo(0.4, 6)
+  })
+
+  it('clips a JS root that overshoots the host by sampling tail', async () => {
+    // Host [0, 500 µs]. Samples run 100..600 µs — 100 µs tail past host end.
+    // Expected: JS root clipped to host.end (0.5 ms) and still attached
+    // under the host as a proper child.
+    const trace = await buildJsNestingTrace({
+      hostStart: 0,
+      hostDur: 500,
+      profileStart: 100,
+      timeDeltas: [0, 100, 100, 100, 100, 100],
+    })
+    const main = trace.timeline.systems
+      .flatMap(s => s.tracks)
+      .find(t => t.name.startsWith('Thread'))!
+    const host = findMeasure(main, m => m.name === 'Host')!
+    expect(host.measures).toHaveLength(1)
+    const foo = host.measures[0]
+    expect(foo.name).toBe('foo')
+    expect(foo.end).toBeLessThanOrEqual(host.end + 1e-9)
+    expect(foo.end).toBeCloseTo(host.end, 6)
+  })
+
+  it('reparents overlapping pre-existing host children into the JS root', async () => {
+    // Host [0, 1000 µs]. Pre-existing sibling children inside the host:
+    //   Debugger::AsyncTaskRun at 200..210 µs, 400..410 µs.
+    // Profile runs 100..900 µs, so the JS root [0.1ms, 0.9ms] should
+    // engulf both sibling slices and make them depth-4 descendants.
+    const trace = await buildJsNestingTrace({
+      hostStart: 0,
+      hostDur: 1000,
+      profileStart: 100,
+      timeDeltas: [0, 100, 100, 100, 100, 100, 100, 100, 100],
+      extraChildren: [
+        {name: 'SiblingA', ts: 200, dur: 10},
+        {name: 'SiblingB', ts: 400, dur: 10},
+      ],
+    })
+    const main = trace.timeline.systems
+      .flatMap(s => s.tracks)
+      .find(t => t.name.startsWith('Thread'))!
+    const host = findMeasure(main, m => m.name === 'Host')!
+    // The host should have exactly one direct child — the JS root.
+    expect(host.measures.map(m => m.name)).toEqual(['foo'])
+    const foo = host.measures[0]
+    const fooChildren = foo.measures.map(m => m.name).sort()
+    expect(fooChildren).toContain('SiblingA')
+    expect(fooChildren).toContain('SiblingB')
+    // Neither sibling remains at the host depth.
+    expect(host.measures.find(m => m.name === 'SiblingA')).toBeUndefined()
+    expect(host.measures.find(m => m.name === 'SiblingB')).toBeUndefined()
+  })
+
+  it('mints short lowercase-hex ids (no prefix, no zero-padding)', async () => {
+    const trace = await buildJsNestingTrace({
+      hostStart: 0,
+      hostDur: 500,
+      profileStart: 100,
+      timeDeltas: [0, 100, 100, 100],
+    })
+    const all: Measure[] = []
+    for (const sys of trace.timeline.systems) {
+      for (const tr of sys.tracks) all.push(...collectMeasures(tr))
+    }
+    expect(all.length).toBeGreaterThan(0)
+    // Every id is pure lowercase hex, no prefix, no empty string.
+    for (const m of all) {
+      expect(m.id).toMatch(/^[0-9a-f]+$/)
+    }
+    // Ids are unique across the whole trace.
+    const ids = new Set(all.map(m => m.id))
+    expect(ids.size).toBe(all.length)
+  })
+})
+
 describe('ChromeParser - V8.GC_* collapse', () => {
   const BASE_GC_EVENTS = [
     {ph: 'X', name: 'MinorGC', cat: 'v8', pid: 1, tid: 1, ts: 0, dur: 100},

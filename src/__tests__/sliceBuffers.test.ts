@@ -110,6 +110,27 @@ describe('buildSliceBuffers', () => {
     // still 100, so binary search lands on the sibling (index 4).
     expect(lowerBoundF32(b.maxEndsPrefix, b.count, 150)).toBe(4)
   })
+
+  it('parentEnds keys every slice by its direct ancestor (roots share a sentinel)', () => {
+    // Two depth-0 roots (peers under the track), each with one child.
+    // Roots share the root sentinel so they can still merge in the
+    // mipmap; descendants store their parent's F32-rounded end so
+    // sibling comparisons are byte-identical.
+    const child1 = m('c1', 1, 2)
+    const child2 = m('c2', 11, 12)
+    const p1 = m('p1', 0, 5, [child1])
+    const p2 = m('p2', 10, 15, [child2])
+    const b = buildSliceBuffers(track([p1, p2]))
+    // Pre-order: p1, c1, p2, c2
+    expect(Array.from(b.depths)).toEqual([0, 1, 0, 1])
+    // Roots share the sentinel (0), so their parentEnds match.
+    expect(b.parentEnds[0]).toBe(b.parentEnds[2])
+    // Child of p1 keys off p1.end; child of p2 keys off p2.end.
+    expect(b.parentEnds[1]).toBe(Math.fround(5))
+    expect(b.parentEnds[3]).toBe(Math.fround(15))
+    // Different parents ⇒ different keys.
+    expect(b.parentEnds[1]).not.toBe(b.parentEnds[3])
+  })
 })
 
 describe('buildMarkBuffers', () => {
