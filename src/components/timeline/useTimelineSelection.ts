@@ -456,6 +456,7 @@ function hitTestSliceAtClick(
     startMs: measure.start,
     endMs: measure.end,
     depth: hit.depth,
+    measureId: measure.id,
   }
 }
 

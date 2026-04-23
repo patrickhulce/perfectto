@@ -52,10 +52,10 @@ const SKIRT_EDGE_THRESHOLD_FRACTION = 0.5
 /**
  * Snapshot of what the base canvas currently has painted on it. Updated
  * every time we redraw the base; consulted every frame to decide between
- * a cheap `translateX` update and a full repaint. The base canvas is
- * selection-agnostic — dimming for the tree-highlight affordance lives
- * entirely on the sibling overlay canvas (see {@link OverlayPaint}), so
- * selection changes never invalidate this snapshot.
+ * a cheap `translateX` update and a full repaint. The base canvas's
+ * painted pixels are selection-agnostic — selection/hover only adjust
+ * CSS opacity and the sibling overlay canvas (see {@link OverlayPaint}),
+ * so selection changes never invalidate this snapshot.
  */
 interface LoadedRange {
   /** `pxPerMs` the canvas was painted at. Any change forces a full redraw. */
@@ -135,6 +135,7 @@ function CanvasTrackRendererBase({
     let lastBackingWidthCss = -1
     let lastBackingHeightCss = -1
     let lastDpr = -1
+    let lastBaseOpacity = ''
     let loaded: LoadedRange | null = null
     let overlayPainted: OverlayPaint | null = null
 
@@ -145,9 +146,7 @@ function CanvasTrackRendererBase({
      * the more immediate intent. Returns `undefined` when no slice on
      * this track is active, which empties the overlay.
      */
-    const currentHighlight = ():
-      | {startMs: number; endMs: number; minDepth: number}
-      | undefined => {
+    const currentHighlight = (): {startMs: number; endMs: number; minDepth: number} | undefined => {
       const sel = selectionStore.get()
       const hl = sel.hoveredSlice ?? sel.selectedSlice
       if (!hl || hl.trackId !== track.id) return undefined
@@ -156,20 +155,22 @@ function CanvasTrackRendererBase({
 
     const highlightKeyOf = (
       hl: {startMs: number; endMs: number; minDepth: number} | undefined,
-    ): string =>
-      hl === undefined
-        ? ''
-        : `${hl.startMs}|${hl.endMs}|${hl.minDepth}`
+    ): string => (hl === undefined ? '' : `${hl.startMs}|${hl.endMs}|${hl.minDepth}`)
+
+    const syncBaseOpacity = (): void => {
+      const sel = selectionStore.get()
+      const nextOpacity = sel.hoveredSlice ?? sel.selectedSlice ? '0.4' : '0.8'
+      if (nextOpacity === lastBaseOpacity) return
+      canvas.style.opacity = nextOpacity
+      lastBaseOpacity = nextOpacity
+    }
 
     /**
      * Keep both canvases' backing stores identical. The overlay sits
      * directly over the base and uses the same CSS-pixel coordinate
      * space, so they must share width, height, and the DPR transform.
      */
-    const resizeBackingStores = (
-      canvasWidthCss: number,
-      heightCss: number,
-    ): void => {
+    const resizeBackingStores = (canvasWidthCss: number, heightCss: number): void => {
       const dpr = window.devicePixelRatio || 1
       if (
         canvasWidthCss === lastBackingWidthCss &&
@@ -200,24 +201,19 @@ function CanvasTrackRendererBase({
       // The skirt buys us 3 viewport-widths of cached pan; outside skirt
       // mode we draw exactly one viewport wide, exactly aligned with the
       // visible window.
-      const canvasWidthCss = skirtEnabled
-        ? contentWidthCss * SKIRT_FACTOR
-        : contentWidthCss
+      const canvasWidthCss = skirtEnabled ? contentWidthCss * SKIRT_FACTOR : contentWidthCss
       resizeBackingStores(canvasWidthCss, heightCss)
 
       const state = store.get()
-      const msAtCanvasLeft =
-        state.timelineStart + scrollLeftAnchor / pxPerMs
+      const msAtCanvasLeft = state.timelineStart + scrollLeftAnchor / pxPerMs
       const visibleDurationMs = canvasWidthCss / pxPerMs
       const visibleStartMs = msAtCanvasLeft
       const visibleEndMs = msAtCanvasLeft + visibleDurationMs
 
       const slices = track.mipmap
         ? pickMipmapLevel(track.mipmap, pxPerMs)
-        : track.buffers ?? EMPTY_SLICE_BUFFERS
-      const baseMeasures = track.mipmap
-        ? track.mipmap.base.measures
-        : track.buffers?.measures
+        : (track.buffers ?? EMPTY_SLICE_BUFFERS)
+      const baseMeasures = track.mipmap ? track.mipmap.base.measures : track.buffers?.measures
 
       // Compute tick positions from the same store snapshot the top
       // `TimelineAxis` uses. Pure function, sub-millisecond per frame
@@ -278,15 +274,12 @@ function CanvasTrackRendererBase({
         return
       }
       const state = store.get()
-      const msAtCanvasLeft =
-        state.timelineStart + scrollLeftAnchor / pxPerMs
+      const msAtCanvasLeft = state.timelineStart + scrollLeftAnchor / pxPerMs
       const visibleDurationMs = canvasWidthCss / pxPerMs
       const slices = track.mipmap
         ? pickMipmapLevel(track.mipmap, pxPerMs)
-        : track.buffers ?? EMPTY_SLICE_BUFFERS
-      const baseMeasures = track.mipmap
-        ? track.mipmap.base.measures
-        : track.buffers?.measures
+        : (track.buffers ?? EMPTY_SLICE_BUFFERS)
+      const baseMeasures = track.mipmap ? track.mipmap.base.measures : track.buffers?.measures
 
       drawHighlightFrame({
         ctx: overlayCtx,
@@ -316,6 +309,7 @@ function CanvasTrackRendererBase({
 
     const render = (): void => {
       rafRef.current = null
+      syncBaseOpacity()
       const state = store.get()
       const pxPerMs = state.pxPerMs
       if (pxPerMs <= 0) {
@@ -326,10 +320,7 @@ function CanvasTrackRendererBase({
         overlayPainted = null
         return
       }
-      const contentWidthCss = Math.max(
-        0,
-        state.viewportWidth - state.labelWidthPx,
-      )
+      const contentWidthCss = Math.max(0, state.viewportWidth - state.labelWidthPx)
       if (contentWidthCss <= 0) return
 
       // Keep the sticky wrapper width in lockstep with the viewport's
@@ -344,7 +335,8 @@ function CanvasTrackRendererBase({
       const edgeThresholdPx = contentWidthCss * SKIRT_EDGE_THRESHOLD_FRACTION
 
       // Base-canvas invalidation. Selection state deliberately does not
-      // appear here — the overlay handles that entirely.
+      // appear here — selection/hover only affect CSS opacity plus the
+      // sibling overlay, never the base pixels.
       const baseMustRedraw =
         !skirtEnabled ||
         loaded === null ||
@@ -353,16 +345,13 @@ function CanvasTrackRendererBase({
         loaded.expanded !== expanded ||
         loaded.trackId !== track.id ||
         state.scrollLeft - loaded.scrollLeftAnchor < edgeThresholdPx ||
-        loaded.scrollLeftAnchor + loaded.widthCss -
-          (state.scrollLeft + contentWidthCss) <
+        loaded.scrollLeftAnchor + loaded.widthCss - (state.scrollLeft + contentWidthCss) <
           edgeThresholdPx
 
       if (baseMustRedraw) {
         // Recenter so we have one viewport of skirt on each side. Outside
         // skirt mode anchor === scrollLeft (no overdraw, no transform).
-        const anchor = skirtEnabled
-          ? state.scrollLeft - contentWidthCss
-          : state.scrollLeft
+        const anchor = skirtEnabled ? state.scrollLeft - contentWidthCss : state.scrollLeft
         fullRedrawBase(contentWidthCss, heightCss, pxPerMs, anchor)
       }
 
@@ -371,9 +360,7 @@ function CanvasTrackRendererBase({
       // Both canvases always share the same transform so overlay content
       // stays pinned to the same logical ms positions as the base rects
       // underneath it. One write per frame, no layout.
-      const translate = `translateX(${
-        loaded.scrollLeftAnchor - state.scrollLeft
-      }px)`
+      const translate = `translateX(${loaded.scrollLeftAnchor - state.scrollLeft}px)`
       canvas.style.transform = translate
       overlay.style.transform = translate
 
@@ -491,10 +478,7 @@ function CanvasTrackRendererBase({
           height: heightPx,
         }}
       >
-        <span
-          aria-hidden
-          className="mt-px inline-block w-3 shrink-0 text-[#718096]"
-        >
+        <span aria-hidden className="mt-px inline-block w-3 shrink-0 text-[#718096]">
           {canToggle ? (expanded ? '▾' : '▸') : ''}
         </span>
         <span className="min-w-0 flex-1">
@@ -547,14 +531,15 @@ function CanvasTrackRendererBase({
             display: 'block',
             // willChange hints the compositor to keep this on its own
             // layer so translateX during pan never paints.
-            willChange: 'transform',
-            // Dimming for the tree-highlight affordance lives here as a
-            // CSS property: the full-opacity overlay canvas stacked on
-            // top will render the currently highlighted tree at 1.0,
-            // while everything drawn on this canvas sits at 0.75. This
-            // avoids the alpha-composition bugs the previous in-canvas
-            // dim pass kept running into.
-            opacity: 0.75,
+            willChange: 'transform, opacity',
+            // Ease opacity changes a bit so hover/selection emphasis feels
+            // deliberate instead of flashing on quick pointer movement.
+            transition: 'opacity 140ms ease-out',
+            // The RAF render loop owns this opacity so it can switch
+            // between the idle (0.8) and active-highlight (0.4) states
+            // without a React re-render. The full-opacity overlay canvas
+            // stacked on top keeps the highlighted subtree at 1.0.
+            opacity: 0.8,
           }}
         />
         <canvas

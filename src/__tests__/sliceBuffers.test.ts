@@ -1,7 +1,9 @@
 import type {Mark, Measure, Track} from '../core'
 import {
+  buildAncestorChain,
   buildMarkBuffers,
   buildSliceBuffers,
+  findMeasureIndexById,
   lowerBoundF32,
   maxDepthPlusOne,
 } from '../core/render/sliceBuffers'
@@ -109,6 +111,50 @@ describe('buildSliceBuffers', () => {
     // Viewport strictly after root/a/ai/b: prefix up through index 3 is
     // still 100, so binary search lands on the sibling (index 4).
     expect(lowerBoundF32(b.maxEndsPrefix, b.count, 150)).toBe(4)
+  })
+
+  it('parentIndex points each slice at its direct ancestor (-1 for roots)', () => {
+    // Layout:
+    //   root             depth 0  (index 0)
+    //     middle         depth 1  (index 1)
+    //       inner        depth 2  (index 2)
+    //     sibling        depth 1  (index 3)
+    //   peer             depth 0  (index 4)
+    const inner = m('inner', 10, 20)
+    const middle = m('middle', 5, 30, [inner])
+    const sibling = m('sibling', 40, 50)
+    const root = m('root', 0, 100, [middle, sibling])
+    const peer = m('peer', 200, 300)
+    const b = buildSliceBuffers(track([root, peer]))
+
+    expect(Array.from(b.parentIndex)).toEqual([-1, 0, 1, 0, -1])
+    // parentIndex is the authoritative ancestor pointer; parent indices
+    // always precede the slice (pre-order) so the walk terminates cleanly.
+    for (let i = 0; i < b.count; i++) {
+      expect(b.parentIndex[i]).toBeLessThan(i)
+    }
+  })
+
+  it('buildAncestorChain walks parentIndex root-to-leaf', () => {
+    const inner = m('inner', 10, 20)
+    const middle = m('middle', 5, 30, [inner])
+    const root = m('root', 0, 100, [middle])
+    const b = buildSliceBuffers(track([root]))
+
+    expect(buildAncestorChain(b, 2)).toEqual([0, 1, 2])
+    expect(buildAncestorChain(b, 0)).toEqual([0])
+    expect(buildAncestorChain(b, -1)).toEqual([])
+    expect(buildAncestorChain(b, 99)).toEqual([])
+  })
+
+  it('findMeasureIndexById returns the matching buffer index', () => {
+    const inner = m('needle', 10, 20)
+    const root = m('root', 0, 100, [inner])
+    const b = buildSliceBuffers(track([root]))
+
+    expect(findMeasureIndexById(b, 'needle')).toBe(1)
+    expect(findMeasureIndexById(b, 'root')).toBe(0)
+    expect(findMeasureIndexById(b, 'missing')).toBe(-1)
   })
 
   it('parentEnds keys every slice by its direct ancestor (roots share a sentinel)', () => {

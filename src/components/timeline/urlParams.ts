@@ -164,12 +164,14 @@ export function resolveInitialSelection(
         if (!buffers || buffers.count === 0) continue
         const {starts, ends, depths, count, measures} = buffers
         for (let i = 0; i < count; i++) {
-          if (measures[i]?.id !== request.id) continue
+          const measure = measures[i]
+          if (measure?.id !== request.id) continue
           return {
             trackId: track.id,
             startMs: starts[i],
             endMs: ends[i],
             depth: depths[i],
+            measureId: measure.id,
           }
         }
       }
@@ -193,6 +195,7 @@ export function resolveInitialSelection(
           startMs: starts[i],
           endMs: ends[i],
           depth: depths[i],
+          measureId: buffers.measures[i]?.id,
         }
       }
     }

@@ -148,6 +148,9 @@ describe('useTimelineSelection — click-to-select slice', () => {
     expect(sel).not.toBeNull()
     expect(sel?.startMs).toBeCloseTo(0)
     expect(sel?.endMs).toBeCloseTo(50)
+    // measureId is populated so the aggregator can resolve the exact slice
+    // even when two measures share the same [start, end, depth] tuple.
+    expect(sel?.measureId).toBe('anchor')
     unmount()
   })
 

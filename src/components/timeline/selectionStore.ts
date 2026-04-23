@@ -37,12 +37,21 @@ export interface InProgressSelection extends SelectionRange {
  * the tree-highlight affordance: start/end/depth uniquely determine the
  * pre-order descendant range (depth >= this.depth and span ⊆ [start,end]),
  * and trackId scopes that check to one track's canvas.
+ *
+ * `measureId` carries the parser-assigned `Measure.id` when the selection
+ * originates from a real slice hit (click, deep-link resolver). Consumers
+ * that need an exact back-pointer — e.g. the aggregator looking up the
+ * selected measure to render its callstack — key off this field instead
+ * of trying to re-match bounds, which would be ambiguous when two slices
+ * share the same `[start, end, depth]` tuple.
  */
 export interface SliceRef {
   trackId: string
   startMs: number
   endMs: number
   depth: number
+  /** Parser-assigned `Measure.id`. Optional so synthetic selections keep working. */
+  measureId?: string
 }
 
 export interface SelectionState {
@@ -167,6 +176,7 @@ function slicesEqual(
     a.trackId === b.trackId &&
     a.startMs === b.startMs &&
     a.endMs === b.endMs &&
-    a.depth === b.depth
+    a.depth === b.depth &&
+    a.measureId === b.measureId
   )
 }

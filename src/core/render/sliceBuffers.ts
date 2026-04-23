@@ -46,6 +46,15 @@ export interface SliceBuffers {
    * "bridges" two parents.
    */
   parentEnds: Float32Array
+  /**
+   * Direct parent's buffer index, per slice. Depth-0 roots store `-1` as
+   * the sentinel (they have no flame-chart parent under the track). This
+   * is purely a render-time optimization layer — it lives here instead of
+   * on `Measure` itself so the parsed trace model stays unchanged. O(depth)
+   * ancestor walks (e.g. callstack reconstruction for a selected JS frame)
+   * follow this chain rather than rescanning siblings via `parentEnds`.
+   */
+  parentIndex: Int32Array
 }
 
 /** Same shape as {@link SliceBuffers} but keyed on a single `time` per mark. */
@@ -60,6 +69,7 @@ export interface MarkBuffers {
 const EMPTY_F32 = new Float32Array(0)
 const EMPTY_U16 = new Uint16Array(0)
 const EMPTY_U32 = new Uint32Array(0)
+const EMPTY_I32 = new Int32Array(0)
 
 export const EMPTY_SLICE_BUFFERS: SliceBuffers = {
   count: 0,
@@ -70,6 +80,7 @@ export const EMPTY_SLICE_BUFFERS: SliceBuffers = {
   measures: [],
   maxEndsPrefix: EMPTY_F32,
   parentEnds: EMPTY_F32,
+  parentIndex: EMPTY_I32,
 }
 
 export const EMPTY_MARK_BUFFERS: MarkBuffers = {
@@ -102,13 +113,19 @@ export function buildSliceBuffers(root: TimelineContainer): SliceBuffers {
   // slices store their direct ancestor's F32-rounded `end`, which is
   // byte-identical across every child of that ancestor.
   const parentEnds = new Float32Array(total)
+  // Direct parent's buffer index per slice. `-1` marks a depth-0 root;
+  // deeper slices point at their immediate ancestor's slot, so callers
+  // can reconstruct a root-to-leaf chain with a simple while-loop.
+  const parentIndex = new Int32Array(total)
   const PARENT_END_ROOT = 0
+  const PARENT_INDEX_ROOT = -1
 
   let i = 0
   const visit = (
     container: TimelineContainer,
     depth: number,
     parentEnd: number,
+    parentIdx: number,
   ): void => {
     for (const m of container.measures) {
       starts[i] = m.start
@@ -117,14 +134,17 @@ export function buildSliceBuffers(root: TimelineContainer): SliceBuffers {
       colors[i] = packColor(m.color, DEFAULT_MEASURE_COLOR)
       measures[i] = m
       parentEnds[i] = parentEnd
+      parentIndex[i] = parentIdx
+      const selfIdx = i
       i += 1
-      // Pass `ends[i-1]` (F32-rounded, exactly as it will appear in any
+      // Pass `ends[selfIdx]` (F32-rounded, exactly as it will appear in any
       // sibling's parentEnds slot) so every child of this measure stores
-      // the identical key.
-      if (m.measures.length > 0) visit(m, depth + 1, ends[i - 1])
+      // the identical key. `selfIdx` is the authoritative back-pointer for
+      // ancestor walks.
+      if (m.measures.length > 0) visit(m, depth + 1, ends[selfIdx], selfIdx)
     }
   }
-  visit(root, 0, PARENT_END_ROOT)
+  visit(root, 0, PARENT_END_ROOT, PARENT_INDEX_ROOT)
 
   const maxEndsPrefix = new Float32Array(i)
   let running = -Infinity
@@ -143,6 +163,7 @@ export function buildSliceBuffers(root: TimelineContainer): SliceBuffers {
     measures,
     maxEndsPrefix,
     parentEnds,
+    parentIndex,
   }
 }
 
@@ -259,6 +280,61 @@ export function maxDepthPlusOne(buffers: SliceBuffers): number {
     if (buffers.depths[i] > maxD) maxD = buffers.depths[i]
   }
   return buffers.count === 0 ? 0 : maxD + 1
+}
+
+/**
+ * Linear scan for the buffer index of a `Measure` whose `id` matches.
+ * Returns `-1` when nothing matches. Callers with a `measureId` from a
+ * click selection should prefer this over bounds-based matching because
+ * it stays unambiguous across same-bounds siblings.
+ *
+ * O(n) in the track's slice count; good enough for a once-per-click
+ * selection, and avoids keeping a parallel id → index map resident for
+ * every track.
+ */
+export function findMeasureIndexById(
+  buffers: SliceBuffers,
+  measureId: string,
+): number {
+  const measures = buffers.measures
+  for (let i = 0; i < buffers.count; i++) {
+    if (measures[i]?.id === measureId) return i
+  }
+  return -1
+}
+
+/**
+ * Walk `parentIndex` from `leafIndex` up to a root, returning the buffer
+ * indices in root → leaf order. `leafIndex` is included as the last
+ * entry. Returns an empty array when `leafIndex` is out of range.
+ *
+ * The loop is guarded against cycles so a corrupt `parentIndex` can't
+ * spin forever; in practice `parentIndex` is built in strictly
+ * increasing-depth order so no cycle can form.
+ */
+export function buildAncestorChain(
+  buffers: SliceBuffers,
+  leafIndex: number,
+): number[] {
+  if (leafIndex < 0 || leafIndex >= buffers.count) return []
+  const chain: number[] = []
+  const parent = buffers.parentIndex
+  let cursor = leafIndex
+  // Depth is bounded by `depths[leafIndex] + 1`; cap just in case the
+  // buffer arrives malformed (e.g. future parsers that forget to set
+  // `parentIndex` would read `0` and form a loop otherwise).
+  const guardLimit = buffers.count + 1
+  let guard = 0
+  while (cursor >= 0 && guard < guardLimit) {
+    chain.push(cursor)
+    const next = parent[cursor]
+    if (next < 0) break
+    if (next >= cursor) break
+    cursor = next
+    guard += 1
+  }
+  chain.reverse()
+  return chain
 }
 
 // ---------------------------------------------------------------------------

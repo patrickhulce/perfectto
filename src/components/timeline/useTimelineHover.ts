@@ -215,6 +215,7 @@ export function useTimelineHover(options: UseTimelineHoverOptions): void {
         startMs: measure.start,
         endMs: measure.end,
         depth: hit.depth,
+        measureId: measure.id,
       })
     }
 

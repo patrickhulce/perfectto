@@ -118,6 +118,7 @@ describe('resolveInitialSelection', () => {
       startMs: expect.closeTo(10, 3),
       endMs: expect.closeTo(20, 3),
       depth: 1,
+      measureId: 'child',
     })
   })
 
@@ -190,6 +191,7 @@ describe('resolveInitialSelection', () => {
       startMs: expect.closeTo(10, 3),
       endMs: expect.closeTo(20, 3),
       depth: 1,
+      measureId: 'child',
     })
   })
 

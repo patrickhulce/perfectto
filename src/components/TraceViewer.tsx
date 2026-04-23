@@ -98,7 +98,7 @@ export default function TraceViewer({trace, onBack}: TraceViewerProps) {
         initialView={initial.view}
         initialSelectedSlice={initial.initialSelectedSlice}
       />
-      <Aggregator selectionStore={selectionStore} />
+      <Aggregator selectionStore={selectionStore} timeline={trace.timeline} />
     </div>
   )
 }
