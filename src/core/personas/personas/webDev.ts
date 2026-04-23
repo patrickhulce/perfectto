@@ -72,12 +72,12 @@ export const WEB_DEV_PERSONA: Persona = {
     // a single stripe at low zoom. Pink also matches the "GPU /
     // presentation" hue most perf tools reach for.
     {id: CAT.gpu, label: 'GPU', color: '#e8457f'},
-    {id: CAT.system, label: 'System', color: '#9e9e9e'},
+    {id: CAT.system, label: 'System', color: '#4a5568'},
     // Deliberately omitted from `overviewOrder` below so they contribute
     // no overview stripe — idle / unclassified time reads as the dark
     // gap between bands, matching DevTools.
     {id: CAT.idle, label: 'Idle', color: '#e5e5e5'},
-    {id: CAT.other, label: 'Other', color: '#4a5568'},
+    {id: CAT.other, label: 'Other', color: '#9e9e9e'},
   ],
 
   // Order matters: first-matching rule wins. Keep the more-specific

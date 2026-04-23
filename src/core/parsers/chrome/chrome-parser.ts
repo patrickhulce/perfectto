@@ -40,6 +40,7 @@ import {
 const V8_GC_INTERNAL_NAME = /^V8\.GC_/
 const JS_FRAME_CATEGORY = 'jsFrame'
 const JS_FRAME_TRACE_CATEGORY = 'disabled-by-default-v8.cpu_profiler'
+const JS_HOST_OVERSHOOT_EPSILON_MS = 0.05
 
 /**
  * Names of synthetic CPU-profile nodes that should not be rendered as their
@@ -620,6 +621,11 @@ export class ChromeParser implements TraceParser {
       startTs: number
       children: Measure[]
     }
+    interface SamplePoint {
+      ts: number
+      sampleId: number
+      order: number
+    }
     const openStack: OpenJsFrame[] = []
     const roots: Measure[] = []
 
@@ -633,11 +639,24 @@ export class ChromeParser implements TraceParser {
       }
     }
 
+    // Some real-world V8 profiles contain negative `timeDeltas` corrections,
+    // so the raw sample stream can arrive slightly out of timestamp order.
+    // Feeding that directly into the stack-diff synthesizer can reopen the
+    // same node before the earlier segment closes, yielding same-depth
+    // overlaps, while naively clamping the clock forward erases earlier JS
+    // spans altogether. Instead, accumulate absolute sample timestamps first,
+    // then process the samples in stable time order.
+    const samplePoints: SamplePoint[] = []
     let cumTs = profile.startTs
     for (let i = 0; i < profile.samples.length; i++) {
       cumTs += profile.timeDeltas[i] ?? 0
-      const ts = cumTs
-      const stack = buildCpuStack(profile.nodes, profile.samples[i])
+      samplePoints.push({ts: cumTs, sampleId: profile.samples[i], order: i})
+    }
+    samplePoints.sort((a, b) => a.ts - b.ts || a.order - b.order)
+
+    for (const point of samplePoints) {
+      const ts = point.ts
+      const stack = buildCpuStack(profile.nodes, point.sampleId)
 
       if (isIdleStack(stack)) {
         closeFromDepth(0, ts)
@@ -656,7 +675,7 @@ export class ChromeParser implements TraceParser {
     }
 
     // Close any still-open frames at the end of the profile.
-    const endTs = cumTs
+    const endTs = samplePoints.length > 0 ? samplePoints[samplePoints.length - 1].ts : profile.startTs
     closeFromDepth(0, endTs)
     return roots
   }
@@ -917,7 +936,7 @@ function attachJsRoot(rootMeasures: Measure[], jsRoot: Measure): void {
   let hostStart = Number.NEGATIVE_INFINITY
   for (let i = chain.length - 1; i >= 0; i--) {
     const ancestor = chain[i]
-    if (ancestor.end >= jsRoot.end) {
+    if (ancestor.end + JS_HOST_OVERSHOOT_EPSILON_MS >= jsRoot.end) {
       hostChildren = ancestor.measures
       hostEnd = ancestor.end
       hostStart = ancestor.start
@@ -937,19 +956,29 @@ function attachJsRoot(rootMeasures: Measure[], jsRoot: Measure): void {
   // jsRoot itself gets clipped too in case of tail overshoot.
   clipSubtreeToBounds(jsRoot, hostStart, hostEnd)
 
-  // Re-parent any pre-existing host children whose bounds fall inside the
-  // (clipped) JS root's span. Those were logged while the JS function was
-  // on the stack and belong as descendants of the JS frame, not peers.
-  // For each sibling, descend into the JS subtree and attach at the
-  // deepest JS descendant whose bounds still contain it — otherwise a
-  // sibling that fires inside (say) `flushPassiveEffects` ends up as a
-  // peer of `flushPassiveEffects` rather than a child, reintroducing the
-  // same same-depth overlap we just fixed at the host level.
+  // Re-parent any pre-existing host children whose bounds overlap the
+  // (clipped) JS root's span. Fully-contained siblings move wholesale;
+  // straddlers get clipped to the overlapping interval first. This mirrors
+  // the descendant-level straddler handling below: we would rather keep the
+  // in-JS portion of a `V8Console` / `v8::Debugger::*` slice nested under the
+  // JS frame than leave it as a same-depth peer that overlaps the user-code
+  // bar we just attached.
+  //
+  // For each sibling, descend into the JS subtree and attach at the deepest
+  // JS descendant whose bounds still contain it — otherwise a sibling that
+  // fires inside (say) `flushPassiveEffects` ends up as a peer of
+  // `flushPassiveEffects` rather than a child, reintroducing the same-depth
+  // overlap we just fixed at the host level.
   const remaining: Measure[] = []
   const reparented: Measure[] = []
   for (const existing of hostChildren) {
-    if (existing.start >= jsRoot.start && existing.end <= jsRoot.end) {
-      reparented.push(existing)
+    const overlapStart = existing.start > jsRoot.start ? existing.start : jsRoot.start
+    const overlapEnd = existing.end < jsRoot.end ? existing.end : jsRoot.end
+    if (overlapStart < overlapEnd) {
+      if (existing.start < overlapStart) existing.start = overlapStart
+      if (existing.end > overlapEnd) existing.end = overlapEnd
+      clipSubtreeToBounds(existing, existing.start, existing.end)
+      if (existing.start < existing.end) reparented.push(existing)
     } else {
       remaining.push(existing)
     }

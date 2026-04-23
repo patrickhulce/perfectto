@@ -449,6 +449,26 @@ export function useTimelineZoom(
           cursorBefore?: string
         }
       | {
+          // Left-button pressed over the timeline, but we haven't decided
+          // whether this is a pan or a click yet. Promotes to `pan` once
+          // movement crosses `CLICK_THRESHOLD_PX`; a release before then
+          // flows through the same click-dispatch path as `click-track`.
+          // This is what lets single-click slice-selection keep working
+          // on presets where `leftDrag` is bound to pan — without it,
+          // pan starts on the initial `pointerdown` and consumes the
+          // pointerup, so the selection hook's click tracker never sees
+          // a clean click.
+          kind: 'pending-pan'
+          axes: PanAxes
+          pointerId: number
+          startClientX: number
+          startClientY: number
+          startScrollLeft: number
+          startScrollTop: number
+          button: number
+          cursorBefore?: string
+        }
+      | {
           kind: 'click-track'
           pointerId: number
           startClientX: number
@@ -562,8 +582,12 @@ export function useTimelineZoom(
         if (action === 'selection.selectRange') return
         const axes = panAxesForAction(action)
         if (axes !== null) {
+          // Enter pending-pan: we don't commit to a pan (cursor change,
+          // pointer capture) until the pointer actually moves past
+          // `CLICK_THRESHOLD_PX`. This preserves click-to-select on the
+          // default preset where `leftDrag` is bound to pan.
           panning = {
-            kind: 'pan',
+            kind: 'pending-pan',
             axes,
             pointerId: e.pointerId,
             startClientX: e.clientX,
@@ -572,12 +596,6 @@ export function useTimelineZoom(
             startScrollTop: scroller.scrollTop,
             button: e.button,
             cursorBefore: el.style.cursor,
-          }
-          el.style.cursor = 'grabbing'
-          try {
-            el.setPointerCapture(e.pointerId)
-          } catch {
-            // Non-capture-eligible target; ignore.
           }
           return
         }
@@ -607,6 +625,39 @@ export function useTimelineZoom(
         }
         return
       }
+      if (panning.kind === 'pending-pan') {
+        const dxPending = e.clientX - panning.startClientX
+        const dyPending = e.clientY - panning.startClientY
+        if (
+          Math.abs(dxPending) < CLICK_THRESHOLD_PX &&
+          Math.abs(dyPending) < CLICK_THRESHOLD_PX
+        ) {
+          // Still within the click slop — don't commit to a pan yet.
+          return
+        }
+        // Threshold crossed: promote to a real pan. Change the cursor
+        // and grab the pointer so subsequent move/up events route here
+        // even if the pointer leaves the element's box.
+        panning = {
+          kind: 'pan',
+          axes: panning.axes,
+          pointerId: panning.pointerId,
+          startClientX: panning.startClientX,
+          startClientY: panning.startClientY,
+          startScrollLeft: panning.startScrollLeft,
+          startScrollTop: panning.startScrollTop,
+          button: panning.button,
+          cursorBefore: panning.cursorBefore,
+        }
+        el.style.cursor = 'grabbing'
+        try {
+          el.setPointerCapture(e.pointerId)
+        } catch {
+          // Non-capture-eligible target; ignore.
+        }
+        // Fall through to the scroll update below so the very first
+        // past-threshold frame already moves the viewport.
+      }
       const scroller = scrollerRef.current
       if (!scroller) return
       const dx = e.clientX - panning.startClientX
@@ -622,7 +673,13 @@ export function useTimelineZoom(
 
     const endPan = (e: PointerEvent): void => {
       if (!panning || e.pointerId !== panning.pointerId) return
-      if (panning.kind === 'click-track') {
+      if (panning.kind === 'click-track' || panning.kind === 'pending-pan') {
+        // Either we never bound a drag action (click-track) or we bound
+        // one but the pointer never moved far enough to commit
+        // (pending-pan). Either way, a sub-threshold release at this
+        // point is a click — dispatch the `click` binding. A release
+        // on `pointercancel` past threshold is a no-op, matching the
+        // prior click-track behavior.
         const dx = e.clientX - panning.startClientX
         const dy = e.clientY - panning.startClientY
         const isClick =

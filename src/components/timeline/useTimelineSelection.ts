@@ -188,6 +188,16 @@ export function useTimelineSelection(
       // keeps click-through / capture semantics intact.
       e.preventDefault()
 
+      // The overview canvas sits *inside* the main event surface in the
+      // DOM, so a pointerdown on it bubbles up to where `useTimelineZoom`
+      // is listening and would otherwise start a horizontal pan at the
+      // same instant we're trying to draw a selection. Swallow the event
+      // for the overview path only — the main-surface path still needs
+      // to propagate to the viewport hook for middle-click pan etc.
+      if (source === 'overview') {
+        e.stopPropagation()
+      }
+
       drag = {
         host,
         pointerId: e.pointerId,
@@ -215,6 +225,9 @@ export function useTimelineSelection(
 
     const onPointerMove = (e: PointerEvent): void => {
       if (!drag || e.pointerId !== drag.pointerId) return
+      // Overview-sourced drags must not leak to the viewport hook's
+      // listeners on the event surface — same reason as the down path.
+      if (drag.source === 'overview') e.stopPropagation()
       const dx = e.clientX - drag.startClientX
       const dy = e.clientY - drag.startClientY
       if (!drag.promoted) {
@@ -234,6 +247,7 @@ export function useTimelineSelection(
 
     const onPointerUp = (e: PointerEvent): void => {
       if (!drag || e.pointerId !== drag.pointerId) return
+      if (drag.source === 'overview') e.stopPropagation()
       const host = drag.host
       const wasPromoted = drag.promoted
       try {
@@ -257,6 +271,7 @@ export function useTimelineSelection(
 
     const onPointerCancel = (e: PointerEvent): void => {
       if (!drag || e.pointerId !== drag.pointerId) return
+      if (drag.source === 'overview') e.stopPropagation()
       drag = null
       selectionStore.cancel()
       hideTooltip()

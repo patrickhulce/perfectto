@@ -1,3 +1,6 @@
+import {readFile} from 'node:fs/promises'
+import path from 'node:path'
+
 import {parseTrace} from '../core/parser'
 import type {Measure, TimelineContainer} from '../core'
 
@@ -5,6 +8,10 @@ const SOURCE = {name: 'trace.json', size: 0}
 
 function streamFromString(text: string): ReadableStream<Uint8Array> {
   const bytes = new TextEncoder().encode(text)
+  return streamFromBytes(bytes)
+}
+
+function streamFromBytes(bytes: Uint8Array): ReadableStream<Uint8Array> {
   return new ReadableStream<Uint8Array>({
     start(controller) {
       controller.enqueue(bytes)
@@ -35,6 +42,42 @@ function collectMeasures(container: TimelineContainer): Measure[] {
   }
   walk(container)
   return out
+}
+
+interface SiblingOverlap {
+  parentName: string
+  leftName: string
+  rightName: string
+  leftStart: number
+  leftEnd: number
+  rightStart: number
+  rightEnd: number
+}
+
+function collectSiblingOverlaps(
+  container: TimelineContainer,
+  parentName: string = '(root)',
+): SiblingOverlap[] {
+  const overlaps: SiblingOverlap[] = []
+  const siblings = [...container.measures].sort((a, b) => a.start - b.start || a.end - b.end)
+  for (let i = 0; i < siblings.length; i++) {
+    const left = siblings[i]
+    for (let j = i + 1; j < siblings.length; j++) {
+      const right = siblings[j]
+      if (right.start >= left.end) break
+      overlaps.push({
+        parentName,
+        leftName: left.name,
+        rightName: right.name,
+        leftStart: left.start,
+        leftEnd: left.end,
+        rightStart: right.start,
+        rightEnd: right.end,
+      })
+    }
+    overlaps.push(...collectSiblingOverlaps(left, left.name))
+  }
+  return overlaps
 }
 
 // CPU profile nodes: (root=1) -> (program=2), (root=1) -> foo=10 -> bar=11
@@ -235,6 +278,75 @@ describe('ChromeParser - CPU sample synthesis', () => {
     // But real user frames survive.
     expect(names.has('foo')).toBe(true)
   })
+
+  it('sorts negative timeDeltas by absolute sample timestamp instead of clamping them forward', async () => {
+    const trace = await parseTrace(
+      streamFromString(
+        JSON.stringify({
+          traceEvents: [
+            {
+              ph: 'X',
+              name: 'EvaluateScript',
+              cat: 'devtools.timeline',
+              pid: 1,
+              tid: 100,
+              ts: 0,
+              dur: 500,
+            },
+            {
+              ph: 'P',
+              name: 'Profile',
+              cat: 'disabled-by-default-v8.cpu_profiler',
+              pid: 1,
+              tid: 100,
+              id: '0x1',
+              ts: 0,
+              args: {data: {startTime: 0}},
+            },
+            {
+              ph: 'P',
+              name: 'ProfileChunk',
+              cat: 'disabled-by-default-v8.cpu_profiler',
+              pid: 1,
+              tid: 200,
+              id: '0x1',
+              ts: 0,
+              args: {
+                data: {
+                  cpuProfile: {
+                    nodes: CPU_PROFILE_NODES,
+                    samples: [11, 10, 11, 10],
+                  },
+                  // Sample timestamps are 100, 150, 125, 150. Processing them
+                  // in input order reopens `bar` before the prior segment
+                  // closes; clamping them forward erases the 125 µs sample's
+                  // earlier position. Sorting by absolute timestamp yields a
+                  // single contiguous `bar` span ending at 150 µs.
+                  timeDeltas: [100, 50, -25, 25],
+                },
+              },
+            },
+          ],
+        }),
+      ),
+      SOURCE,
+    )
+
+    const main = trace.timeline.systems
+      .flatMap(s => s.tracks)
+      .find(t => t.name.startsWith('Thread'))!
+    const evalScript = findMeasure(main, m => m.name === 'EvaluateScript')!
+    const overlaps = collectSiblingOverlaps(evalScript)
+    expect(overlaps).toEqual([])
+
+    const foo = findMeasure(evalScript, m => m.name === 'foo')!
+    const bars = foo.measures.filter(m => m.name === 'bar').sort((a, b) => a.start - b.start)
+    expect(bars).toHaveLength(1)
+    expect(bars[0].start).toBeCloseTo(100 / 1000, 6)
+    expect(bars[0].end).toBeCloseTo(150 / 1000, 6)
+    expect(foo.start).toBeCloseTo(100 / 1000, 6)
+    expect(foo.end).toBeCloseTo(150 / 1000, 6)
+  })
 })
 
 describe('ChromeParser - JS-frame nesting into existing B/E tree', () => {
@@ -393,6 +505,111 @@ describe('ChromeParser - JS-frame nesting into existing B/E tree', () => {
     expect(host.measures.find(m => m.name === 'SiblingB')).toBeUndefined()
   })
 
+  it('clips and reparents host children that straddle the JS root boundaries', async () => {
+    // Host [0, 500 µs], JS root [100, 400 µs]. The siblings overlap the JS
+    // root on each edge but are not fully contained by it, matching the
+    // `performWorkUntilDeadline` / debugger-console edge case from the real
+    // trace. They should still be attached under the JS subtree after being
+    // clipped to the overlapping span.
+    const trace = await buildJsNestingTrace({
+      hostStart: 0,
+      hostDur: 500,
+      profileStart: 100,
+      timeDeltas: [0, 100, 100, 100],
+      extraChildren: [
+        {name: 'V8Console', ts: 90, dur: 50},
+        {name: 'v8::Debugger::AsyncTaskRun', ts: 390, dur: 30},
+      ],
+    })
+    const main = trace.timeline.systems
+      .flatMap(s => s.tracks)
+      .find(t => t.name.startsWith('Thread'))!
+    const host = findMeasure(main, m => m.name === 'Host')!
+    expect(host.measures.map(m => m.name)).toEqual(['foo'])
+
+    const foo = host.measures[0]
+    const debuggerSlice = findMeasure(foo, m => m.name === 'v8::Debugger::AsyncTaskRun')
+    const consoleSlice = findMeasure(foo, m => m.name === 'V8Console')
+
+    expect(consoleSlice).not.toBeNull()
+    expect(consoleSlice!.start).toBeCloseTo(foo.start, 6)
+    expect(consoleSlice!.end).toBeCloseTo(140 / 1000, 6)
+
+    expect(debuggerSlice).not.toBeNull()
+    expect(debuggerSlice!.start).toBeCloseTo(390 / 1000, 6)
+    expect(debuggerSlice!.end).toBeCloseTo(foo.end, 6)
+
+    expect(host.measures.find(m => m.name === 'V8Console')).toBeUndefined()
+    expect(host.measures.find(m => m.name === 'v8::Debugger::AsyncTaskRun')).toBeUndefined()
+  })
+
+  it('prefers the deeper host when the JS root only overshoots it by a tiny sampling tail', async () => {
+    const trace = await parseTrace(
+      streamFromString(
+        JSON.stringify({
+          traceEvents: [
+            {ph: 'X', name: 'Outer', cat: 'v8', pid: 1, tid: 100, ts: 0, dur: 500},
+            {ph: 'X', name: 'Inner', cat: 'devtools.timeline', pid: 1, tid: 100, ts: 0, dur: 400},
+            {
+              ph: 'P',
+              name: 'Profile',
+              cat: 'disabled-by-default-v8.cpu_profiler',
+              pid: 1,
+              tid: 100,
+              id: '0x1',
+              ts: 100,
+              args: {data: {startTime: 100}},
+            },
+            {
+              ph: 'P',
+              name: 'ProfileChunk',
+              cat: 'disabled-by-default-v8.cpu_profiler',
+              pid: 1,
+              tid: 200,
+              id: '0x1',
+              ts: 100,
+              args: {
+                data: {
+                  cpuProfile: {
+                    nodes: [
+                      {id: 1, callFrame: {functionName: '(root)', scriptId: 0, codeType: 'other'}},
+                      {
+                        id: 10,
+                        parent: 1,
+                        callFrame: {
+                          functionName: 'performWorkUntilDeadline',
+                          scriptId: 42,
+                          url: 'app.js',
+                          lineNumber: 1,
+                          columnNumber: 1,
+                        },
+                      },
+                    ],
+                    samples: [10, 10, 10, 10],
+                  },
+                  // Root spans 100..415 µs: only 15 µs past Inner.end.
+                  timeDeltas: [0, 100, 100, 115],
+                },
+              },
+            },
+          ],
+        }),
+      ),
+      SOURCE,
+    )
+
+    const main = trace.timeline.systems
+      .flatMap(s => s.tracks)
+      .find(t => t.name.startsWith('Thread'))!
+    const inner = findMeasure(main, m => m.name === 'Inner')!
+    const outer = findMeasure(main, m => m.name === 'Outer')!
+    const jsRoot = findMeasure(main, m => m.name === 'performWorkUntilDeadline')!
+
+    expect(findMeasure(inner, m => m.name === 'performWorkUntilDeadline')).toBe(jsRoot)
+    expect(jsRoot.end).toBeCloseTo(inner.end, 6)
+    expect(outer.measures.find(m => m === jsRoot)).toBeUndefined()
+  })
+
   it('mints short lowercase-hex ids (no prefix, no zero-padding)', async () => {
     const trace = await buildJsNestingTrace({
       hostStart: 0,
@@ -453,4 +670,23 @@ describe('ChromeParser - V8.GC_* collapse', () => {
     expect(all.find(m => m.name === 'V8.GC_SCAVENGER_SCAVENGE')).toBeDefined()
     expect(all.find(m => m.name === 'V8.GC_HEAP_PROLOGUE')).toBeDefined()
   })
+})
+
+describe('ChromeParser - real trace overlap invariants', () => {
+  it('parses the main thread with zero same-depth unattached overlaps', async () => {
+    const filePath = path.resolve(__dirname, '..', '..', 'assets', 'perfecto-chrome-trace.json')
+    const bytes = await readFile(filePath)
+    const trace = await parseTrace(
+      streamFromBytes(new Uint8Array(bytes)),
+      {name: 'perfecto-chrome-trace.json', size: bytes.byteLength},
+    )
+
+    const renderer = trace.timeline.systems.find(s => s.name === 'Renderer')
+    expect(renderer).toBeDefined()
+    const mainTrack = renderer!.tracks.find(t => t.name === 'CrRendererMain')
+    expect(mainTrack).toBeDefined()
+
+    const overlaps = collectSiblingOverlaps(mainTrack!)
+    expect(overlaps).toEqual([])
+  }, 30000)
 })

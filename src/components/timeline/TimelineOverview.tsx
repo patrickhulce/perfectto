@@ -340,7 +340,11 @@ function TimelineOverviewBase({
         alignItems: 'stretch',
         position: 'sticky',
         top: 0,
-        zIndex: 3,
+        // One level above the per-track sticky label gutter (zIndex: 3 in
+        // CanvasTrackRenderer) and system header (zIndex: 3 in
+        // TimelineSystem) so rows scroll *under* the overview instead of
+        // painting on top of it at equal-z.
+        zIndex: 4,
         height: TIMELINE_OVERVIEW_HEIGHT_PX,
         width: '100%',
       }}

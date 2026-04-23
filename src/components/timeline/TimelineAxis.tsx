@@ -184,11 +184,12 @@ function TimelineAxisBase({store, labelWidthPx, stickyTopPx = 0}: TimelineAxisPr
         display: 'flex',
         alignItems: 'stretch',
         // Stick to the top of the scroller (or just below the overview
-        // when one is present — see `stickyTopPx`). z-index keeps the
-        // axis above track content during vertical scroll.
+        // when one is present — see `stickyTopPx`). Keep the whole axis
+        // above the sticky system / track label gutters (z=3) so the
+        // per-ms tick labels do not disappear behind them while scrolling.
         position: 'sticky',
         top: stickyTopPx,
-        zIndex: 2,
+        zIndex: 4,
         height: TIMELINE_AXIS_HEIGHT_PX,
         width: '100%',
       }}
