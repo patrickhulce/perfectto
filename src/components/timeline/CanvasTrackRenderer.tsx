@@ -50,6 +50,15 @@ const SKIRT_FACTOR = 3
 const SKIRT_EDGE_THRESHOLD_FRACTION = 0.5
 
 /**
+ * Duration of the overlay's opacity fade-out when a hover/selection ends.
+ * Kept in lockstep with the base canvas's `transition: opacity` below so
+ * the flame-chart's "de-emphasis" and the highlight's "fade away" finish
+ * at the same time — hovering off a slice feels like one motion instead
+ * of two competing ones.
+ */
+const OVERLAY_FADE_OUT_MS = 500
+
+/**
  * Snapshot of what the base canvas currently has painted on it. Updated
  * every time we redraw the base; consulted every frame to decide between
  * a cheap `translateX` update and a full repaint. The base canvas's
@@ -136,8 +145,15 @@ function CanvasTrackRendererBase({
     let lastBackingHeightCss = -1
     let lastDpr = -1
     let lastBaseOpacity = ''
+    let lastOverlayOpacity = ''
     let loaded: LoadedRange | null = null
     let overlayPainted: OverlayPaint | null = null
+    // Remembered so we can keep the highlight rect on the overlay canvas
+    // during the fade-out — without it, `currentHighlight()` returns
+    // `undefined` the instant the user moves off and we'd wipe the
+    // pixels before CSS had anything to fade.
+    let lastHighlight: {startMs: number; endMs: number; minDepth: number} | undefined = undefined
+    let overlayClearTimer: number | null = null
 
     /**
      * Resolve which (if any) slice on *this* track should drive the
@@ -159,10 +175,35 @@ function CanvasTrackRendererBase({
 
     const syncBaseOpacity = (): void => {
       const sel = selectionStore.get()
-      const nextOpacity = sel.hoveredSlice ?? sel.selectedSlice ? '0.4' : '0.8'
+      const nextOpacity = (sel.hoveredSlice ?? sel.selectedSlice) ? '0.4' : '0.8'
       if (nextOpacity === lastBaseOpacity) return
       canvas.style.opacity = nextOpacity
       lastBaseOpacity = nextOpacity
+    }
+
+    const syncOverlayOpacity = (hasHighlight: boolean): void => {
+      const next = hasHighlight ? '1' : '0'
+      if (next === lastOverlayOpacity) return
+      overlay.style.opacity = next
+      lastOverlayOpacity = next
+    }
+
+    /**
+     * Wipe the overlay canvas for real. Called at the end of the fade-out
+     * window (or immediately on unmount / view-invalidating changes) so
+     * stale highlight pixels don't linger behind an invisible canvas and
+     * pop back in if something re-enables opacity.
+     */
+    const clearOverlayNow = (): void => {
+      overlayCtx.clearRect(0, 0, overlay.width, overlay.height)
+      overlayPainted = null
+      lastHighlight = undefined
+    }
+
+    const cancelPendingOverlayClear = (): void => {
+      if (overlayClearTimer === null) return
+      window.clearTimeout(overlayClearTimer)
+      overlayClearTimer = null
     }
 
     /**
@@ -315,9 +356,9 @@ function CanvasTrackRendererBase({
       if (pxPerMs <= 0) {
         // Parse not finished yet; clear both canvases and bail.
         ctx.clearRect(0, 0, canvas.width, canvas.height)
-        overlayCtx.clearRect(0, 0, overlay.width, overlay.height)
+        cancelPendingOverlayClear()
+        clearOverlayNow()
         loaded = null
-        overlayPainted = null
         return
       }
       const contentWidthCss = Math.max(0, state.viewportWidth - state.labelWidthPx)
@@ -371,7 +412,25 @@ function CanvasTrackRendererBase({
       // scrolls (base translate, no redraw) leave the overlay
       // untouched — its drawn rects are already anchored correctly.
       const highlight = currentHighlight()
-      const highlightKey = highlightKeyOf(highlight)
+      // When the hover goes away we keep the last-drawn highlight on the
+      // canvas and let CSS fade opacity to 0 over OVERLAY_FADE_OUT_MS. A
+      // trailing timer clears the pixels once the transition has
+      // finished; if a new highlight arrives first the timer is cancelled
+      // and we paint the new one immediately at opacity 1.
+      if (highlight) {
+        cancelPendingOverlayClear()
+        lastHighlight = highlight
+      } else if (lastHighlight !== undefined && overlayClearTimer === null) {
+        overlayClearTimer = window.setTimeout(() => {
+          overlayClearTimer = null
+          clearOverlayNow()
+          schedule()
+        }, OVERLAY_FADE_OUT_MS)
+      }
+      syncOverlayOpacity(!!highlight)
+
+      const drawHighlight = highlight ?? (overlayClearTimer !== null ? lastHighlight : undefined)
+      const highlightKey = highlightKeyOf(drawHighlight)
       const overlayMustRedraw =
         overlayPainted === null ||
         overlayPainted.pxPerMs !== loaded.pxPerMs ||
@@ -387,7 +446,7 @@ function CanvasTrackRendererBase({
           loaded.scrollLeftAnchor,
           loaded.widthCss,
           loaded.heightCss,
-          highlight,
+          drawHighlight,
         )
       }
     }
@@ -421,6 +480,7 @@ function CanvasTrackRendererBase({
       unsubscribe()
       unsubscribeSelection()
       dprMedia?.removeEventListener?.('change', onDprChange)
+      cancelPendingOverlayClear()
       if (rafRef.current !== null) {
         cancelAnimationFrame(rafRef.current)
         rafRef.current = null
@@ -534,7 +594,7 @@ function CanvasTrackRendererBase({
             willChange: 'transform, opacity',
             // Ease opacity changes a bit so hover/selection emphasis feels
             // deliberate instead of flashing on quick pointer movement.
-            transition: 'opacity 140ms ease-out',
+            transition: 'opacity 500ms ease-out',
             // The RAF render loop owns this opacity so it can switch
             // between the idle (0.8) and active-highlight (0.4) states
             // without a React re-render. The full-opacity overlay canvas
@@ -558,7 +618,14 @@ function CanvasTrackRendererBase({
             top: 0,
             height: heightPx,
             display: 'block',
-            willChange: 'transform',
+            willChange: 'transform, opacity',
+            // Match the base's fade so both canvases settle together
+            // when the user moves off a slice. The RAF loop flips
+            // opacity between 0 and 1; the pixels are left on the
+            // canvas until the trailing clear timer fires so there's
+            // something here to actually transition.
+            transition: 'opacity 500ms ease-out',
+            opacity: 0,
           }}
         />
       </div>

@@ -111,7 +111,7 @@ export const WEB_DEV_PERSONA: Persona = {
     // Scripting / V8 / JS execution.
     {
       measureName:
-        /^(v8\.|V8\.|FunctionCall|EvaluateScript|EvaluateModule|CompileScript|CompileCode|CompileModule|MinorGC|MajorGC|GC|GCEvent|TimerFire|TimerInstall|TimerRemove|EventDispatch|RunMicrotasks|RunTask|ParseScriptOnBackground|XHRReadyStateChange|ScheduledAction::execute|AsyncTask|ScriptStreamer)/i,
+        /^(v8\.|V8\.|FunctionCall|EvaluateScript|EvaluateModule|CompileScript|CompileCode|CompileModule|ScriptCompiled|ScriptStreamer|ScriptStreamingTask|MinorGC|MajorGC|GC|GCEvent|TimerFire|TimerInstall|TimerRemove|EventDispatch|RunMicrotasks|RunTask|ParseScriptOnBackground|XHRReadyStateChange|ScheduledAction::execute|AsyncTask)/i,
       categoryId: CAT.scripting,
     },
     {
