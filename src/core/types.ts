@@ -20,6 +20,37 @@ export interface Mark {
   events: RawEvent[]
 }
 
+export interface SourceLocation {
+  url?: string
+  lineNumber?: number
+  columnNumber?: number
+}
+
+/**
+ * A measure that represents a single frame in a call stack (JS, native,
+ * etc.). Carries everything the UI needs to render a stack entry without
+ * reaching back into parser-internal raw events or category strings.
+ */
+export interface MeasureAttributionCallsite {
+  kind: 'callsite'
+  /** Display label for the frame (e.g. function name, or '(anonymous)'). */
+  label: string
+  /** Optional source location for the call site. */
+  location?: SourceLocation
+  /**
+   * Where this attribution came from. Lets future UIs filter/group by
+   * producer (e.g. 'v8-cpu-profile') without re-coupling to internals.
+   */
+  source?: string
+}
+
+/**
+ * Display-ready metadata a parser attaches to a {@link Measure} to tell
+ * the UI what the measure represents. Discriminated by `kind` so future
+ * producers can add new attribution shapes without reshuffling.
+ */
+export type MeasureAttribution = MeasureAttributionCallsite
+
 export interface Measure extends TimelineContainer {
   id: string
   name: string
@@ -29,6 +60,14 @@ export interface Measure extends TimelineContainer {
   color?: string
   events: RawEvent[]
   compaction?: CompactionReport[]
+  /**
+   * Optional display-ready metadata describing *what this measure
+   * represents* in a way the UI can act on generically (e.g. render a
+   * callstack, surface a code location). Parsers populate this; UI code
+   * must not inspect raw events or categories to reconstruct the same
+   * information.
+   */
+  attribution?: MeasureAttribution
 }
 
 export interface CompactionReport {

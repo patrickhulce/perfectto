@@ -1,32 +1,24 @@
-import type {Measure, RawEvent, Timeline, Track} from '../../core'
+import type {Measure, MeasureAttributionCallsite, Timeline, Track} from '../../core'
 import {
   buildAncestorChain,
   findMeasureIndexById,
 } from '../../core/render/sliceBuffers'
 import type {SliceRef} from './selectionStore'
 
-/** The parser-assigned category for V8 CPU-profiler frames. */
-export const JS_FRAME_CATEGORY = 'jsFrame'
-/** `ph` of the synthetic raw event that carries JS frame metadata. */
-export const JS_FRAME_PHASE = 'JS_FRAME'
-
 /**
  * One entry in a reconstructed callstack. A frame wraps the underlying
- * `Measure` for anyone who needs the full record, plus the commonly-shown
- * call-site fields pulled from the synthetic `JS_FRAME` raw event.
+ * `Measure` for anyone who needs the full record, plus the measure's
+ * optional callsite attribution (function name + source location) when
+ * the parser produced one.
  *
- * `isJsFrame` distinguishes true V8 sample frames from host measures
- * (`FunctionCall`, `v8.callFunction`, …) that get interleaved into the
+ * Frames without a callsite attribution are host wrappers (e.g.
+ * `FunctionCall`, `v8.callFunction`, tasks, …) that interleave into the
  * ancestor chain; consumers can either render the full chain or filter
- * down to the JS frames.
+ * down to the attributed frames via `attribution.kind === 'callsite'`.
  */
 export interface CallstackFrame {
   measure: Measure
-  isJsFrame: boolean
-  functionName?: string
-  url?: string
-  lineNumber?: number
-  columnNumber?: number
+  attribution?: MeasureAttributionCallsite
 }
 
 export interface ResolvedCallstack {
@@ -71,23 +63,10 @@ function locateSlice(
   return null
 }
 
-function findJsFrameEvent(measure: Measure): RawEvent | undefined {
-  for (const ev of measure.events) {
-    if ((ev as {ph?: unknown}).ph === JS_FRAME_PHASE) return ev
-  }
-  return undefined
-}
-
 function frameFor(measure: Measure): CallstackFrame {
-  const isJsFrame = measure.category === JS_FRAME_CATEGORY
-  if (!isJsFrame) return {measure, isJsFrame}
-  const ev = findJsFrameEvent(measure)
-  if (!ev) return {measure, isJsFrame}
-  const functionName = typeof ev.functionName === 'string' ? ev.functionName : undefined
-  const url = typeof ev.url === 'string' ? ev.url : undefined
-  const lineNumber = typeof ev.lineNumber === 'number' ? ev.lineNumber : undefined
-  const columnNumber = typeof ev.columnNumber === 'number' ? ev.columnNumber : undefined
-  return {measure, isJsFrame, functionName, url, lineNumber, columnNumber}
+  const attr = measure.attribution
+  if (attr && attr.kind === 'callsite') return {measure, attribution: attr}
+  return {measure}
 }
 
 /**
@@ -114,12 +93,12 @@ export function resolveCallstack(
 
 /**
  * Predicate for "should the callstack view activate on this selection?".
- * Matches the plan: only when the selected slice is itself a JS frame,
- * to keep the panel focused and avoid surfacing host-measure ancestry
- * as a pseudo-callstack for non-JS selections.
+ * Only when the selected leaf has a `callsite` attribution — that's the
+ * parser-provided signal that the measure represents a real frame (as
+ * opposed to a host wrapper like `FunctionCall` or `RunTask`).
  */
-export function isJsFrameSelection(resolved: ResolvedCallstack): boolean {
+export function hasCallstackSelection(resolved: ResolvedCallstack): boolean {
   if (resolved.leafIndex < 0) return false
   const leaf = resolved.frames[resolved.leafIndex]
-  return leaf?.isJsFrame === true
+  return leaf?.attribution?.kind === 'callsite'
 }

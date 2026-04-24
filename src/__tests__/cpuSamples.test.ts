@@ -199,6 +199,24 @@ describe('ChromeParser - CPU sample synthesis', () => {
     expect(barFrame!.start).toBeCloseTo(200 / 1000, 6)
     expect(barFrame!.end).toBeCloseTo(400 / 1000, 6)
 
+    // Parser-emitted jsFrame measures carry a `callsite` attribution so
+    // the UI can render a callstack without reaching into V8-shaped raw
+    // events. Nothing on the frame itself should leak V8 internals.
+    expect(fooFrame!.attribution).toEqual({
+      kind: 'callsite',
+      source: 'v8-cpu-profile',
+      label: 'foo',
+      location: {url: 'app.js', lineNumber: 1, columnNumber: 1},
+    })
+    expect(barFrame!.attribution).toEqual({
+      kind: 'callsite',
+      source: 'v8-cpu-profile',
+      label: 'bar',
+      location: {url: 'app.js', lineNumber: 5, columnNumber: 1},
+    })
+    expect(fooFrame!.events).toEqual([])
+    expect(barFrame!.events).toEqual([])
+
     // No JS-frame measures on the profiler thread: ProfileChunk's own tid
     // must not accrete samples that logically belong to the main thread.
     if (profilerTrack) {

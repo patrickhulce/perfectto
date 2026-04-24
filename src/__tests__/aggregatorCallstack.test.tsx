@@ -1,22 +1,9 @@
 import {render, screen} from '@testing-library/react'
 import {act} from 'react'
-import type {Measure, RawEvent, Timeline, Track} from '../core'
+import type {Measure, Timeline, Track} from '../core'
 import {buildSliceBuffers} from '../core/render/sliceBuffers'
 import Aggregator from '../components/Aggregator'
 import {createSelectionStore} from '../components/timeline/selectionStore'
-
-function jsFrameEvent(fn: string, line?: number): RawEvent {
-  return {
-    ph: 'JS_FRAME',
-    name: fn,
-    ts: 0,
-    dur: 0,
-    functionName: fn,
-    url: 'https://x/a.js',
-    lineNumber: line,
-    nodeId: 0,
-  }
-}
 
 function jsFrame(
   id: string,
@@ -24,17 +11,24 @@ function jsFrame(
   end: number,
   fn: string,
   children: Measure[] = [],
-  line?: number,
+  lineNumber?: number,
 ): Measure {
+  const label = fn || '(anonymous)'
   return {
     id,
-    name: fn || '(anonymous)',
+    name: label,
     start,
     end,
     category: 'jsFrame',
-    events: [jsFrameEvent(fn, line)],
+    events: [],
     marks: [],
     measures: children,
+    attribution: {
+      kind: 'callsite',
+      source: 'v8-cpu-profile',
+      label,
+      location: {url: 'https://x/a.js', lineNumber},
+    },
   }
 }
 
@@ -62,7 +56,7 @@ describe('Aggregator — callstack view', () => {
     expect(screen.queryByTestId('aggregator-callstack')).toBeNull()
   })
 
-  it('renders root → leaf JS frames when a JS slice is selected', () => {
+  it('renders root → leaf callsite frames when an attributed slice is selected', () => {
     const leaf = jsFrame('leaf', 2, 5, 'render', [], 42)
     const mid = jsFrame('mid', 1, 8, 'dispatch', [leaf])
     const root = jsFrame('root', 0, 10, '(root)', [mid])
@@ -93,8 +87,8 @@ describe('Aggregator — callstack view', () => {
     expect(leafEl?.textContent).toContain('render')
   })
 
-  it('does not render the callstack when the selected slice is not a JS frame', () => {
-    const nonJs: Measure = {
+  it('does not render the callstack when the selected slice has no callsite attribution', () => {
+    const unattributed: Measure = {
       id: 'layout',
       name: 'Layout',
       start: 0,
@@ -104,7 +98,7 @@ describe('Aggregator — callstack view', () => {
       marks: [],
       measures: [],
     }
-    const {timeline} = makeTimeline([nonJs])
+    const {timeline} = makeTimeline([unattributed])
     const store = createSelectionStore()
     render(<Aggregator selectionStore={store} timeline={timeline} />)
 

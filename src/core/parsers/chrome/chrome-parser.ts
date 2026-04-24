@@ -39,7 +39,6 @@ import {
 
 const V8_GC_INTERNAL_NAME = /^V8\.GC_/
 const JS_FRAME_CATEGORY = 'jsFrame'
-const JS_FRAME_TRACE_CATEGORY = 'disabled-by-default-v8.cpu_profiler'
 const JS_HOST_OVERSHOOT_EPSILON_MS = 0.05
 
 /**
@@ -688,28 +687,26 @@ export class ChromeParser implements TraceParser {
     toMs: (ts: number) => number,
   ): Measure {
     const cf: CpuCallFrame = node.callFrame ?? {functionName: ''}
-    const rawEvent: RawEvent = {
-      ph: 'JS_FRAME',
-      cat: JS_FRAME_TRACE_CATEGORY,
-      name: cf.functionName,
-      ts: startTs,
-      dur: endTs - startTs,
-      functionName: cf.functionName,
-      url: cf.url,
-      scriptId: cf.scriptId,
-      lineNumber: cf.lineNumber,
-      columnNumber: cf.columnNumber,
-      nodeId: node.id,
-    }
+    const label = cf.functionName || '(anonymous)'
     return {
       id: this._nextId(),
-      name: cf.functionName || '(anonymous)',
+      name: label,
       start: toMs(startTs),
       end: toMs(endTs),
       category: JS_FRAME_CATEGORY,
-      events: [rawEvent],
+      events: [],
       marks: [],
       measures: children,
+      attribution: {
+        kind: 'callsite',
+        source: 'v8-cpu-profile',
+        label,
+        location: {
+          url: cf.url,
+          lineNumber: cf.lineNumber,
+          columnNumber: cf.columnNumber,
+        },
+      },
     }
   }
 

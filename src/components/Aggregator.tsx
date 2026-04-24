@@ -2,7 +2,7 @@ import {useEffect, useMemo, useState} from 'react'
 import type {Timeline} from '../core'
 import type {SelectionState, SelectionStore} from './timeline/selectionStore'
 import {
-  isJsFrameSelection,
+  hasCallstackSelection,
   resolveCallstack,
   type CallstackFrame,
   type ResolvedCallstack,
@@ -38,9 +38,12 @@ const INITIAL_STATE: SelectionState = {
  *
  *  - The committed time-range duration (drag-select semantics).
  *  - A root→leaf callstack for the sticky `selectedSlice` when that
- *    slice is a V8 JS frame. The callstack is reconstructed on demand
- *    by walking `SliceBuffers.parentIndex` so we don't pay the memory
- *    cost of storing a per-event stack snapshot.
+ *    slice carries a callsite attribution. The callstack is reconstructed
+ *    on demand by walking `SliceBuffers.parentIndex` so we don't pay the
+ *    memory cost of storing a per-event stack snapshot. The UI stays
+ *    agnostic to the attribution's producer (V8 CPU profile, native
+ *    sampler, …) — anything a parser tags as `{kind: 'callsite'}` renders
+ *    here.
  */
 export default function Aggregator({selectionStore, timeline}: AggregatorProps) {
   const [state, setState] = useState<SelectionState>(
@@ -63,7 +66,7 @@ export default function Aggregator({selectionStore, timeline}: AggregatorProps) 
     return resolveCallstack(timeline, state.selectedSlice)
   }, [timeline, state.selectedSlice])
 
-  const showCallstack = isJsFrameSelection(resolved)
+  const showCallstack = hasCallstackSelection(resolved)
 
   return (
     <section
@@ -110,13 +113,16 @@ interface CallstackViewProps {
 }
 
 /**
- * Renders the JS-frame callstack root → leaf. Non-JS ancestors
- * (`FunctionCall`, host B/E/X wrappers) are hidden so the view shows the
- * classic script-land stack users expect from a profiler. The leaf frame
+ * Renders the callstack root → leaf. Only frames whose measure carries a
+ * `callsite` attribution are shown; host wrappers (`FunctionCall`, task
+ * runners, B/E/X ancestry) are filtered out so the view shows the
+ * classic source-land stack users expect from a profiler. The leaf frame
  * is emphasized so users can see which function they actually clicked.
  */
 function CallstackView({resolved}: CallstackViewProps) {
-  const jsFrames = resolved.frames.filter(f => f.isJsFrame)
+  const callsiteFrames = resolved.frames.filter(
+    f => f.attribution?.kind === 'callsite',
+  )
   const leafFrame = resolved.frames[resolved.leafIndex]
   const durationMs = leafFrame
     ? leafFrame.measure.end - leafFrame.measure.start
@@ -126,7 +132,7 @@ function CallstackView({resolved}: CallstackViewProps) {
     <div className="mt-3" data-testid="aggregator-callstack">
       <div className="flex items-baseline justify-between">
         <h4 className="text-[10px] font-semibold uppercase tracking-wide text-[#a0aec0]">
-          JS Callstack
+          Callstack
         </h4>
         {durationMs !== null ? (
           <span className="text-[10px] text-[#718096]">
@@ -137,17 +143,18 @@ function CallstackView({resolved}: CallstackViewProps) {
           </span>
         ) : null}
       </div>
-      {jsFrames.length === 0 ? (
+      {callsiteFrames.length === 0 ? (
         <p className="mt-2 text-xs text-[#718096]">
-          No JS frames in ancestor chain.
+          No attributed frames in ancestor chain.
         </p>
       ) : (
         <ol
           className="mt-2 flex flex-col gap-0.5 font-mono text-[11px] text-[#e2e8f0]"
           data-testid="aggregator-callstack-list"
         >
-          {jsFrames.map((frame, idx) => {
+          {callsiteFrames.map((frame, idx) => {
             const isLeaf = frame === leafFrame
+            const location = frameLocation(frame)
             return (
               <li
                 key={`${frame.measure.id}-${idx}`}
@@ -159,9 +166,9 @@ function CallstackView({resolved}: CallstackViewProps) {
                 data-leaf={isLeaf ? 'true' : undefined}
               >
                 <span className="truncate">{frameLabel(frame)}</span>
-                {frame.url ? (
+                {location ? (
                   <span className="ml-2 text-[10px] text-[#718096]">
-                    {frameLocation(frame)}
+                    {location}
                   </span>
                 ) : null}
               </li>
@@ -174,20 +181,18 @@ function CallstackView({resolved}: CallstackViewProps) {
 }
 
 function frameLabel(frame: CallstackFrame): string {
-  const name =
-    (frame.functionName && frame.functionName.length > 0
-      ? frame.functionName
-      : frame.measure.name) || '(anonymous)'
-  return name
+  const attr = frame.attribution
+  if (attr && attr.label.length > 0) return attr.label
+  return frame.measure.name || '(anonymous)'
 }
 
 function frameLocation(frame: CallstackFrame): string {
-  if (!frame.url) return ''
-  const line = frame.lineNumber
-  const col = frame.columnNumber
-  if (line === undefined) return frame.url
-  if (col === undefined) return `${frame.url}:${line}`
-  return `${frame.url}:${line}:${col}`
+  const loc = frame.attribution?.location
+  if (!loc?.url) return ''
+  const {url, lineNumber, columnNumber} = loc
+  if (lineNumber === undefined) return url
+  if (columnNumber === undefined) return `${url}:${lineNumber}`
+  return `${url}:${lineNumber}:${columnNumber}`
 }
 
 const MS_PER_S = 1000

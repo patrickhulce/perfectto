@@ -1,30 +1,10 @@
-import type {Measure, RawEvent, Timeline, Track} from '../core'
+import type {Measure, Timeline, Track} from '../core'
 import {buildSliceBuffers} from '../core/render/sliceBuffers'
 import {
-  isJsFrameSelection,
+  hasCallstackSelection,
   resolveCallstack,
 } from '../components/timeline/callstack'
 import type {SliceRef} from '../components/timeline/selectionStore'
-
-function jsFrameEvent(
-  functionName: string,
-  url?: string,
-  lineNumber?: number,
-  columnNumber?: number,
-): RawEvent {
-  return {
-    ph: 'JS_FRAME',
-    cat: 'disabled-by-default-v8.cpu_profiler',
-    name: functionName,
-    ts: 0,
-    dur: 0,
-    functionName,
-    url,
-    lineNumber,
-    columnNumber,
-    nodeId: 0,
-  }
-}
 
 function jsFrame(
   id: string,
@@ -34,16 +14,24 @@ function jsFrame(
   children: Measure[] = [],
   url?: string,
   lineNumber?: number,
+  columnNumber?: number,
 ): Measure {
+  const label = functionName || '(anonymous)'
   return {
     id,
-    name: functionName || '(anonymous)',
+    name: label,
     start,
     end,
     category: 'jsFrame',
-    events: [jsFrameEvent(functionName, url, lineNumber)],
+    events: [],
     marks: [],
     measures: children,
+    attribution: {
+      kind: 'callsite',
+      source: 'v8-cpu-profile',
+      label,
+      location: {url, lineNumber, columnNumber},
+    },
   }
 }
 
@@ -89,10 +77,10 @@ describe('resolveCallstack', () => {
     expect(out.frames).toEqual([])
     expect(out.leafIndex).toBe(-1)
     expect(out.track).toBeNull()
-    expect(isJsFrameSelection(out)).toBe(false)
+    expect(hasCallstackSelection(out)).toBe(false)
   })
 
-  it('reconstructs a root-to-leaf chain of JS frames via measureId', () => {
+  it('reconstructs a root-to-leaf chain of callsite frames via measureId', () => {
     const leaf = jsFrame('leaf', 2, 5, 'inner', [], 'https://x/a.js', 12)
     const mid = jsFrame('mid', 1, 8, 'outer', [leaf], 'https://x/a.js', 3)
     const root = jsFrame('root', 0, 10, '(root)', [mid])
@@ -109,11 +97,11 @@ describe('resolveCallstack', () => {
 
     expect(out.frames.map(f => f.measure.id)).toEqual(['root', 'mid', 'leaf'])
     expect(out.leafIndex).toBe(2)
-    expect(out.frames.every(f => f.isJsFrame)).toBe(true)
-    expect(out.frames[2].functionName).toBe('inner')
-    expect(out.frames[2].url).toBe('https://x/a.js')
-    expect(out.frames[2].lineNumber).toBe(12)
-    expect(isJsFrameSelection(out)).toBe(true)
+    expect(out.frames.every(f => f.attribution?.kind === 'callsite')).toBe(true)
+    expect(out.frames[2].attribution?.label).toBe('inner')
+    expect(out.frames[2].attribution?.location?.url).toBe('https://x/a.js')
+    expect(out.frames[2].attribution?.location?.lineNumber).toBe(12)
+    expect(hasCallstackSelection(out)).toBe(true)
   })
 
   it('falls back to bounds+depth when measureId is absent', () => {
@@ -126,7 +114,7 @@ describe('resolveCallstack', () => {
     expect(out.frames.map(f => f.measure.id)).toEqual(['root', 'leaf'])
   })
 
-  it('preserves non-JS-frame ancestors in the chain but marks them', () => {
+  it('preserves unattributed ancestors in the chain but marks them', () => {
     const leaf = jsFrame('leaf', 2, 5, 'inner')
     const hostMeasure = host('h', 'FunctionCall', 1, 8, [leaf])
     const {timeline} = makeTimeline([hostMeasure])
@@ -140,11 +128,14 @@ describe('resolveCallstack', () => {
     }
     const out = resolveCallstack(timeline, ref)
     expect(out.frames.map(f => f.measure.id)).toEqual(['h', 'leaf'])
-    expect(out.frames.map(f => f.isJsFrame)).toEqual([false, true])
-    expect(isJsFrameSelection(out)).toBe(true)
+    expect(out.frames.map(f => f.attribution?.kind)).toEqual([
+      undefined,
+      'callsite',
+    ])
+    expect(hasCallstackSelection(out)).toBe(true)
   })
 
-  it('returns no callstack when the selected leaf is not a JS frame', () => {
+  it('returns no callstack when the selected leaf has no callsite attribution', () => {
     const hostMeasure = host('h', 'Layout', 0, 10)
     const {timeline} = makeTimeline([hostMeasure])
 
@@ -157,7 +148,7 @@ describe('resolveCallstack', () => {
     }
     const out = resolveCallstack(timeline, ref)
     expect(out.frames).toHaveLength(1)
-    expect(isJsFrameSelection(out)).toBe(false)
+    expect(hasCallstackSelection(out)).toBe(false)
   })
 
   it('returns an empty result when the track cannot be found', () => {
