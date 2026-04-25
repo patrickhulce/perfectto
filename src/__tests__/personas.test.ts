@@ -48,7 +48,6 @@ function makeTrace(systems: System[], start = 0, end = 100): ParsedTrace {
     source: {name: 'test', size: 0},
     metadata: {},
     timeline: {start, end, systems},
-    events: [],
   }
 }
 

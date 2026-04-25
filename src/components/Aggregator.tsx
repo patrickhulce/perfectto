@@ -225,6 +225,10 @@ function CallstackView({resolved}: CallstackViewProps) {
   const durationMs = leafFrame
     ? leafFrame.measure.end - leafFrame.measure.start
     : null
+  // A compacted leaf represents many source events. Surface that count
+  // explicitly so users don't think they're looking at a single 1ms
+  // event that was actually 10k folded sub-ms events.
+  const compaction = leafFrame?.measure.compaction?.[0]
 
   return (
     <div className="mt-3" data-testid="aggregator-callstack">
@@ -232,14 +236,29 @@ function CallstackView({resolved}: CallstackViewProps) {
         <h4 className="text-[10px] font-semibold uppercase tracking-wide text-[#a0aec0]">
           Callstack
         </h4>
-        {durationMs !== null ? (
-          <span className="text-[10px] text-[#718096]">
-            leaf{' '}
-            <span className="font-mono text-[#f6e05e]">
-              {formatDuration(durationMs)}
+        <div className="flex items-baseline gap-2">
+          {compaction ? (
+            <span
+              className="rounded border border-[#f6ad55]/40 bg-[#f6ad55]/10 px-1.5 py-0.5 font-mono text-[10px] text-[#f6ad55]"
+              title={
+                compaction.origin === 'cpu-tiny-frames'
+                  ? 'CPU-profile tiny frames were folded here'
+                  : 'Adjacent same-name events were folded here'
+              }
+              data-testid="aggregator-compaction-pill"
+            >
+              {compaction.count.toLocaleString()} folded
             </span>
-          </span>
-        ) : null}
+          ) : null}
+          {durationMs !== null ? (
+            <span className="text-[10px] text-[#718096]">
+              leaf{' '}
+              <span className="font-mono text-[#f6e05e]">
+                {formatDuration(durationMs)}
+              </span>
+            </span>
+          ) : null}
+        </div>
       </div>
       {callsiteFrames.length === 0 ? (
         <p className="mt-2 text-xs text-[#718096]">

@@ -19,6 +19,14 @@ import {
 import {yieldToEventLoop} from '../../utils/yieldToEventLoop'
 import type {FinalizeOptions, TraceParser} from '../types'
 import {
+  compactCpuTinyFrames,
+  compactSiblings,
+  DEFAULT_CPU_TINY_OPTIONS,
+  DEFAULT_SIBLING_COMPACTION_OPTIONS,
+  emptyCompactionCounters,
+  type CompactionCounters,
+} from '../compaction'
+import {
   asyncKey,
   counterKey,
   cpuProfileKey,
@@ -57,6 +65,79 @@ const HIDDEN_CPU_NODE_NAMES = new Set(['(root)', '(garbage collector)'])
 const IDLE_CPU_NODE_NAMES = new Set(['(program)', '(idle)'])
 
 const MAGIC = new TextEncoder().encode('"traceEvents"')
+/**
+ * Shared frozen empty RawEvent[] handed to every Measure/Mark so we
+ * don't allocate a fresh 0-length array per event. At hundreds of
+ * millions of events that's the difference between a few hundred MB
+ * and a few GB of v8 headers.
+ */
+const EMPTY_RAW_EVENTS: RawEvent[] = Object.freeze([]) as unknown as RawEvent[]
+
+/**
+ * Per-thread event count at which the online compactor starts merging
+ * adjacent same-(name,cat) sub-threshold X events into single synthetic
+ * X records. 2M is well below typical v8 heap limits for a raw
+ * ChromeEvent[] (~400-800 MB), so we leave a safety margin before the
+ * full finalize tree doubles the footprint.
+ */
+const STREAMING_CAP_EVENTS = 2_000_000
+/**
+ * Trace-wide event-count threshold below which we skip the finalize
+ * sibling compactor entirely. On a typical dev trace (tens of
+ * thousands of events) every Measure paints fine and folding any of
+ * them only loses information from the user's flame chart. Above the
+ * threshold the compactor still applies its own size gates (leaf-only,
+ * sub-visible duration, span fraction) so it only ever folds genuine
+ * sub-pixel clutter. CPU-profile tiny-frame compaction runs at every
+ * size — it's targeted at synthesized `jsFrame` subtrees where the
+ * fold _is_ the desired rendering.
+ */
+const COMPACTION_MIN_EVENTS = 500_000
+/**
+ * Maximum `dur` (in µs) an X event can have and still be eligible for
+ * online merging. Events wider than this keep their identity because
+ * they're likely to be visible at fit-zoom.
+ */
+const ONLINE_MERGE_MAX_DUR_US = 500
+/** Sentinel field on a ChromeEvent marking it as an online-merged record. */
+const ONLINE_MERGED_ARGS_KEY = '_pfctoMerged'
+
+interface OnlineMergeRecord {
+  count: number
+  firstTs: number
+  lastTs: number
+  totalDur: number
+}
+
+function extractOnlineMergeRecord(ev: ChromeEvent): OnlineMergeRecord | null {
+  const args = ev.args as {[ONLINE_MERGED_ARGS_KEY]?: OnlineMergeRecord} | undefined
+  if (!args) return null
+  const rec = args[ONLINE_MERGED_ARGS_KEY]
+  if (!rec || typeof rec.count !== 'number') return null
+  return rec
+}
+
+/**
+ * Shared string interner. `@streamparser/json` emits fresh primitive
+ * strings per event; on a trace with 200M events and only a few hundred
+ * distinct name/cat values, deduping reclaims the overhead of repeated
+ * string headers. Interning is `O(1)` per call via a Map lookup; miss
+ * cost is one Map set.
+ */
+class StringTable {
+  private readonly _map = new Map<string, string>()
+
+  intern(s: string): string {
+    const hit = this._map.get(s)
+    if (hit !== undefined) return hit
+    this._map.set(s, s)
+    return s
+  }
+
+  get size(): number {
+    return this._map.size
+  }
+}
 const ROOT_METADATA_FIELDS = new Set([
   'metadata',
   'displayTimeUnit',
@@ -125,11 +206,28 @@ export class ChromeParser implements TraceParser {
   private _minTs = Number.POSITIVE_INFINITY
   private _maxTs = Number.NEGATIVE_INFINITY
   private _idCounter = 0
+  /**
+   * Running compaction counters. Populated during finalize (sibling +
+   * CPU-tiny-frame passes) and surfaced on `metadata.compaction` so
+   * UI code can show "N events folded" without re-scanning the tree.
+   * Online counters (from the streaming cap in {@link ThreadEventBuffer})
+   * merge into the same struct before finalize runs its passes.
+   */
+  private _compactionCounters: CompactionCounters = emptyCompactionCounters()
+  private _onlineEventsFolded = 0
+  private _onlineTriggered = false
+  /**
+   * Interns name/cat strings so repeated events on huge traces don't
+   * each carry their own heap-allocated string. Benchmarks: a 3M-event
+   * DevTools trace sees ~85% dedupe on `name` alone.
+   */
+  private _strings = new StringTable()
 
   constructor(options?: unknown) {
     const opts = isChromeParserOptions(options) ? options : {}
     this._options = {
       collapseGcInternals: opts.collapseGcInternals ?? true,
+      compactionMinEvents: opts.compactionMinEvents ?? COMPACTION_MIN_EVENTS,
     }
     this._json_parser = new JSONParser({
       paths: [
@@ -190,6 +288,10 @@ export class ChromeParser implements TraceParser {
     if (!Number.isFinite(pid) || !Number.isFinite(tid)) return
     ev.pid = pid
     ev.tid = tid
+    // Intern the two hot strings so repeated events don't each own a
+    // heap-allocated copy. Rough-stats on huge traces show ~85% dedupe.
+    if (typeof ev.name === 'string') ev.name = this._strings.intern(ev.name)
+    if (typeof ev.cat === 'string') ev.cat = this._strings.intern(ev.cat)
 
     if (isMetadataPh(ph)) {
       this._eventCount += 1
@@ -242,8 +344,76 @@ export class ChromeParser implements TraceParser {
     if (isDurationBegin(ph) || isDurationEnd(ph) || isComplete(ph) || isInstantPh(ph)) {
       const proc = this._touchProcess(pid)
       const thread = this._touchThread(proc, tid)
+      if (
+        isComplete(ph) &&
+        thread.events.length >= STREAMING_CAP_EVENTS &&
+        this._tryOnlineMerge(thread, ev)
+      ) {
+        return
+      }
       thread.events.push(ev)
     }
+  }
+
+  /**
+   * Online compactor: when a thread crosses {@link STREAMING_CAP_EVENTS},
+   * try to merge a newly-arrived `X` event into the last-seen event on
+   * that thread. Conditions to merge:
+   *
+   *   1. The new event has the same `(name, cat)` as the previous.
+   *   2. Both events' durations are under {@link ONLINE_MERGE_MAX_DUR_US}
+   *      so we don't visually hide anything the user would have seen at
+   *      fit-zoom.
+   *   3. The previous event is itself a leaf-ish `X` (not a wrapper with
+   *      recorded children) — we check by looking at the ts delta, not
+   *      by re-scanning subsequent events, so the decision stays O(1).
+   *
+   * When all three hold we update the previous event in-place with an
+   * `_pfctoMerged` record under `args` and bump the aggregate duration.
+   * Finalize recognizes this marker and emits a Measure carrying a
+   * {@link CompactionReport} with `origin: 'sibling'` — the same shape
+   * the finalize sibling compactor emits, so UI code handles both
+   * uniformly.
+   *
+   * Returns `true` iff the event was merged (and therefore should not
+   * be pushed).
+   */
+  private _tryOnlineMerge(thread: ThreadInfo, ev: ChromeEvent): boolean {
+    const dur = typeof ev.dur === 'number' ? ev.dur : 0
+    if (dur <= 0 || dur > ONLINE_MERGE_MAX_DUR_US) return false
+    const prev = thread.events[thread.events.length - 1]
+    if (!prev || prev.ph !== 'X') return false
+    if (prev.name !== ev.name || prev.cat !== ev.cat) return false
+    const prevDur = typeof prev.dur === 'number' ? prev.dur : 0
+    if (prevDur > ONLINE_MERGE_MAX_DUR_US) return false
+    // Require the previous event to end before or at the new event's
+    // start — overlap would mean they're nested, not peers.
+    const prevEnd = prev.ts + prevDur
+    if (prevEnd > ev.ts) return false
+
+    const args = (prev.args ?? {}) as Record<string, unknown>
+    let record = args[ONLINE_MERGED_ARGS_KEY] as OnlineMergeRecord | undefined
+    if (!record) {
+      record = {
+        count: 1,
+        firstTs: prev.ts,
+        lastTs: prevEnd,
+        totalDur: prevDur,
+      }
+      args[ONLINE_MERGED_ARGS_KEY] = record
+      prev.args = args
+    }
+    record.count += 1
+    record.lastTs = ev.ts + dur
+    record.totalDur += dur
+    // Widen the stored `dur` so downstream logic that reads `ts + dur`
+    // still sees the merged span. The run's ts stays at the first
+    // event's ts (prev.ts) — which is exactly firstTs.
+    prev.dur = record.lastTs - record.firstTs
+
+    this._onlineEventsFolded += 1
+    this._onlineTriggered = true
+    return true
   }
 
   /**
@@ -383,15 +553,32 @@ export class ChromeParser implements TraceParser {
     const onProgress = options?.onProgress
     const baseBytesRead = options?.bytesRead ?? 0
     const streamIndex = options?.streamIndex ?? 0
+    // Throttle finalize-phase progress pumps to 50 ms. Without this a
+    // 64-process trace spams the worker message channel so hard that the
+    // main-thread render loop can't keep up with progress redraws. The
+    // universal parser already throttles the `parsing` phase; this
+    // mirrors that cadence for finalize.
+    const FINALIZE_PROGRESS_MIN_INTERVAL_MS = 50
+    let lastProgressAt = 0
+    const emitFinalizeProgress = (): void => {
+      if (!onProgress) return
+      const now = (globalThis.performance?.now?.() ?? Date.now())
+      if (now - lastProgressAt < FINALIZE_PROGRESS_MIN_INTERVAL_MS) return
+      lastProgressAt = now
+      onProgress({streamIndex, bytesRead: baseBytesRead, phase: 'finalizing'})
+    }
+    // Always fire once at the start so the UI flips out of 'parsing'.
+    if (onProgress) {
+      onProgress({streamIndex, bytesRead: baseBytesRead, phase: 'finalizing'})
+      lastProgressAt = globalThis.performance?.now?.() ?? Date.now()
+    }
 
     for (const proc of processes) {
       throwIfAborted(signal)
       // Yield before each process so the host event loop stays live even if we
       // end up on a trace with one monstrous process.
       await yieldToEventLoop()
-      if (onProgress) {
-        onProgress({streamIndex, bytesRead: baseBytesRead, phase: 'finalizing'})
-      }
+      emitFinalizeProgress()
 
       const tracks: Track[] = []
 
@@ -412,7 +599,49 @@ export class ChromeParser implements TraceParser {
 
       if (tracks.length === 0) continue
 
+      // Sibling compaction is only worth doing when the trace is large
+      // enough that we genuinely can't keep every event around. On a
+      // typical-sized dev trace (tens of thousands of events) every
+      // measure renders fine and folding any of them only loses
+      // information from the user's flame chart. Above the threshold
+      // we trust the size-aware compactor heuristics (leaf-only, sub-
+      // visible per-event duration, span gates) to fold only sampler
+      // bursts and tight-loop noise.
+      const siblingCompactionEnabled =
+        this._eventCount >= this._options.compactionMinEvents
+
       for (const track of tracks) {
+        finalizeContainer(track)
+        // CPU-profile tiny-frame compaction is always safe: it only
+        // touches synthesized `jsFrame` subtrees produced from V8
+        // samples, where folding sub-pixel leaf clusters into a single
+        // density rect is the explicit goal. Skipping it would mean
+        // tens of thousands of singleton frames render as the same
+        // visual smear but cost real memory.
+        for (const root of track.measures) {
+          compactCpuTinyFrames(
+            root,
+            DEFAULT_CPU_TINY_OPTIONS,
+            () => this._nextId(),
+            this._compactionCounters,
+          )
+        }
+        if (siblingCompactionEnabled) {
+          // Fold runs of same-(category,name) leaf siblings across the
+          // whole subtree. Uses the track's total span as the top-level
+          // parent span so root-level folds apply the fraction predicate.
+          const trackSpan = (track.maxEnd ?? 0) - 0
+          compactSiblings(
+            track,
+            DEFAULT_SIBLING_COMPACTION_OPTIONS,
+            () => this._nextId(),
+            this._compactionCounters,
+            trackSpan,
+          )
+        }
+        // Compaction may have mutated `measures` arrays — rerun the
+        // sort/maxEnd pass so SliceBuffers + mipmap see a well-formed
+        // tree. finalizeContainer is idempotent on already-sorted input.
         finalizeContainer(track)
         // Once containers are sorted + maxEnd-tagged, flatten the whole
         // subtree into typed arrays. This is the data the canvas renderer
@@ -439,15 +668,21 @@ export class ChromeParser implements TraceParser {
       systems,
     }
 
-    const events = collectEvents(timeline.systems.flatMap(s => s.tracks))
-
     const metadata: TraceMetadata = {
       ...this._rootMetadata,
       parser: 'chrome',
       eventCount: this._eventCount,
+      compaction: {
+        onlineEventsFolded: this._onlineEventsFolded,
+        onlineTriggered: this._onlineTriggered,
+        siblingRunsFolded: this._compactionCounters.siblingRunsFolded,
+        siblingEventsFolded: this._compactionCounters.siblingEventsFolded,
+        cpuTinyRunsFolded: this._compactionCounters.cpuTinyRunsFolded,
+        cpuTinyEventsFolded: this._compactionCounters.cpuTinyEventsFolded,
+      },
     }
 
-    return {source, metadata, timeline, events}
+    return {source, metadata, timeline}
   }
 
   private _buildThreadTrack(
@@ -773,42 +1008,65 @@ export class ChromeParser implements TraceParser {
     }
   }
 
+  /**
+   * Build a Measure from a B/E or X frame. Historically stashed shallow
+   * copies of the raw begin/end events on `Measure.events` — useful for
+   * debug tooling but nothing in the UI reads it, and at 200M events
+   * those copies dominate RAM. We now leave `events: []`; callers that
+   * truly want the raw payload can re-parse from source.
+   */
   private _makeMeasureFromFrame(
     frame: Frame,
     endTs: number,
-    endEvent: ChromeEvent | null,
+    _endEvent: ChromeEvent | null,
     toMs: (ts: number) => number,
   ): Measure {
     const begin = frame.event
-    const events: RawEvent[] = [toRawEvent(begin)]
-    if (endEvent) events.push(toRawEvent(endEvent))
-    return {
+    const measure: Measure = {
       id: this._nextId(),
       name: begin.name,
       start: toMs(begin.ts),
       end: toMs(endTs),
       category: begin.cat,
-      events,
+      events: EMPTY_RAW_EVENTS,
       marks: frame.marks,
       measures: frame.children,
     }
+    // Surface any online-merge record stashed during ingest as a
+    // proper CompactionReport so UI code treats online + finalize
+    // folds uniformly.
+    const mergeRecord = extractOnlineMergeRecord(begin)
+    if (mergeRecord) {
+      measure.compaction = [
+        {
+          origin: 'sibling',
+          category: begin.cat,
+          names: [begin.name],
+          count: mergeRecord.count,
+          firstTs: toMs(mergeRecord.firstTs),
+          lastTs: toMs(mergeRecord.lastTs),
+          totalDurationMs: mergeRecord.totalDur / 1000,
+        },
+      ]
+      this._compactionCounters.siblingRunsFolded += 1
+      this._compactionCounters.siblingEventsFolded += mergeRecord.count
+    }
+    return measure
   }
 
   private _makeAsyncMeasure(
     begin: ChromeEvent,
     endTs: number,
-    endEvent: ChromeEvent | null,
+    _endEvent: ChromeEvent | null,
     toMs: (ts: number) => number,
   ): Measure {
-    const events: RawEvent[] = [toRawEvent(begin)]
-    if (endEvent) events.push(toRawEvent(endEvent))
     return {
       id: this._nextId(),
       name: begin.name,
       start: toMs(begin.ts),
       end: toMs(endTs),
       category: begin.cat,
-      events,
+      events: EMPTY_RAW_EVENTS,
       marks: [],
       measures: [],
     }
@@ -820,7 +1078,7 @@ export class ChromeParser implements TraceParser {
       name: ev.name,
       time: toMs(ev.ts),
       category: ev.cat,
-      events: [toRawEvent(ev)],
+      events: EMPTY_RAW_EVENTS,
     }
   }
 
@@ -1107,9 +1365,6 @@ function compareThreads(a: ThreadInfo, b: ThreadInfo, discoveryOrder: number[]):
   return discoveryOrder.indexOf(a.tid) - discoveryOrder.indexOf(b.tid)
 }
 
-function toRawEvent(ev: ChromeEvent): RawEvent {
-  return {...ev}
-}
 
 /**
  * Sort events by `ts` ascending with parent-first tie-breaking so that
@@ -1132,14 +1387,3 @@ function stableSortByTs(events: ChromeEvent[]): ChromeEvent[] {
   return indexed.map(x => x.ev)
 }
 
-function collectEvents(containers: TimelineContainer[]): Array<Mark | Measure> {
-  const out: Array<Mark | Measure> = []
-  for (const container of containers) {
-    for (const mark of container.marks) out.push(mark)
-    for (const measure of container.measures) {
-      out.push(measure)
-      out.push(...collectEvents([measure]))
-    }
-  }
-  return out
-}

@@ -63,7 +63,23 @@ export async function parseTraceInWorker(
     }
 
     worker.onerror = err => {
-      settle(() => reject(err.error ?? new Error(err.message ?? 'Worker error')))
+      // Without this, a worker crash (OOM, parse bug, uncaught async
+      // rejection) surfaces as a bare `ErrorEvent` whose fields were
+      // lost to structured-clone. Reconstruct a proper Error with the
+      // `message`/`filename`/`lineno` so React's error boundary can
+      // render something actionable.
+      const fallback =
+        err.message ||
+        (err.filename ? `Worker error at ${err.filename}:${err.lineno}` : 'Worker error')
+      const wrapped = err.error instanceof Error ? err.error : new Error(fallback)
+      if (!wrapped.name) wrapped.name = 'WorkerError'
+      settle(() => reject(wrapped))
+    }
+
+    worker.onmessageerror = ev => {
+      settle(() =>
+        reject(new Error(`Worker message deserialization failed${ev.data ? `: ${String(ev.data)}` : ''}`)),
+      )
     }
 
     if (signal) {

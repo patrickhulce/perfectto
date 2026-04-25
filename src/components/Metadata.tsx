@@ -1,6 +1,6 @@
 import {useState} from 'react'
 import {formatBytes} from '../core/utils/formatBytes'
-import type {Persona, TraceSource} from '../core'
+import type {CompactionMetadata, Persona, TraceSource} from '../core'
 import PersonaPicker from './PersonaPicker'
 import SettingsPanel, {SettingsCog} from './SettingsPanel'
 import type {InputBindingsStore} from './timeline/inputBindingsStore'
@@ -19,6 +19,12 @@ interface MetadataProps {
    * viewer tree.
    */
   bindingsStore?: InputBindingsStore
+  /**
+   * Optional compaction counters produced by the parser. When non-zero
+   * totals are present we render a small pill so users can see that
+   * large-trace auto-compaction fired on the current file.
+   */
+  compaction?: CompactionMetadata
 }
 
 export default function Metadata({
@@ -29,7 +35,12 @@ export default function Metadata({
   detectedPersonaId,
   onPersonaChange,
   bindingsStore,
+  compaction,
 }: MetadataProps) {
+  const totalFolded =
+    (compaction?.onlineEventsFolded ?? 0) +
+    (compaction?.siblingEventsFolded ?? 0) +
+    (compaction?.cpuTinyEventsFolded ?? 0)
   const [settingsOpen, setSettingsOpen] = useState(false)
   return (
     <>
@@ -53,6 +64,20 @@ export default function Metadata({
           />
         )}
         <span className="whitespace-nowrap text-xs text-[#718096]">{formatBytes(source.size)}</span>
+        {compaction && totalFolded > 0 && (
+          <span
+            className="whitespace-nowrap rounded border border-[#f6ad55]/40 bg-[#f6ad55]/10 px-2 py-0.5 font-mono text-[10px] text-[#f6ad55]"
+            title={
+              `Large-trace compaction: ${compaction.siblingEventsFolded.toLocaleString()} sibling · ` +
+              `${compaction.cpuTinyEventsFolded.toLocaleString()} cpu-tiny · ` +
+              `${compaction.onlineEventsFolded.toLocaleString()} online` +
+              (compaction.onlineTriggered ? ' (streaming cap hit)' : '')
+            }
+            data-testid="metadata-compaction-pill"
+          >
+            {totalFolded.toLocaleString()} folded
+          </span>
+        )}
         {bindingsStore && (
           <SettingsCog onClick={() => setSettingsOpen(v => !v)} />
         )}

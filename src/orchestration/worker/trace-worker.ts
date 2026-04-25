@@ -2,6 +2,7 @@
 
 import {parseTrace} from '../../core'
 import type {WorkerMessage, WorkerRequest} from '../protocol'
+import {collectParsedTraceTransferables} from '../transferables'
 
 declare const self: DedicatedWorkerGlobalScope
 
@@ -35,7 +36,11 @@ async function runParse(
         post({type: 'progress', progress})
       },
     })
-    post({type: 'done', trace})
+    // Transfer every typed-array backing buffer so the main thread
+    // receives them in O(1) without a structured-clone copy. On a 1GB
+    // trace this is a ~80-500 MB saving depending on mipmap depth.
+    const transferList = collectParsedTraceTransferables(trace)
+    self.postMessage({type: 'done', trace} as WorkerMessage, transferList)
   } catch (err) {
     const e = toErrorDescriptor(err)
     post({type: 'error', error: e})

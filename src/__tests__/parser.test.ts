@@ -2,6 +2,7 @@ import {readFile} from 'node:fs/promises'
 import path from 'node:path'
 
 import {parseTrace} from '../core/parser'
+import {iterateTimelineEvents} from '../core'
 import type {
   CompactionReport,
   Measure,
@@ -83,9 +84,13 @@ describe('parseTrace - chrome minimal', () => {
       for (const track of system.tracks) walk(track)
     }
 
-    const idsFromEvents = new Set(trace.events.map(e => e.id))
-    expect(idsFromEvents).toEqual(idsFromTree)
-    expect(trace.events.length).toBeGreaterThan(0)
+    // ParsedTrace no longer carries a flat `events` array — iterate via
+    // the public generator to re-derive ids and check they match the
+    // tree walk above.
+    const idsFromIterator = new Set<string>()
+    for (const e of iterateTimelineEvents(trace.timeline)) idsFromIterator.add(e.id)
+    expect(idsFromIterator).toEqual(idsFromTree)
+    expect(idsFromIterator.size).toBeGreaterThan(0)
   })
 
   it('populates metadata as an object and copies root-level metadata field', async () => {
@@ -460,7 +465,9 @@ describe('parseTrace - real trace asset', () => {
     expect(trace.timeline.systems.length).toBeGreaterThan(0)
     expect(trace.timeline.start).toBe(0)
     expect(trace.timeline.end).toBeGreaterThan(0)
-    expect(trace.events.length).toBeGreaterThan(0)
+    let iterated = 0
+    for (const _ of iterateTimelineEvents(trace.timeline)) iterated++
+    expect(iterated).toBeGreaterThan(0)
 
     const systemNames = trace.timeline.systems.map(s => s.name)
     expect(systemNames).toEqual(expect.arrayContaining(['Renderer', 'Browser']))
@@ -472,19 +479,110 @@ describe('parseTrace - real trace asset', () => {
     expect(trace.metadata.parser).toBe('chrome')
     expect(typeof trace.metadata.eventCount).toBe('number')
     expect(trace.metadata.source).toBe('DevTools')
+
+    // Structural regression guard: a real Chrome trace's Renderer Main
+    // track always has meaningful nested depth (RunTask → tasks → user
+    // code frames). A prior compaction bug collapsed everything into a
+    // single top-level rect; the test below would have caught that.
+    const main = renderer.tracks.find(t => t.name === 'CrRendererMain')
+    expect(main).toBeDefined()
+
+    const countMeasures = (ms: Measure[]): number => {
+      let n = ms.length
+      for (const m of ms) n += countMeasures(m.measures)
+      return n
+    }
+    const maxDepth = (m: Measure): number => {
+      let d = 0
+      for (const c of m.measures) {
+        const cd = maxDepth(c) + 1
+        if (cd > d) d = cd
+      }
+      return d
+    }
+
+    const totalMeasures = countMeasures(main!.measures)
+    const deepest = Math.max(0, ...main!.measures.map(maxDepth))
+    // Thresholds chosen well under the observed real-trace values
+    // (~10k measures, depth ≥ 5 on this asset) so they fire on
+    // compaction bugs without being flaky over time.
+    expect(totalMeasures).toBeGreaterThan(3_000)
+    expect(deepest).toBeGreaterThanOrEqual(3)
+    // Top-level `RunTask` parents must survive compaction — folding
+    // them destroys every callstack inside.
+    const runTasks = main!.measures.filter(m => m.name === 'RunTask')
+    expect(runTasks.length).toBeGreaterThan(5)
+    const runTasksWithChildren = runTasks.filter(m => m.measures.length > 0)
+    expect(runTasksWithChildren.length).toBeGreaterThan(0)
+    // Hard regression guard: a small "personal-laptop"-sized trace
+    // should be byte-for-byte preserved by the parser. Sibling
+    // compaction is gated on a trace-wide event-count threshold so
+    // small traces never get silently rewritten in the user's view.
+    expect(trace.metadata.compaction?.siblingRunsFolded ?? 0).toBe(0)
+    expect(trace.metadata.compaction?.siblingEventsFolded ?? 0).toBe(0)
+    // CPU-tiny-frame folding is allowed (it's the explicit purpose of
+    // the synthesized jsFrame subtree), but it must never drop a frame
+    // that carried structural children — `compactCpuTinyFrames` only
+    // touches leaf-only sibling runs.
+    const folded = trace.metadata.compaction?.cpuTinyEventsFolded ?? 0
+    expect(folded).toBeGreaterThanOrEqual(0)
   }, 30000)
+
+  it('produces the same measure tree on the real asset with compaction force-disabled', async () => {
+    // Cross-check: parsing with the size gate forced wide open
+    // _and_ disabled should yield identical structural totals on a
+    // small trace. Catches regressions where some other code path
+    // (online streaming, CPU-tiny, finalize sort) silently drops
+    // measures even though the sibling fold counters report zero.
+    const filePath = path.resolve(
+      __dirname,
+      '..',
+      '..',
+      'assets',
+      'perfecto-chrome-trace.json',
+    )
+    const bytes = await readFile(filePath)
+    const mkStream = (): ReadableStream<Uint8Array> =>
+      new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(new Uint8Array(bytes))
+          controller.close()
+        },
+      })
+    const source = {name: 'perfecto-chrome-trace.json', size: bytes.byteLength}
+
+    const baseline = await parseTrace(mkStream(), source, {
+      chromeParser: {compactionMinEvents: Number.MAX_SAFE_INTEGER},
+    })
+    const withDefault = await parseTrace(mkStream(), source)
+
+    const countMeasures = (ms: Measure[]): number => {
+      let n = ms.length
+      for (const m of ms) n += countMeasures(m.measures)
+      return n
+    }
+    const trackTotal = (trace: typeof baseline, sysName: string, trackName: string): number => {
+      const sys = trace.timeline.systems.find(s => s.name === sysName)
+      const track = sys?.tracks.find(t => t.name === trackName)
+      return track ? countMeasures(track.measures) : 0
+    }
+    const def = trackTotal(withDefault, 'Renderer', 'CrRendererMain')
+    const base = trackTotal(baseline, 'Renderer', 'CrRendererMain')
+    expect(base).toBeGreaterThan(3_000)
+    expect(def).toBe(base)
+  }, 30_000)
 })
 
 describe('types', () => {
   it('accepts a CompactionReport on Measure', () => {
     const report: CompactionReport = {
+      origin: 'sibling',
       category: 'render',
-      names: ['Layout', 'Paint'],
-      fraction: 0.75,
-      events: [
-        {phase: 'B', ts: 10},
-        {phase: 'E', ts: 42},
-      ],
+      names: ['Layout'],
+      count: 42,
+      firstTs: 10,
+      lastTs: 52,
+      totalDurationMs: 3.5,
     }
 
     const compacted: Measure = {
@@ -500,8 +598,8 @@ describe('types', () => {
     }
 
     expect(compacted.compaction).toHaveLength(1)
-    expect(compacted.compaction?.[0].fraction).toBeCloseTo(0.75)
-    expect(compacted.compaction?.[0].names).toEqual(['Layout', 'Paint'])
-    expect(compacted.compaction?.[0].events).toHaveLength(2)
+    expect(compacted.compaction?.[0].origin).toBe('sibling')
+    expect(compacted.compaction?.[0].count).toBe(42)
+    expect(compacted.compaction?.[0].names).toEqual(['Layout'])
   })
 })

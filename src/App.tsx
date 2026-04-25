@@ -10,7 +10,14 @@ interface ParsingState {
   name: string
   bytesTotal: number
   progress: ParseProgress
+  startedAt: number
   controller: AbortController
+}
+
+interface ParseErrorState {
+  name: string
+  message: string
+  detail?: string
 }
 
 const DEFAULT_AUTOLOAD_NAME = 'perfecto-chrome-trace'
@@ -18,8 +25,10 @@ const DEFAULT_AUTOLOAD_NAME = 'perfecto-chrome-trace'
 export default function App() {
   const [trace, setTrace] = useState<ParsedTrace | null>(null)
   const [parsing, setParsing] = useState<ParsingState | null>(null)
+  const [parseError, setParseError] = useState<ParseErrorState | null>(null)
 
-  const handleFileSelected = async (file: File) => {
+  const runParse = async (file: File): Promise<void> => {
+    setParseError(null)
     const loaded = loadFile(file)
     const controller = new AbortController()
     const initial: ParseProgress = {
@@ -31,6 +40,7 @@ export default function App() {
       name: loaded.name,
       bytesTotal: loaded.size,
       progress: initial,
+      startedAt: Date.now(),
       controller,
     })
 
@@ -46,12 +56,24 @@ export default function App() {
       )
       setTrace(parsed)
     } catch (err) {
-      if ((err as { name?: string } | null)?.name !== 'AbortError') {
-        throw err
-      }
+      // Silence user-initiated aborts; surface every other failure mode
+      // as a visible error state instead of re-throwing into React (which
+      // leaves the splash mounted but invisible under the default error
+      // boundary).
+      if ((err as { name?: string } | null)?.name === 'AbortError') return
+      const asErr = err instanceof Error ? err : new Error(String(err))
+      setParseError({
+        name: loaded.name,
+        message: asErr.message || 'Trace parsing failed',
+        detail: asErr.name && asErr.name !== 'Error' ? asErr.name : undefined,
+      })
     } finally {
       setParsing(null)
     }
+  }
+
+  const handleFileSelected = async (file: File) => {
+    await runParse(file)
   }
 
   // Dev-only autoload: fetch a checked-in asset on mount so iterating
@@ -101,9 +123,76 @@ export default function App() {
         name={parsing.name}
         bytesTotal={parsing.bytesTotal}
         progress={parsing.progress}
+        startedAt={parsing.startedAt}
         onCancel={() => parsing.controller.abort()}
       />
     )
   }
+  if (parseError) {
+    return (
+      <ParseErrorView
+        error={parseError}
+        onDismiss={() => setParseError(null)}
+      />
+    )
+  }
   return <Splash onFileSelected={handleFileSelected} />
+}
+
+/**
+ * Rendered when `parseTraceInWorker` rejects with anything other than
+ * an `AbortError`. Surfaces the worker's error message + a retry/back
+ * path so an OOM, unexpected trace format, or parse bug doesn't leave
+ * the user on an unrecoverable blank page.
+ */
+function ParseErrorView({
+  error,
+  onDismiss,
+}: {
+  error: ParseErrorState
+  onDismiss: () => void
+}) {
+  return (
+    <div className="flex min-h-screen flex-col items-center justify-center p-8">
+      <div className="flex w-full max-w-[640px] flex-col gap-5 rounded-2xl border border-[#fc8181]/60 bg-[rgba(252,129,129,0.06)] p-8">
+        <h1 className="text-2xl font-semibold text-[#fc8181]">
+          Couldn&apos;t parse that trace
+        </h1>
+        <div>
+          <p className="truncate text-sm text-[#a0aec0]" title={error.name}>
+            {error.name}
+          </p>
+          <p className="mt-2 text-sm text-[#e2e8f0]">{error.message}</p>
+          {error.detail && (
+            <p className="mt-2 text-xs uppercase tracking-wider text-[#718096]">
+              {error.detail}
+            </p>
+          )}
+        </div>
+        <ul className="list-disc space-y-1 pl-5 text-xs text-[#a0aec0]">
+          <li>
+            If the file is over ~2 GB, try the Chrome DevTools sample-rate knob or
+            pre-split the trace before loading.
+          </li>
+          <li>
+            Some traces need to be saved as raw Chrome Trace Event Format — pretty-
+            printed JSON or wrapped `.gz` files aren&apos;t supported yet.
+          </li>
+          <li>
+            Browser worker OOMs surface here; closing other tabs can free the
+            headroom we need.
+          </li>
+        </ul>
+        <div className="flex justify-end gap-2">
+          <button
+            type="button"
+            onClick={onDismiss}
+            className="cursor-pointer rounded-lg border border-[#4a5568] bg-transparent px-4 py-1.5 text-sm text-[#a0aec0] transition-colors hover:border-[#667eea] hover:text-[#667eea]"
+          >
+            Try another file
+          </button>
+        </div>
+      </div>
+    </div>
+  )
 }

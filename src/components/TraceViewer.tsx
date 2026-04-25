@@ -89,6 +89,7 @@ export default function TraceViewer({trace, onBack}: TraceViewerProps) {
         detectedPersonaId={detectedPersona.id}
         onPersonaChange={setActivePersonaId}
         bindingsStore={bindingsStore}
+        compaction={trace.metadata.compaction}
       />
       <Timeline
         timeline={trace.timeline}

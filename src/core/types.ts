@@ -70,11 +70,66 @@ export interface Measure extends TimelineContainer {
   attribution?: MeasureAttribution
 }
 
+/**
+ * Summary of a run of events that were folded into a single Measure by
+ * the compactor. Intentionally carries only aggregate statistics — never
+ * the raw event objects — so a single compacted Measure costs O(1) RAM
+ * regardless of how many events it represents.
+ *
+ * Producers populate this in two places:
+ *
+ *   - The finalize-time sibling compactor collapses runs of adjacent
+ *     same-(category, name) siblings whose aggregate span stays under a
+ *     threshold. `origin = 'sibling'` and `names` carries the single
+ *     shared name (kept as a list for forward-compatibility with future
+ *     multi-name variants).
+ *   - The CPU-profile tiny-frame compactor collapses sub-resolution
+ *     child frames under a wider ancestor. `origin = 'cpu-tiny-frames'`
+ *     and `names` lists the distinct frame labels that were folded.
+ *
+ * UI code should surface `count` prominently (it's what tells the user
+ * "this rect represents N events, not one") and may show a condensed
+ * `names` preview in a tooltip.
+ */
 export interface CompactionReport {
-  category: string
+  /** Where this compaction came from. Used by UI to tailor labels. */
+  origin: 'sibling' | 'cpu-tiny-frames'
+  /** Category shared by every folded event (or the representative's category). */
+  category?: string
+  /** Names that appeared in the run — deduped, sorted for display stability. */
   names: string[]
-  fraction: number
-  events: RawEvent[]
+  /** Total number of source events that were folded into the Measure. */
+  count: number
+  /** Earliest `ts` across the folded run, in ms. */
+  firstTs: number
+  /** Latest `end` across the folded run, in ms. */
+  lastTs: number
+  /**
+   * Aggregate "on" time across the run — sum of durations — in ms. Useful
+   * for the UI to show "N events · Mms wall time" without re-scanning.
+   */
+  totalDurationMs: number
+}
+
+/**
+ * Parser-level counters recorded during compaction. Attached to
+ * {@link TraceMetadata.compaction} so the SettingsPanel / Metadata bar
+ * can surface a read-only "large-trace" summary without the UI having
+ * to walk the timeline itself.
+ */
+export interface CompactionMetadata {
+  /** Events folded by the online streaming compactor (per-thread run-merging). */
+  onlineEventsFolded: number
+  /** True iff the online compactor crossed its trigger threshold at least once. */
+  onlineTriggered: boolean
+  /** Runs of same-name siblings collapsed at finalize. */
+  siblingRunsFolded: number
+  /** Total source events folded by the finalize sibling compactor. */
+  siblingEventsFolded: number
+  /** Count of CPU-profile tiny-frame compactions emitted at finalize. */
+  cpuTinyRunsFolded: number
+  /** Total source CPU-profile frames folded into tiny-frame compactions. */
+  cpuTinyEventsFolded: number
 }
 
 export interface Track extends TimelineContainer {
@@ -112,6 +167,12 @@ export interface Timeline {
 }
 
 export interface TraceMetadata {
+  /**
+   * Optional compaction summary populated by the parser. Absent on tiny
+   * traces where compaction never fired; always present when any
+   * non-zero counter could be reported.
+   */
+  compaction?: CompactionMetadata
   [key: string]: unknown
 }
 
@@ -124,7 +185,29 @@ export interface ParsedTrace {
   source: TraceSource
   metadata: TraceMetadata
   timeline: Timeline
-  events: Array<Mark | Measure>
+}
+
+/**
+ * Lazy walker yielding every Mark and Measure in the timeline. The
+ * parser used to eagerly materialize this as `ParsedTrace.events` but
+ * the resulting array doubled the reference footprint at finalize for
+ * no reader — nothing in the UI consumes it. Callers that still need a
+ * flat iteration (tests, debug tooling) can drive this generator.
+ */
+export function* iterateTimelineEvents(timeline: Timeline): Generator<Mark | Measure, void, void> {
+  for (const system of timeline.systems) {
+    for (const track of system.tracks) {
+      yield* iterateContainer(track)
+    }
+  }
+}
+
+function* iterateContainer(container: TimelineContainer): Generator<Mark | Measure, void, void> {
+  for (const mark of container.marks) yield mark
+  for (const measure of container.measures) {
+    yield measure
+    yield* iterateContainer(measure)
+  }
 }
 
 export type TraceInput =

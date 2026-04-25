@@ -48,6 +48,14 @@ export interface ChromeParserOptions {
    * towers of internal GC phase slices. DevTools hides these by default.
    */
   collapseGcInternals?: boolean
+  /**
+   * Trace-wide event-count threshold at or above which finalize-time
+   * sibling compaction runs. Defaults to 500k events; tests can drop
+   * it to small values to exercise the compaction path on synthetic
+   * inputs without having to emit a million events. CPU-profile tiny-
+   * frame compaction is unaffected by this threshold.
+   */
+  compactionMinEvents?: number
 }
 
 /**
