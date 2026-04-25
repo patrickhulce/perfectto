@@ -26,6 +26,7 @@ import {
   emptyCompactionCounters,
   type CompactionCounters,
 } from '../compaction'
+import {cullSubpixelSubtrees, DEFAULT_SUBPIXEL_CULL_OPTIONS} from '../cull'
 import {
   asyncKey,
   counterKey,
@@ -93,6 +94,17 @@ const STREAMING_CAP_EVENTS = 2_000_000
  * fold _is_ the desired rendering.
  */
 const COMPACTION_MIN_EVENTS = 500_000
+/**
+ * Per-track raw-event-count threshold at or above which the
+ * highest-point subpixel-subtree cull engages on that track. The
+ * failing-trace investigation found per-thread event counts in the
+ * hundreds of thousands; 100k is comfortably below that while still
+ * leaving small dev traces (which never produce sub-pixel clutter
+ * worth folding) untouched. Overridable via
+ * `ChromeParserOptions.subpixelCullMinEventsPerTrack` so unit tests
+ * can exercise the cull on synthetic fixtures.
+ */
+const SUBPIXEL_CULL_MIN_EVENTS_PER_TRACK = 100_000
 /**
  * Maximum `dur` (in µs) an X event can have and still be eligible for
  * online merging. Events wider than this keep their identity because
@@ -228,6 +240,8 @@ export class ChromeParser implements TraceParser {
     this._options = {
       collapseGcInternals: opts.collapseGcInternals ?? true,
       compactionMinEvents: opts.compactionMinEvents ?? COMPACTION_MIN_EVENTS,
+      subpixelCullMinEventsPerTrack:
+        opts.subpixelCullMinEventsPerTrack ?? SUBPIXEL_CULL_MIN_EVENTS_PER_TRACK,
     }
     this._json_parser = new JSONParser({
       paths: [
@@ -272,7 +286,12 @@ export class ChromeParser implements TraceParser {
         // Surfaced via onError below.
       }
     }
-    if (this._error) throw this._error
+    // When the universal parser truncated the input on purpose
+    // (`maxBytes` cap), the JSON parser will have flagged an
+    // "incomplete JSON" error on `.end()`. Swallow it: every event
+    // that *did* fully parse is still on `_processes`, and the user
+    // would rather see a partial flame chart than nothing.
+    if (this._error && !options?.truncated) throw this._error
     return this._buildParsedTrace(source, options)
   }
 
@@ -560,27 +579,61 @@ export class ChromeParser implements TraceParser {
     // mirrors that cadence for finalize.
     const FINALIZE_PROGRESS_MIN_INTERVAL_MS = 50
     let lastProgressAt = 0
-    const emitFinalizeProgress = (): void => {
+
+    // Pre-compute the total finalize work across every (track × stage)
+    // so the UI can render a fraction-of-finalize bar instead of
+    // sitting at 100% for tens of seconds. We use raw thread event
+    // counts as the unit because that's what dominates per-track
+    // finalize cost (cull + compact + fixup all walk the Measure
+    // tree, which is bounded by the source event count). Async /
+    // counter tracks add a fixed nominal cost so they still show up
+    // in the progress bar but don't dominate.
+    const FINALIZE_STAGES_PER_TRACK = 3
+    const ASYNC_COUNTER_TRACK_NOMINAL_EVENTS = 100
+    let eventsProcessed = 0
+    let eventsTotal = 0
+    for (const proc of processes) {
+      for (const thread of proc.threads.values()) {
+        if (thread.events.length === 0) continue
+        eventsTotal += thread.events.length * FINALIZE_STAGES_PER_TRACK
+      }
+    }
+    if (eventsTotal === 0) eventsTotal = 1 // avoid div-by-zero in the UI
+
+    const emitFinalizeProgress = (detail?: string, force = false): void => {
       if (!onProgress) return
       const now = (globalThis.performance?.now?.() ?? Date.now())
-      if (now - lastProgressAt < FINALIZE_PROGRESS_MIN_INTERVAL_MS) return
+      if (!force && now - lastProgressAt < FINALIZE_PROGRESS_MIN_INTERVAL_MS) return
       lastProgressAt = now
-      onProgress({streamIndex, bytesRead: baseBytesRead, phase: 'finalizing'})
+      onProgress({
+        streamIndex,
+        bytesRead: baseBytesRead,
+        phase: 'finalizing',
+        detail,
+        events: {processed: eventsProcessed, total: eventsTotal},
+      })
     }
     // Always fire once at the start so the UI flips out of 'parsing'.
-    if (onProgress) {
-      onProgress({streamIndex, bytesRead: baseBytesRead, phase: 'finalizing'})
-      lastProgressAt = globalThis.performance?.now?.() ?? Date.now()
-    }
+    emitFinalizeProgress(undefined, true)
 
+    let procIdx = 0
+    const procTotal = processes.length
     for (const proc of processes) {
+      procIdx += 1
       throwIfAborted(signal)
       // Yield before each process so the host event loop stays live even if we
       // end up on a trace with one monstrous process.
       await yieldToEventLoop()
-      emitFinalizeProgress()
+      const procLabel = proc.name ?? `Process ${proc.pid}`
+      emitFinalizeProgress(`Finalizing ${procLabel} (${procIdx}/${procTotal})`)
 
       const tracks: Track[] = []
+      // Parallel array tracking the source event count per track.
+      // Used for progress weighting + the cull's per-track event-count
+      // gate. Async/counter tracks aren't backed by a thread, so we
+      // give them a small nominal cost that's still visible on the
+      // progress bar but never dominates.
+      const trackEventCounts: number[] = []
 
       const threads = [...proc.threads.values()].sort((a, b) =>
         compareThreads(a, b, proc.threadOrder),
@@ -588,13 +641,18 @@ export class ChromeParser implements TraceParser {
       for (const thread of threads) {
         if (thread.events.length === 0) continue
         tracks.push(this._buildThreadTrack(proc, thread, toMs))
+        trackEventCounts.push(thread.events.length)
       }
 
       const asyncTrack = this._buildAsyncTrack(proc.pid, toMs)
-      if (asyncTrack) tracks.push(asyncTrack)
+      if (asyncTrack) {
+        tracks.push(asyncTrack)
+        trackEventCounts.push(ASYNC_COUNTER_TRACK_NOMINAL_EVENTS)
+      }
 
       for (const counterTrack of this._buildCounterTracks(proc.pid, toMs)) {
         tracks.push(counterTrack)
+        trackEventCounts.push(ASYNC_COUNTER_TRACK_NOMINAL_EVENTS)
       }
 
       if (tracks.length === 0) continue
@@ -609,9 +667,45 @@ export class ChromeParser implements TraceParser {
       // bursts and tight-loop noise.
       const siblingCompactionEnabled =
         this._eventCount >= this._options.compactionMinEvents
+      const subpixelCullThreshold = this._options.subpixelCullMinEventsPerTrack
 
-      for (const track of tracks) {
+      let trackIdx = 0
+      const trackTotal = tracks.length
+      for (let ti = 0; ti < tracks.length; ti++) {
+        const track = tracks[ti]
+        const trackEvents = trackEventCounts[ti]
+        trackIdx += 1
+        const cullEnabled = trackEvents >= subpixelCullThreshold
+        // Yield so the worker can drain its outgoing message queue
+        // (progress pumps, abort requests). Big single-process traces
+        // — a 60+s renderer with millions of CPU samples — used to
+        // execute this whole loop in one synchronous burst, hiding
+        // the finalize phase behind what looked like a hung worker.
+        await yieldToEventLoop()
+
+        // --- Pass A: highest-point sub-pixel subtree cull -----------
+        emitFinalizeProgress(
+          `Culling ${procLabel} — ${track.name} (${trackIdx}/${trackTotal})` +
+            (cullEnabled ? '' : ' [skipped: small track]'),
+        )
+        if (cullEnabled) {
+          cullSubpixelSubtrees(
+            track,
+            DEFAULT_SUBPIXEL_CULL_OPTIONS,
+            () => this._nextId(),
+            this._compactionCounters,
+          )
+        }
+        eventsProcessed += trackEvents
+        emitFinalizeProgress()
+
+        // --- Pre-sort: compactSiblings/CPU-tiny expect sorted input ---
         finalizeContainer(track)
+
+        // --- Pass B: targeted compaction (CPU-tiny + same-name siblings) ---
+        emitFinalizeProgress(
+          `Compacting ${procLabel} — ${track.name} (${trackIdx}/${trackTotal})`,
+        )
         // CPU-profile tiny-frame compaction is always safe: it only
         // touches synthesized `jsFrame` subtrees produced from V8
         // samples, where folding sub-pixel leaf clusters into a single
@@ -639,6 +733,14 @@ export class ChromeParser implements TraceParser {
             trackSpan,
           )
         }
+        eventsProcessed += trackEvents
+        emitFinalizeProgress()
+
+        // --- Pass C: fixup (re-sort) + flat-buffer build -------------
+        emitFinalizeProgress(
+          `Building buffers for ${procLabel} — ${track.name} (${trackIdx}/${trackTotal})`,
+        )
+        await yieldToEventLoop()
         // Compaction may have mutated `measures` arrays — rerun the
         // sort/maxEnd pass so SliceBuffers + mipmap see a well-formed
         // tree. finalizeContainer is idempotent on already-sorted input.
@@ -653,6 +755,8 @@ export class ChromeParser implements TraceParser {
         // buffer. Cheap to build (O(n log n)) and zoomed-out renders read it
         // instead of the raw flat list to stay viewport-bounded.
         track.mipmap = buildSliceMipmap(track.buffers)
+        eventsProcessed += trackEvents
+        emitFinalizeProgress()
       }
 
       systems.push({
@@ -661,6 +765,12 @@ export class ChromeParser implements TraceParser {
         tracks,
       })
     }
+
+    // Snap progress to 100% so the bar doesn't sit at 99% while the
+    // universal parser flips us to `'done'`. Force the emit through
+    // the throttle since it's the last finalize message we'll send.
+    eventsProcessed = eventsTotal
+    emitFinalizeProgress(undefined, true)
 
     const timeline = {
       start: 0,
@@ -679,6 +789,9 @@ export class ChromeParser implements TraceParser {
         siblingEventsFolded: this._compactionCounters.siblingEventsFolded,
         cpuTinyRunsFolded: this._compactionCounters.cpuTinyRunsFolded,
         cpuTinyEventsFolded: this._compactionCounters.cpuTinyEventsFolded,
+        subpixelSubtreesFolded: this._compactionCounters.subpixelSubtreesFolded,
+        subpixelEventsFolded: this._compactionCounters.subpixelEventsFolded,
+        subpixelMaxDepthFolded: this._compactionCounters.subpixelMaxDepthFolded,
       },
     }
 

@@ -4,6 +4,13 @@ export interface WorkerParseRequest {
   type: 'parse'
   stream: ReadableStream<Uint8Array>
   source: TraceSource
+  /**
+   * Optional soft byte cap. Forwarded into `parseTrace`'s `maxBytes`
+   * so the worker stops reading after roughly this many decompressed
+   * bytes and finalizes on the partial input. Undefined / non-finite
+   * means unlimited.
+   */
+  maxBytes?: number
 }
 
 export interface WorkerAbortRequest {

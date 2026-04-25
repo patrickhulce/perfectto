@@ -1,6 +1,63 @@
 import type {ParsedTrace} from '../core'
 
 /**
+ * Walk every `Track` in a finalized trace and clear the recursive
+ * `Measure.measures` / `Measure.marks` arrays in place.
+ *
+ * Why this exists: V8's structured-clone serializer recurses on object
+ * graphs, with one frame per nesting level. A Chrome CPU-profile trace
+ * with deep async stacks produces a `Measure` tree thousands of nodes
+ * deep, and `worker.postMessage(trace)` blows the stack with
+ * `RangeError: Maximum call stack size exceeded` long before it sends
+ * a single byte. The fix is to stop sending the tree at all — every
+ * field the main thread reads (depth, parent index, color, hit-test
+ * lookup) is already mirrored in the flat `track.buffers` SoA, so we
+ * iterate `buffers.measures` (a flat list of references to *every*
+ * Measure in the subtree, including nested ones) and replace each
+ * Measure's child arrays with empty arrays. The flat references are
+ * still distinct objects whose scalar fields (`id`, `name`, `start`,
+ * `end`, `category`, etc.) survive the clone unchanged; only the
+ * recursion is severed.
+ *
+ * The marks list gets the same treatment: `track.markBuffers` already
+ * carries every nested `Mark`, so per-measure `marks: []` is safe to
+ * clear.
+ *
+ * After calling this the worker-side `ParsedTrace` is no longer a
+ * traversable tree — only the flat buffers + transferred typed-arrays
+ * remain. We only call it at the very end of `runParse`, immediately
+ * before `postMessage`, and the worker terminates after the message
+ * is sent.
+ */
+export function stripParsedTreeForTransfer(trace: ParsedTrace): void {
+  const EMPTY_MEASURES: never[] = []
+  const EMPTY_MARKS: never[] = []
+  for (const system of trace.timeline.systems) {
+    for (const track of system.tracks) {
+      const buffers = track.buffers
+      if (buffers) {
+        const measures = buffers.measures
+        for (let i = 0; i < buffers.count; i++) {
+          const m = measures[i]
+          // Cast through unknown so we can drop the reference even
+          // though `Measure.measures` is non-optional in the type.
+          // The main thread's consumers don't read this field — they
+          // walk `buffers` instead — so the type-level guarantee is
+          // preserved at the public boundary.
+          ;(m as unknown as {measures: unknown[]}).measures = EMPTY_MEASURES
+          ;(m as unknown as {marks: unknown[]}).marks = EMPTY_MARKS
+        }
+      }
+      // The track itself also references its top-level measures + marks
+      // recursively through `track.measures`. Drop those so the clone
+      // doesn't even start a recursion.
+      ;(track as unknown as {measures: unknown[]}).measures = EMPTY_MEASURES
+      ;(track as unknown as {marks: unknown[]}).marks = EMPTY_MARKS
+    }
+  }
+}
+
+/**
  * Walk a finalized ParsedTrace and collect every typed-array backing
  * buffer so the worker can hand ownership of them to the main thread
  * via `postMessage(msg, transferList)` instead of structured-cloning

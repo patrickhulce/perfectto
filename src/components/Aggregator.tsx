@@ -1,5 +1,5 @@
 import {useCallback, useEffect, useMemo, useRef, useState} from 'react'
-import type {Timeline} from '../core'
+import type {CompactionReport, Timeline} from '../core'
 import type {SelectionState, SelectionStore} from './timeline/selectionStore'
 import {
   hasCallstackSelection,
@@ -240,14 +240,10 @@ function CallstackView({resolved}: CallstackViewProps) {
           {compaction ? (
             <span
               className="rounded border border-[#f6ad55]/40 bg-[#f6ad55]/10 px-1.5 py-0.5 font-mono text-[10px] text-[#f6ad55]"
-              title={
-                compaction.origin === 'cpu-tiny-frames'
-                  ? 'CPU-profile tiny frames were folded here'
-                  : 'Adjacent same-name events were folded here'
-              }
+              title={compactionTooltip(compaction)}
               data-testid="aggregator-compaction-pill"
             >
-              {compaction.count.toLocaleString()} folded
+              {compactionPillLabel(compaction)}
             </span>
           ) : null}
           {durationMs !== null ? (
@@ -295,6 +291,39 @@ function CallstackView({resolved}: CallstackViewProps) {
       )}
     </div>
   )
+}
+
+/**
+ * Pill label for a folded leaf. Subpixel-subtree folds carry a depth
+ * dimension (the cull collapses entire stacks), so we surface that when
+ * present — "≈N frames · ≤D deep". Sibling/CPU-tiny folds stay flat.
+ */
+function compactionPillLabel(c: CompactionReport): string {
+  if (c.origin === 'subpixel-subtree') {
+    const depth = c.maxDepthFolded
+    if (depth && depth > 1) {
+      return `${c.count.toLocaleString()} folded · ≤${depth} deep`
+    }
+    return `${c.count.toLocaleString()} folded subtree`
+  }
+  return `${c.count.toLocaleString()} folded`
+}
+
+function compactionTooltip(c: CompactionReport): string {
+  switch (c.origin) {
+    case 'cpu-tiny-frames':
+      return 'CPU-profile tiny frames were folded here'
+    case 'subpixel-subtree': {
+      const depth = c.maxDepthFolded ?? 0
+      const distinct = c.distinctNames ?? c.names.length
+      const depthSuffix = depth > 1 ? ` (up to ${depth} levels deep)` : ''
+      const namesSuffix = distinct > 1 ? ` across ${distinct} distinct names` : ''
+      return `Sub-pixel subtree was collapsed at the highest possible point${depthSuffix}${namesSuffix} — the whole subtree was below the cull threshold so individual frames could not have rendered.`
+    }
+    case 'sibling':
+    default:
+      return 'Adjacent same-name events were folded here'
+  }
 }
 
 function frameLabel(frame: CallstackFrame): string {

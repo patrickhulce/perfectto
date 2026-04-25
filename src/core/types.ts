@@ -92,8 +92,20 @@ export interface Measure extends TimelineContainer {
  * `names` preview in a tooltip.
  */
 export interface CompactionReport {
-  /** Where this compaction came from. Used by UI to tailor labels. */
-  origin: 'sibling' | 'cpu-tiny-frames'
+  /**
+   * Where this compaction came from. Used by UI to tailor labels.
+   *
+   * - `'sibling'` — adjacent same-(name, category) leaf runs folded by
+   *   the finalize-time sibling compactor.
+   * - `'cpu-tiny-frames'` — sub-resolution V8 sampler frames folded
+   *   under a wider ancestor.
+   * - `'subpixel-subtree'` — an entire Measure subtree (any depth) was
+   *   replaced by a single representative because the subtree's root
+   *   was already too short to render usefully. The fold happens at
+   *   the highest possible point so a 0.01 ms span never carries a
+   *   128-deep skeleton underneath.
+   */
+  origin: 'sibling' | 'cpu-tiny-frames' | 'subpixel-subtree'
   /** Category shared by every folded event (or the representative's category). */
   category?: string
   /** Names that appeared in the run — deduped, sorted for display stability. */
@@ -109,6 +121,19 @@ export interface CompactionReport {
    * for the UI to show "N events · Mms wall time" without re-scanning.
    */
   totalDurationMs: number
+  /**
+   * For `'subpixel-subtree'` folds, the deepest descendant level that
+   * was collapsed into the representative. Lets the UI surface "≈N
+   * frames, up to D levels deep" instead of just a count. Other
+   * origins leave this undefined.
+   */
+  maxDepthFolded?: number
+  /**
+   * For `'subpixel-subtree'` folds, the number of distinct names in the
+   * subtree (not the size of `names`, which we cap at a small preview).
+   * Other origins leave this undefined.
+   */
+  distinctNames?: number
 }
 
 /**
@@ -130,6 +155,23 @@ export interface CompactionMetadata {
   cpuTinyRunsFolded: number
   /** Total source CPU-profile frames folded into tiny-frame compactions. */
   cpuTinyEventsFolded: number
+  /**
+   * Number of subtrees the highest-point cull collapsed into a single
+   * synthetic Measure. Zero on traces below the per-track event-count
+   * gate (the cull is a no-op on small traces).
+   */
+  subpixelSubtreesFolded: number
+  /**
+   * Total descendant Measures (across all depths) absorbed by the
+   * subpixel-subtree cull. Excludes the surviving representative.
+   */
+  subpixelEventsFolded: number
+  /**
+   * Maximum depth of any single subtree the cull folded. Surfaced in
+   * the metadata pane so the user can see e.g. "1425-deep recursion
+   * collapsed" without having to scan compaction reports manually.
+   */
+  subpixelMaxDepthFolded: number
 }
 
 export interface Track extends TimelineContainer {
@@ -218,6 +260,28 @@ export interface ParseProgress {
   streamIndex: number
   bytesRead: number
   phase: 'parsing' | 'finalizing' | 'done'
+  /**
+   * Optional human-readable status line for the current phase. Parsers
+   * use this to surface sub-phase progress that wouldn't otherwise
+   * show up in `bytesRead` — e.g. "Finalizing Renderer (track 4/12)"
+   * during finalize, where we're walking a per-process tree rather
+   * than reading bytes. The viewer renders it under the phase label;
+   * absent / empty means no sub-status to show.
+   */
+  detail?: string
+  /**
+   * Optional event-count progress for the finalize phase. The parser
+   * pumps this every ~50ms (same throttle as the byte counter) so the
+   * UI can show real motion while it walks per-track buffers, instead
+   * of the bar sitting at 100% during a 20-second finalize. `total` is
+   * the parser's best estimate of the work to do across all stages
+   * (cull + compact + fixup); `processed` is monotonic and saturates
+   * at `total` when finalize completes.
+   */
+  events?: {
+    processed: number
+    total: number
+  }
 }
 
 export interface ParseOptions {
@@ -229,4 +293,18 @@ export interface ParseOptions {
    * DevTools shows out of the box.
    */
   chromeParser?: import('./parsers/chrome/chrome-types').ChromeParserOptions
+  /**
+   * Soft cap on bytes consumed from the input stream(s) before parsing
+   * stops and finalize runs over whatever's been collected so far. Use
+   * this as a safety valve against a runaway file (e.g. a 50 GB Chrome
+   * trace dropped by mistake) to keep the worker from slowly OOM'ing
+   * the tab. Once exceeded we cancel the underlying reader and emit a
+   * final `'parsing'` progress event with `detail: 'truncated'`.
+   *
+   * Counted in *decompressed* bytes for gzipped inputs (the same units
+   * as `ParseProgress.bytesRead`). Undefined / non-finite / ≤ 0 means
+   * unlimited (the default — small traces shouldn't pay any cost for
+   * this guard).
+   */
+  maxBytes?: number
 }

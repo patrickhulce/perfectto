@@ -1,5 +1,5 @@
 import type {AppliedPersona} from '../personas/types'
-import type {Measure, System, Timeline, Track} from '../types'
+import type {Timeline} from '../types'
 
 /**
  * Per-band, per-bucket utilization signal for the stacked overview
@@ -120,30 +120,6 @@ export function buildOverviewBands(
     target[lastBucket] += e2 - lastBucketStart
   }
 
-  const visit = (measure: Measure, track: Track, system: System): void => {
-    const catId = applied.resolveCategoryId(measure, track, system)
-    const bandIdx =
-      catId !== undefined ? bandForCategoryIdx.get(catId) ?? -1 : -1
-    // Self-time: walk children in start-order and attribute any gap
-    // between the running cursor and the next child's start to *this*
-    // measure's band. Children are sorted and non-overlapping by
-    // construction (finalizeContainer), so a single left-to-right pass
-    // is enough.
-    let cursor = measure.start
-    const kids = measure.measures
-    for (let i = 0; i < kids.length; i++) {
-      const child = kids[i]
-      if (cursor < child.start) {
-        accumulate(bandIdx, cursor, child.start)
-      }
-      visit(child, track, system)
-      if (child.end > cursor) cursor = child.end
-    }
-    if (cursor < measure.end) {
-      accumulate(bandIdx, cursor, measure.end)
-    }
-  }
-
   // Aggregate only over `applied.overviewSystems` — the persona-declared
   // subset of visible tracks that matter enough to paint into the
   // overview (for Web Dev this is the Main thread alone). Falling back
@@ -153,12 +129,104 @@ export function buildOverviewBands(
   // thread's silhouette and make the overview look flat. Scoping to
   // what the user is reading keeps the bands aligned with the flame
   // chart.
+  //
+  // We iterate the flat `SliceBuffers` (pre-order, sorted by start
+  // within siblings) instead of recursing through the `Measure` tree.
+  // The recursive form blew V8's structured-clone stack on big CPU-
+  // profile traces, so the worker strips the tree before posting; this
+  // path only needs the buffers anyway, and stays O(slices). A small
+  // per-track stack of "open ancestors" reproduces the recursive
+  // self-time accounting: each entry tracks `cursor` (the running edge
+  // of attribution for that ancestor) and `bandIdx` (its resolved
+  // band). When we leave a subtree we pay out the trailing gap from
+  // `cursor` to the ancestor's end, then bubble that end into the
+  // parent's cursor — exactly what the recursive `visit` did via its
+  // `if (child.end > cursor) cursor = child.end` step.
   let trackCount = 0
+  // Reused per-track. Pre-allocate a generous capacity; max stack depth
+  // == max slice depth, which is bounded by the trace's deepest call
+  // stack. We grow on demand to be safe.
+  const stackMeasureIdx: number[] = []
+  const stackEnd: number[] = []
+  const stackCursor: number[] = []
+  const stackBand: number[] = []
+
   for (const system of applied.overviewSystems) {
     for (const track of system.tracks) {
       trackCount += 1
-      for (const measure of track.measures) {
-        visit(measure, track, system)
+      const buffers = track.buffers
+      if (!buffers || buffers.count === 0) continue
+      const count = buffers.count
+      const starts = buffers.starts
+      const ends = buffers.ends
+      const parentIndex = buffers.parentIndex
+      const measures = buffers.measures
+      stackMeasureIdx.length = 0
+      stackEnd.length = 0
+      stackCursor.length = 0
+      stackBand.length = 0
+
+      for (let i = 0; i < count; i++) {
+        const parentIdx = parentIndex[i]
+        // Pop any open ancestors that aren't on the path to `i`. Each
+        // pop closes a finished subtree, paying its tail gap to the
+        // popped measure's band and bubbling its end into its parent's
+        // cursor.
+        while (
+          stackMeasureIdx.length > 0 &&
+          stackMeasureIdx[stackMeasureIdx.length - 1] !== parentIdx
+        ) {
+          const top = stackMeasureIdx.length - 1
+          const poppedEnd = stackEnd[top]
+          const poppedCursor = stackCursor[top]
+          const poppedBand = stackBand[top]
+          if (poppedCursor < poppedEnd) {
+            accumulate(poppedBand, poppedCursor, poppedEnd)
+          }
+          stackMeasureIdx.length = top
+          stackEnd.length = top
+          stackCursor.length = top
+          stackBand.length = top
+          if (stackMeasureIdx.length > 0) {
+            const pTop = stackMeasureIdx.length - 1
+            if (poppedEnd > stackCursor[pTop]) stackCursor[pTop] = poppedEnd
+          }
+        }
+        // Attribute the gap between the parent's running cursor and
+        // this slice's start to the parent's band.
+        if (stackMeasureIdx.length > 0) {
+          const pTop = stackMeasureIdx.length - 1
+          const pCursor = stackCursor[pTop]
+          if (pCursor < starts[i]) {
+            accumulate(stackBand[pTop], pCursor, starts[i])
+          }
+        }
+        const catId = applied.resolveCategoryId(measures[i], track, system)
+        const bandIdx =
+          catId !== undefined ? bandForCategoryIdx.get(catId) ?? -1 : -1
+        stackMeasureIdx.push(i)
+        stackEnd.push(ends[i])
+        stackCursor.push(starts[i])
+        stackBand.push(bandIdx)
+      }
+
+      // Close any remaining open ancestors at end-of-track.
+      while (stackMeasureIdx.length > 0) {
+        const top = stackMeasureIdx.length - 1
+        const poppedEnd = stackEnd[top]
+        const poppedCursor = stackCursor[top]
+        const poppedBand = stackBand[top]
+        if (poppedCursor < poppedEnd) {
+          accumulate(poppedBand, poppedCursor, poppedEnd)
+        }
+        stackMeasureIdx.length = top
+        stackEnd.length = top
+        stackCursor.length = top
+        stackBand.length = top
+        if (stackMeasureIdx.length > 0) {
+          const pTop = stackMeasureIdx.length - 1
+          if (poppedEnd > stackCursor[pTop]) stackCursor[pTop] = poppedEnd
+        }
       }
     }
   }

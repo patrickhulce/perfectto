@@ -18,6 +18,14 @@ interface ParseProgressViewProps {
 
 const ETA_MIN_BYTES = 500 * 1024 * 1024
 
+/**
+ * Fraction of the progress bar reserved for the parsing (read+sniff+
+ * write-to-parser) phase. The remaining 1 − this is allocated to
+ * finalize so the bar still moves through cull/compact/buffer-build
+ * — which on a multi-GB trace is genuinely seconds of work.
+ */
+const PARSING_BAR_FRACTION = 0.85
+
 export default function ParseProgressView({
   name,
   bytesTotal,
@@ -25,11 +33,16 @@ export default function ParseProgressView({
   startedAt,
   onCancel,
 }: ParseProgressViewProps) {
-  const { bytesRead, phase } = progress
+  const { bytesRead, phase, detail, events } = progress
   const hasTotal = bytesTotal > 0
-  const percent = hasTotal
-    ? Math.min(100, Math.max(0, (bytesRead / bytesTotal) * 100))
-    : 0
+
+  const fraction = computeProgressFraction({
+    phase,
+    bytesRead,
+    bytesTotal,
+    events,
+  })
+  const percent = Math.min(100, Math.max(0, fraction * 100))
 
   const status =
     phase === 'done'
@@ -39,6 +52,10 @@ export default function ParseProgressView({
         : hasTotal
           ? `Reading ${formatBytes(bytesRead)} of ${formatBytes(bytesTotal)}…`
           : `Reading ${formatBytes(bytesRead)}…`
+  // Sub-status from the parser (e.g. "Finalizing Renderer (track 4/12)").
+  // Only shown during finalize where it adds signal that the byte
+  // counter / progress bar can't.
+  const detailText = phase === 'finalizing' && detail ? detail : null
 
   const etaText = useEta({bytesTotal, bytesRead, phase, startedAt})
 
@@ -81,6 +98,11 @@ export default function ParseProgressView({
           <span>{status}</span>
           {etaText && <span className="text-xs text-[#718096]">{etaText}</span>}
         </div>
+        {detailText && (
+          <p className="truncate text-xs text-[#718096]" title={detailText}>
+            {detailText}
+          </p>
+        )}
 
         <div className="flex justify-end">
           <button
@@ -94,6 +116,50 @@ export default function ParseProgressView({
       </div>
     </div>
   )
+}
+
+interface ProgressFractionArgs {
+  phase: ParseProgress['phase']
+  bytesRead: number
+  bytesTotal: number
+  events: ParseProgress['events']
+}
+
+/**
+ * Maps the worker's `(phase, bytesRead, events)` triple onto a single
+ * 0..1 bar position. The parsing phase fills the first
+ * {@link PARSING_BAR_FRACTION}; finalize fills the rest, driven by the
+ * parser's event-count progress when available and by a "barely
+ * moving" indeterminate slope otherwise.
+ *
+ * Saturating both sides at their respective fractions matters more than
+ * exact accuracy — what we're trying to avoid is the bar showing 100%
+ * (or worse, 1100%) for the entire 20-second finalize.
+ */
+function computeProgressFraction({
+  phase,
+  bytesRead,
+  bytesTotal,
+  events,
+}: ProgressFractionArgs): number {
+  if (phase === 'done') return 1
+  if (phase === 'parsing') {
+    if (bytesTotal <= 0) return 0
+    const raw = bytesRead / bytesTotal
+    return Math.max(0, Math.min(PARSING_BAR_FRACTION, raw * PARSING_BAR_FRACTION))
+  }
+  // finalizing
+  const finalizeBudget = 1 - PARSING_BAR_FRACTION
+  if (events && events.total > 0) {
+    const ratio = Math.max(0, Math.min(1, events.processed / events.total))
+    // Cap finalize at 0.99 so the bar only ever reaches 100% on `done`.
+    return Math.min(0.99, PARSING_BAR_FRACTION + ratio * finalizeBudget * 0.99)
+  }
+  // No event-count signal yet (parser hasn't emitted one). Sit at the
+  // boundary between parsing and finalize so the user can see we
+  // crossed phases; the indeterminate stripe (events==null) keeps
+  // visual motion via the existing animate-pulse fallback if total=0.
+  return PARSING_BAR_FRACTION
 }
 
 interface UseEtaArgs {

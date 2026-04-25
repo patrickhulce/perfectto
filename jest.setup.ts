@@ -1,5 +1,5 @@
 import '@testing-library/jest-dom'
-import { ReadableStream } from 'node:stream/web'
+import { DecompressionStream, ReadableStream } from 'node:stream/web'
 import { TextDecoder, TextEncoder } from 'node:util'
 
 // jsdom does not polyfill these Web APIs; expose the Node implementations so
@@ -8,6 +8,7 @@ const g = globalThis as unknown as Record<string, unknown>
 if (typeof g.TextEncoder === 'undefined') g.TextEncoder = TextEncoder
 if (typeof g.TextDecoder === 'undefined') g.TextDecoder = TextDecoder
 if (typeof g.ReadableStream === 'undefined') g.ReadableStream = ReadableStream
+if (typeof g.DecompressionStream === 'undefined') g.DecompressionStream = DecompressionStream
 
 // jsdom's Blob/File lacks both `.arrayBuffer()` and `.stream()`; polyfill them
 // so the streaming parser can consume File objects the same way in tests as in

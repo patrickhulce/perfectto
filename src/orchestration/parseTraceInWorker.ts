@@ -14,7 +14,7 @@ export async function parseTraceInWorker(
   source: TraceSource,
   options?: ParseOptions,
 ): Promise<ParsedTrace> {
-  const {signal, onProgress} = options ?? {}
+  const {signal, onProgress, maxBytes} = options ?? {}
 
   if (typeof Worker === 'undefined' || !isReadableStream(input)) {
     return parseTrace(input, source, options)
@@ -91,7 +91,7 @@ export async function parseTraceInWorker(
     }
 
     try {
-      worker.postMessage({type: 'parse', stream: input, source}, [
+      worker.postMessage({type: 'parse', stream: input, source, maxBytes}, [
         input as unknown as Transferable,
       ])
     } catch (err) {

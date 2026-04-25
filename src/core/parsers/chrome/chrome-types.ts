@@ -56,6 +56,15 @@ export interface ChromeParserOptions {
    * frame compaction is unaffected by this threshold.
    */
   compactionMinEvents?: number
+  /**
+   * Per-track raw-event-count threshold at or above which the
+   * highest-point subpixel-subtree cull runs on that track. Defaults
+   * to 100k; small dev traces (and small auxiliary tracks on big
+   * traces) keep every Measure regardless of duration. Tests can
+   * lower this so synthetic 100-event fixtures still exercise the
+   * cull path.
+   */
+  subpixelCullMinEventsPerTrack?: number
 }
 
 /**

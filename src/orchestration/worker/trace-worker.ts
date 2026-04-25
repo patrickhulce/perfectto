@@ -2,7 +2,7 @@
 
 import {parseTrace} from '../../core'
 import type {WorkerMessage, WorkerRequest} from '../protocol'
-import {collectParsedTraceTransferables} from '../transferables'
+import {collectParsedTraceTransferables, stripParsedTreeForTransfer} from '../transferables'
 
 declare const self: DedicatedWorkerGlobalScope
 
@@ -18,13 +18,14 @@ self.onmessage = (event: MessageEvent<WorkerRequest>) => {
   }
 
   if (msg.type === 'parse') {
-    void runParse(msg.stream, msg.source)
+    void runParse(msg.stream, msg.source, msg.maxBytes)
   }
 }
 
 async function runParse(
   stream: ReadableStream<Uint8Array>,
   source: {name: string; size: number},
+  maxBytes: number | undefined,
 ): Promise<void> {
   const abort = new AbortController()
   currentAbort = abort
@@ -32,6 +33,7 @@ async function runParse(
   try {
     const trace = await parseTrace(stream, source, {
       signal: abort.signal,
+      maxBytes,
       onProgress: progress => {
         post({type: 'progress', progress})
       },
@@ -40,6 +42,12 @@ async function runParse(
     // receives them in O(1) without a structured-clone copy. On a 1GB
     // trace this is a ~80-500 MB saving depending on mipmap depth.
     const transferList = collectParsedTraceTransferables(trace)
+    // Then sever the recursive `Measure` tree. Without this, deep
+    // CPU-profile traces blow V8's structured-clone stack with
+    // "Maximum call stack size exceeded" before postMessage emits a
+    // byte. The flat `buffers` SoA carries everything the main thread
+    // actually reads.
+    stripParsedTreeForTransfer(trace)
     self.postMessage({type: 'done', trace} as WorkerMessage, transferList)
   } catch (err) {
     const e = toErrorDescriptor(err)

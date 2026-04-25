@@ -40,7 +40,8 @@ export default function Metadata({
   const totalFolded =
     (compaction?.onlineEventsFolded ?? 0) +
     (compaction?.siblingEventsFolded ?? 0) +
-    (compaction?.cpuTinyEventsFolded ?? 0)
+    (compaction?.cpuTinyEventsFolded ?? 0) +
+    (compaction?.subpixelEventsFolded ?? 0)
   const [settingsOpen, setSettingsOpen] = useState(false)
   return (
     <>
@@ -70,7 +71,11 @@ export default function Metadata({
             title={
               `Large-trace compaction: ${compaction.siblingEventsFolded.toLocaleString()} sibling · ` +
               `${compaction.cpuTinyEventsFolded.toLocaleString()} cpu-tiny · ` +
-              `${compaction.onlineEventsFolded.toLocaleString()} online` +
+              `${compaction.subpixelEventsFolded.toLocaleString()} subpixel-subtree` +
+              (compaction.subpixelMaxDepthFolded > 0
+                ? ` (≤ ${compaction.subpixelMaxDepthFolded} deep)`
+                : '') +
+              ` · ${compaction.onlineEventsFolded.toLocaleString()} online` +
               (compaction.onlineTriggered ? ' (streaming cap hit)' : '')
             }
             data-testid="metadata-compaction-pill"

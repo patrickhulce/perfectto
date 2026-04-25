@@ -8,6 +8,12 @@ import { parseTraceInWorker } from './orchestration'
 
 interface ParsingState {
   name: string
+  /**
+   * Denominator for the progress bar. For gzipped inputs this is the
+   * uncompressed payload size (read from the ISIZE trailer at load
+   * time); for plain files it's the file size. Lined up with the
+   * worker's decompressed-bytes counter.
+   */
   bytesTotal: number
   progress: ParseProgress
   startedAt: number
@@ -22,6 +28,15 @@ interface ParseErrorState {
 
 const DEFAULT_AUTOLOAD_NAME = 'perfecto-chrome-trace'
 
+// Soft cap on decompressed bytes pulled into the worker before we
+// truncate. 4 GiB is well above what any reasonable Chrome / DevTools
+// trace produces (a 60-second renderer trace at peak detail is ~1.5
+// GiB uncompressed) and well below the point where a single browser
+// tab will OOM on the structured-clone payload. Drag-dropping a
+// runaway file (a 50 GiB Linux ftrace by mistake) hits this cap and
+// the user gets a partial flame chart instead of a hung tab.
+const PARSE_MAX_BYTES = 4 * 1024 * 1024 * 1024
+
 export default function App() {
   const [trace, setTrace] = useState<ParsedTrace | null>(null)
   const [parsing, setParsing] = useState<ParsingState | null>(null)
@@ -29,7 +44,7 @@ export default function App() {
 
   const runParse = async (file: File): Promise<void> => {
     setParseError(null)
-    const loaded = loadFile(file)
+    const loaded = await loadFile(file)
     const controller = new AbortController()
     const initial: ParseProgress = {
       streamIndex: 0,
@@ -38,7 +53,7 @@ export default function App() {
     }
     setParsing({
       name: loaded.name,
-      bytesTotal: loaded.size,
+      bytesTotal: loaded.uncompressedSize ?? loaded.size,
       progress: initial,
       startedAt: Date.now(),
       controller,
@@ -50,6 +65,7 @@ export default function App() {
         { name: loaded.name, size: loaded.size },
         {
           signal: controller.signal,
+          maxBytes: PARSE_MAX_BYTES,
           onProgress: (p) =>
             setParsing((prev) => (prev ? { ...prev, progress: p } : prev)),
         },
@@ -175,8 +191,9 @@ function ParseErrorView({
             pre-split the trace before loading.
           </li>
           <li>
-            Some traces need to be saved as raw Chrome Trace Event Format — pretty-
-            printed JSON or wrapped `.gz` files aren&apos;t supported yet.
+            Gzipped traces (`.gz`, or any file whose first two bytes are
+            `1f 8b`) are decompressed automatically; other archive
+            wrappers (`.zip`, `.tar.gz`) need to be unpacked first.
           </li>
           <li>
             Browser worker OOMs surface here; closing other tabs can free the

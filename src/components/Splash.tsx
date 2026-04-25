@@ -73,7 +73,9 @@ export default function Splash({ onFileSelected }: SplashProps) {
           <line x1="12" y1="3" x2="12" y2="15" />
         </svg>
         <p className="text-xl font-semibold text-[#a0aec0]">Drop your trace file here</p>
-        <p className="text-sm text-[#718096]">Supports any text-based performance trace format</p>
+        <p className="text-sm text-[#718096]">
+          Supports any text-based performance trace format (`.json`, `.json.gz`)
+        </p>
         <button
           type="button"
           data-browse-btn

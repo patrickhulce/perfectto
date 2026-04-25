@@ -1,4 +1,5 @@
 import type {ParsedTrace, ParseOptions, ParseProgress, TraceInput, TraceSource} from '../types'
+import {maybeDecompressGzip} from '../utils/decompress'
 import {yieldToEventLoop} from '../utils/yieldToEventLoop'
 import {ChromeParser} from './chrome/chrome-parser'
 import type {TraceParser, TraceParserConstructor} from './types'
@@ -19,8 +20,13 @@ export async function parseTrace(
   source: TraceSource,
   options?: ParseOptions,
 ): Promise<ParsedTrace> {
-  const {signal, onProgress, chromeParser: chromeParserOptions} = options ?? {}
+  const {signal, onProgress, chromeParser: chromeParserOptions, maxBytes} = options ?? {}
   throwIfAborted(signal)
+
+  const cap =
+    typeof maxBytes === 'number' && Number.isFinite(maxBytes) && maxBytes > 0
+      ? maxBytes
+      : Infinity
 
   let parser: TraceParser | null = null
   let sniffBuf: Uint8Array = new Uint8Array(0)
@@ -28,8 +34,13 @@ export async function parseTrace(
   let streamIndex = 0
   let lastEmitBytes = 0
   let lastEmitTime = 0
+  let truncated = false
 
-  const emit = (phase: ParseProgress['phase'], force: boolean): void => {
+  const emit = (
+    phase: ParseProgress['phase'],
+    force: boolean,
+    detail?: string,
+  ): void => {
     if (!onProgress) return
     const now = Date.now()
     if (!force && bytesRead - lastEmitBytes < THROTTLE_BYTES && now - lastEmitTime < THROTTLE_MS) {
@@ -37,11 +48,18 @@ export async function parseTrace(
     }
     lastEmitBytes = bytesRead
     lastEmitTime = now
-    onProgress({streamIndex, bytesRead, phase})
+    onProgress({streamIndex, bytesRead, phase, detail})
   }
 
-  for await (const stream of normalizeInput(input)) {
+  outer: for await (const rawStream of normalizeInput(input)) {
     throwIfAborted(signal)
+    // Peek + (maybe) decompress before the parser sees byte 0. The
+    // detector returns the original stream untouched if the input
+    // isn't gzipped, so this is cheap on the common path. Note that
+    // `bytesRead` will track *decompressed* bytes from here on; for
+    // gzipped inputs that won't line up with `source.size` (compressed
+    // size) — the progress UI just overshoots toward the end.
+    const stream = await maybeDecompressGzip(rawStream, {name: source.name})
     const reader = stream.getReader()
     const cancelOnAbort = (): void => {
       reader.cancel(abortReason(signal)).catch(() => {})
@@ -74,6 +92,16 @@ export async function parseTrace(
         // Yield so our host (usually a Worker) can drain its message queue:
         // outgoing progress posts, incoming abort requests, etc.
         await yieldToEventLoop()
+
+        if (bytesRead >= cap) {
+          // Soft cap hit: stop reading, surface the truncation in
+          // progress, and fall through to finalize on whatever's been
+          // collected so the user still gets *something* to inspect.
+          truncated = true
+          reader.cancel('maxBytes exceeded').catch(() => {})
+          emit('parsing', true, 'truncated')
+          break outer
+        }
       }
     } finally {
       signal?.removeEventListener('abort', cancelOnAbort)
@@ -105,7 +133,17 @@ export async function parseTrace(
     onProgress,
     bytesRead,
     streamIndex,
+    truncated,
   })
+  if (truncated) {
+    // Surface truncation in metadata so the viewer's metadata pane can
+    // tell the user "this trace was cut short at N MB". We don't
+    // promote it to a parser error because finalize succeeded — the
+    // partial trace is genuinely usable.
+    trace.metadata.truncated = true
+    trace.metadata.truncatedAtBytes = bytesRead
+    trace.metadata.truncatedAtMaxBytes = Number.isFinite(cap) ? cap : undefined
+  }
   emit('done', true)
   return trace
 }

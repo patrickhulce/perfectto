@@ -67,6 +67,12 @@ export interface CompactionCounters {
   siblingEventsFolded: number
   cpuTinyRunsFolded: number
   cpuTinyEventsFolded: number
+  /** Subtrees collapsed by `cullSubpixelSubtrees`. */
+  subpixelSubtreesFolded: number
+  /** Total descendants absorbed by subpixel-subtree culls. */
+  subpixelEventsFolded: number
+  /** Deepest subtree any single cull operation collapsed. */
+  subpixelMaxDepthFolded: number
 }
 
 export function emptyCompactionCounters(): CompactionCounters {
@@ -75,6 +81,9 @@ export function emptyCompactionCounters(): CompactionCounters {
     siblingEventsFolded: 0,
     cpuTinyRunsFolded: 0,
     cpuTinyEventsFolded: 0,
+    subpixelSubtreesFolded: 0,
+    subpixelEventsFolded: 0,
+    subpixelMaxDepthFolded: 0,
   }
 }
 

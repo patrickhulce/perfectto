@@ -1,5 +1,6 @@
 import {readFile} from 'node:fs/promises'
 import path from 'node:path'
+import {gzipSync} from 'node:zlib'
 
 import {parseTrace} from '../core/parser'
 import {iterateTimelineEvents} from '../core'
@@ -441,6 +442,121 @@ describe('parseTrace - sniff/magic detection', () => {
   })
 })
 
+describe('parseTrace - gzip handling', () => {
+  function streamFromBytes(bytes: Uint8Array): ReadableStream<Uint8Array> {
+    return new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(bytes)
+        controller.close()
+      },
+    })
+  }
+
+  function streamFromByteChunks(chunks: Uint8Array[]): ReadableStream<Uint8Array> {
+    const queue = chunks.slice()
+    return new ReadableStream<Uint8Array>({
+      pull(controller) {
+        const next = queue.shift()
+        if (next) controller.enqueue(next)
+        else controller.close()
+      },
+    })
+  }
+
+  it('decompresses a payload identified by gzip magic bytes alone', async () => {
+    const gz = gzipSync(Buffer.from(MINIMAL_TRACE, 'utf8'))
+    // Misleading filename — no `.gz` — so this only succeeds if magic
+    // detection fires.
+    const trace = await parseTrace(streamFromBytes(new Uint8Array(gz)), {
+      name: 'trace.json',
+      size: gz.byteLength,
+    })
+    expect(trace.timeline.systems[0].tracks[0].measures[0].name).toBe('task')
+  })
+
+  it('decompresses a `.gz` file that was split across multiple chunks', async () => {
+    const gz = new Uint8Array(gzipSync(Buffer.from(MINIMAL_TRACE, 'utf8')))
+    // Force a chunk boundary right inside the gzip header so the
+    // decompressor has to be fed the buffered first chunk plus the
+    // rest, in order, without re-reading bytes.
+    const split = Math.min(4, gz.byteLength)
+    const trace = await parseTrace(
+      streamFromByteChunks([gz.slice(0, split), gz.slice(split)]),
+      {name: 'trace.json.gz', size: gz.byteLength},
+    )
+    expect(trace.timeline.systems[0].tracks[0].measures[0].name).toBe('task')
+  })
+
+  it('passes through non-gzipped streams untouched (no decompression)', async () => {
+    const trace = await parseTrace(streamFromString(MINIMAL_TRACE), {
+      name: 'trace.json',
+      size: byteSize(MINIMAL_TRACE),
+    })
+    expect(trace.timeline.systems[0].tracks[0].measures[0].name).toBe('task')
+  })
+})
+
+describe('parseTrace - maxBytes truncation', () => {
+  it('stops reading at the cap and finalizes on whatever has been emitted', async () => {
+    // Build a stream of N small events so we can split them across
+    // multiple chunks. The chrome JSON parser emits each completed
+    // `traceEvents[i]` as we cross its closing brace, so anything
+    // before the cut should land in the parsed trace.
+    const events: string[] = []
+    for (let i = 0; i < 200; i++) {
+      events.push(
+        `{"ph":"X","name":"e${i}","cat":"c","pid":1,"tid":1,"ts":${i},"dur":1}`,
+      )
+    }
+    const head = '{"traceEvents":['
+    const body = events.join(',')
+    // We deliberately *don't* include the closing `]}` — the
+    // truncation path must accept incomplete JSON.
+    const text = head + body
+    const encoded = new TextEncoder().encode(text)
+
+    // Feed in 1 KiB chunks so the cap can land mid-stream.
+    const chunkSize = 1024
+    const chunks: Uint8Array[] = []
+    for (let off = 0; off < encoded.byteLength; off += chunkSize) {
+      chunks.push(encoded.slice(off, off + chunkSize))
+    }
+    const stream = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        const next = chunks.shift()
+        if (next) controller.enqueue(next)
+        else controller.close()
+      },
+    })
+
+    const cap = 2 * chunkSize
+    const phaseDetails: Array<{phase: string; detail?: string}> = []
+    const trace = await parseTrace(stream, SOURCE, {
+      maxBytes: cap,
+      onProgress: p => phaseDetails.push({phase: p.phase, detail: p.detail}),
+    })
+
+    expect(trace.metadata.truncated).toBe(true)
+    expect(trace.metadata.truncatedAtMaxBytes).toBe(cap)
+    expect(typeof trace.metadata.truncatedAtBytes).toBe('number')
+    // The first slice in the timeline should be one of the events that
+    // landed in the cap window — proving partial parse worked.
+    const firstTrack = trace.timeline.systems[0]?.tracks[0]
+    expect(firstTrack).toBeDefined()
+    expect(firstTrack.measures.length).toBeGreaterThan(0)
+    expect(firstTrack.measures[0].name.startsWith('e')).toBe(true)
+    // We should have seen a 'truncated' detail bubble up at least once.
+    expect(phaseDetails.some(p => p.detail === 'truncated')).toBe(true)
+  })
+
+  it('does not truncate when the cap is greater than the input', async () => {
+    const trace = await parseTrace(streamFromString(MINIMAL_TRACE), SOURCE, {
+      maxBytes: 10 * 1024 * 1024,
+    })
+    expect(trace.metadata.truncated).toBeUndefined()
+  })
+})
+
 describe('parseTrace - real trace asset', () => {
   it('parses assets/perfecto-chrome-trace.json end-to-end', async () => {
     const filePath = path.resolve(
@@ -571,6 +687,123 @@ describe('parseTrace - real trace asset', () => {
     expect(base).toBeGreaterThan(3_000)
     expect(def).toBe(base)
   }, 30_000)
+})
+
+describe('parseTrace - subpixel-subtree cull', () => {
+  /**
+   * Build a tightly nested B/E pair stack inside a single 0.01ms-wide
+   * window (10ns at the trace's µs resolution). After parsing this
+   * looks like a `depth`-deep stack rooted on the same thread —
+   * exactly the shape the cull is designed to fold.
+   */
+  function nestedStackEvents(depth: number, startUs: number, endUs: number) {
+    const events: Array<Record<string, unknown>> = []
+    const pid = 1
+    const tid = 100
+    events.push({ph: 'M', name: 'process_name', pid, tid, ts: 0, args: {name: 'P'}})
+    events.push({ph: 'M', name: 'thread_name', pid, tid, ts: 0, args: {name: 'T'}})
+    for (let i = 0; i < depth; i++) {
+      events.push({ph: 'B', name: `frame${i}`, cat: 'js', pid, tid, ts: startUs})
+    }
+    for (let i = depth - 1; i >= 0; i--) {
+      events.push({ph: 'E', name: `frame${i}`, cat: 'js', pid, tid, ts: endUs})
+    }
+    return events
+  }
+
+  it('folds a deep sub-pixel stack into one synthetic Measure when track meets the gate', async () => {
+    const events = nestedStackEvents(50, 1000, 1010) // 1ms width — actually well above 0.05ms
+    // Use a tiny window (10ns) so the whole stack is sub-pixel.
+    const tinyEvents = nestedStackEvents(50, 1000, 1000.01)
+    void events
+
+    const trace = await parseTrace(
+      streamFromString(JSON.stringify({traceEvents: tinyEvents})),
+      SOURCE,
+      {chromeParser: {subpixelCullMinEventsPerTrack: 10}},
+    )
+
+    expect(trace.metadata.compaction?.subpixelSubtreesFolded ?? 0).toBeGreaterThan(0)
+    expect(trace.metadata.compaction?.subpixelEventsFolded ?? 0).toBeGreaterThan(0)
+    expect(trace.metadata.compaction?.subpixelMaxDepthFolded ?? 0).toBeGreaterThanOrEqual(40)
+    // The track should now have a single representative whose subtree
+    // is empty and whose compaction report carries the new origin.
+    const track = trace.timeline.systems[0].tracks[0]
+    const folded = track.measures.find(m => m.compaction?.some(r => r.origin === 'subpixel-subtree'))
+    expect(folded).toBeDefined()
+    expect(folded!.measures).toHaveLength(0)
+  })
+
+  it('leaves small tracks untouched (per-track event-count gate)', async () => {
+    const tinyEvents = nestedStackEvents(50, 1000, 1000.01)
+
+    const trace = await parseTrace(
+      streamFromString(JSON.stringify({traceEvents: tinyEvents})),
+      SOURCE,
+      {chromeParser: {subpixelCullMinEventsPerTrack: 1_000_000}},
+    )
+
+    expect(trace.metadata.compaction?.subpixelSubtreesFolded ?? 0).toBe(0)
+    expect(trace.metadata.compaction?.subpixelEventsFolded ?? 0).toBe(0)
+    // Stack should have survived intact (modulo the existing
+    // CPU-tiny / sibling passes, which don't touch B/E pairs).
+    const track = trace.timeline.systems[0].tracks[0]
+    let depth = 0
+    let cur = track.measures[0]
+    while (cur && cur.measures.length > 0) {
+      depth += 1
+      cur = cur.measures[0]
+    }
+    expect(depth).toBeGreaterThanOrEqual(40)
+  })
+
+  it('preserves visible-duration deep stacks even when the track is large', async () => {
+    // Same depth as the cull-eligible test but spanning 1ms — every
+    // frame is wider than the cull threshold, so depth alone must
+    // not trigger a fold.
+    const wideEvents = nestedStackEvents(50, 1000, 2000)
+
+    const trace = await parseTrace(
+      streamFromString(JSON.stringify({traceEvents: wideEvents})),
+      SOURCE,
+      {chromeParser: {subpixelCullMinEventsPerTrack: 10}},
+    )
+
+    expect(trace.metadata.compaction?.subpixelSubtreesFolded ?? 0).toBe(0)
+    const track = trace.timeline.systems[0].tracks[0]
+    let depth = 0
+    let cur = track.measures[0]
+    while (cur && cur.measures.length > 0) {
+      depth += 1
+      cur = cur.measures[0]
+    }
+    expect(depth).toBeGreaterThanOrEqual(40)
+  })
+
+  it('emits events.{processed,total} during the finalize phase', async () => {
+    const tinyEvents = nestedStackEvents(20, 1000, 1000.01)
+    const updates: Array<{processed: number; total: number}> = []
+    await parseTrace(
+      streamFromString(JSON.stringify({traceEvents: tinyEvents})),
+      SOURCE,
+      {
+        chromeParser: {subpixelCullMinEventsPerTrack: 10},
+        onProgress: p => {
+          if (p.phase === 'finalizing' && p.events) updates.push(p.events)
+        },
+      },
+    )
+    expect(updates.length).toBeGreaterThan(0)
+    // Counter must be monotonic and saturate at total.
+    let prev = 0
+    for (const e of updates) {
+      expect(e.total).toBeGreaterThan(0)
+      expect(e.processed).toBeGreaterThanOrEqual(prev)
+      expect(e.processed).toBeLessThanOrEqual(e.total)
+      prev = e.processed
+    }
+    expect(updates.at(-1)!.processed).toBe(updates.at(-1)!.total)
+  })
 })
 
 describe('types', () => {
