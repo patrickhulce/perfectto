@@ -1,8 +1,10 @@
-import type {Mark, Measure, Track} from '../core'
+import type {CompactionReport, Mark, Measure, Track} from '../core'
 import {
+  SLICE_FLAG_COMPACTED,
   buildAncestorChain,
   buildMarkBuffers,
   buildSliceBuffers,
+  buildSliceMipmap,
   findMeasureIndexById,
   lowerBoundF32,
   maxDepthPlusOne,
@@ -176,6 +178,108 @@ describe('buildSliceBuffers', () => {
     expect(b.parentEnds[3]).toBe(Math.fround(15))
     // Different parents ⇒ different keys.
     expect(b.parentEnds[1]).not.toBe(b.parentEnds[3])
+  })
+
+  it('sets flags & SLICE_FLAG_COMPACTED iff the source Measure carries compaction reports', () => {
+    const compactionReport: CompactionReport = {
+      origin: 'subpixel-subtree',
+      category: 'js',
+      names: ['frame0'],
+      count: 99,
+      firstTs: 0,
+      lastTs: 0.01,
+      totalDurationMs: 0.01,
+      maxDepthFolded: 99,
+    }
+    const folded: Measure = {
+      id: 'folded',
+      name: 'folded',
+      start: 0,
+      end: 0.01,
+      events: [],
+      marks: [],
+      measures: [],
+      compaction: [compactionReport],
+    }
+    const plain = m('plain', 1, 2)
+    const b = buildSliceBuffers(track([folded, plain]))
+
+    expect(b.count).toBe(2)
+    expect(b.flags[0] & SLICE_FLAG_COMPACTED).toBe(SLICE_FLAG_COMPACTED)
+    expect(b.flags[1] & SLICE_FLAG_COMPACTED).toBe(0)
+  })
+
+  it('mipmap merges OR every contributing flag bit into the bucket', () => {
+    // Build a long row of sub-resolution children so the mipmap's
+    // finest level merges them into a single bucket. Two of them
+    // carry compaction reports — the bucket must inherit the flag.
+    const compactionReport: CompactionReport = {
+      origin: 'subpixel-subtree',
+      category: 'js',
+      names: ['frame0'],
+      count: 50,
+      firstTs: 0,
+      lastTs: 0,
+      totalDurationMs: 0,
+      maxDepthFolded: 50,
+    }
+    const children: Measure[] = []
+    for (let i = 0; i < 50; i++) {
+      const ms: Measure = {
+        id: `c${i}`,
+        name: `c${i}`,
+        start: i * 0.05,
+        end: i * 0.05 + 0.02,
+        events: [],
+        marks: [],
+        measures: [],
+      }
+      // Mark a couple of them as compaction representatives.
+      if (i === 5 || i === 17) ms.compaction = [compactionReport]
+      children.push(ms)
+    }
+    const root = m('root', 0, 5, children)
+    const base = buildSliceBuffers(track([root]))
+
+    // Pre-flight: at least two base slices have the flag set.
+    let baseCompactedCount = 0
+    for (let i = 0; i < base.count; i++) {
+      if (base.flags[i] & SLICE_FLAG_COMPACTED) baseCompactedCount += 1
+    }
+    expect(baseCompactedCount).toBe(2)
+
+    const mm = buildSliceMipmap(base)
+    expect(mm.levels.length).toBeGreaterThan(0)
+
+    // At every level: a bucket has the flag iff at least one source
+    // base slice in its window had the flag — i.e. the count of
+    // flagged buckets is non-zero whenever we still have at least
+    // one bucket that covers the [5, 18] index range, which holds
+    // for every level since we never collapse all 50 children to
+    // zero buckets.
+    for (const lvl of mm.levels) {
+      let flaggedBuckets = 0
+      for (let i = 0; i < lvl.count; i++) {
+        if (lvl.flags[i] & SLICE_FLAG_COMPACTED) flaggedBuckets += 1
+      }
+      expect(flaggedBuckets).toBeGreaterThan(0)
+    }
+  })
+
+  it('mipmap leaves bucket flags unset when no source slice was compacted', () => {
+    const children: Measure[] = []
+    for (let i = 0; i < 50; i++) {
+      children.push(m(`c${i}`, i * 0.05, i * 0.05 + 0.02))
+    }
+    const root = m('root', 0, 5, children)
+    const base = buildSliceBuffers(track([root]))
+    const mm = buildSliceMipmap(base)
+    expect(mm.levels.length).toBeGreaterThan(0)
+    for (const lvl of mm.levels) {
+      for (let i = 0; i < lvl.count; i++) {
+        expect(lvl.flags[i] & SLICE_FLAG_COMPACTED).toBe(0)
+      }
+    }
   })
 })
 

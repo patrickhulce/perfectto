@@ -1,4 +1,5 @@
 import {
+  SLICE_FLAG_COMPACTED,
   hasDensityCounts,
   lowerBoundF32,
   type MarkBuffers,
@@ -93,6 +94,95 @@ export interface DrawHighlightFrameArgs {
 
 /** Vertical padding inside a row (mirrors the old DOM renderer). */
 const ROW_VPAD_PX = 4
+
+/**
+ * Translucent diagonal-stripe overlay drawn on top of any slice whose
+ * `flags & SLICE_FLAG_COMPACTED` is set. Subtle enough that the
+ * underlying color still reads at a glance, distinct enough that the
+ * user can tell "this rect represents folded detail" vs. a leaf.
+ */
+const STRIPE_FALLBACK_FILL = 'rgba(255, 255, 255, 0.18)'
+const STRIPE_PATTERN_SIZE = 8
+const STRIPE_LINE_COLOR = 'rgba(255, 255, 255, 0.35)'
+const STRIPE_LINE_WIDTH = 1.5
+
+/**
+ * Lazily-built `CanvasPattern` for the compaction stripe overlay.
+ * Cached per source ctx because `CanvasPattern` instances are tied to
+ * a specific 2D context — reusing one across contexts works in
+ * Chrome/Firefox today but isn't spec-guaranteed, and jsdom in tests
+ * returns `null` from `createPattern`, which we want to fall back from
+ * gracefully without spamming `createPattern` calls every frame.
+ */
+const STRIPE_PATTERN_CACHE = new WeakMap<
+  CanvasRenderingContext2D,
+  CanvasPattern | null
+>()
+
+function ensureStripePattern(
+  ctx: CanvasRenderingContext2D,
+): CanvasPattern | null {
+  const cached = STRIPE_PATTERN_CACHE.get(ctx)
+  if (cached !== undefined) return cached
+  // Some test mocks omit `createPattern` entirely; treat that as a
+  // permanent miss so the renderer falls back to a flat tint instead
+  // of throwing on every frame.
+  if (typeof ctx.createPattern !== 'function') {
+    STRIPE_PATTERN_CACHE.set(ctx, null)
+    return null
+  }
+  // OffscreenCanvas covers every browser we render in (Chromium 69+,
+  // Firefox 105+, Safari 16.4+) and avoids touching the DOM. In
+  // environments without it (jsdom in tests, ancient Safari) we
+  // skip the pattern build entirely and let the caller fall back to
+  // a flat tint — visually weaker but functionally correct.
+  if (typeof OffscreenCanvas === 'undefined') {
+    STRIPE_PATTERN_CACHE.set(ctx, null)
+    return null
+  }
+  const off = new OffscreenCanvas(STRIPE_PATTERN_SIZE, STRIPE_PATTERN_SIZE)
+  const pctx = off.getContext('2d') as
+    | OffscreenCanvasRenderingContext2D
+    | null
+  if (pctx) {
+    pctx.clearRect(0, 0, STRIPE_PATTERN_SIZE, STRIPE_PATTERN_SIZE)
+    pctx.strokeStyle = STRIPE_LINE_COLOR
+    pctx.lineWidth = STRIPE_LINE_WIDTH
+    pctx.beginPath()
+    // Two diagonals + a wraparound segment so the pattern tiles seamlessly.
+    pctx.moveTo(-1, STRIPE_PATTERN_SIZE + 1)
+    pctx.lineTo(STRIPE_PATTERN_SIZE + 1, -1)
+    pctx.moveTo(-1, 1)
+    pctx.lineTo(1, -1)
+    pctx.moveTo(STRIPE_PATTERN_SIZE - 1, STRIPE_PATTERN_SIZE + 1)
+    pctx.lineTo(STRIPE_PATTERN_SIZE + 1, STRIPE_PATTERN_SIZE - 1)
+    pctx.stroke()
+  }
+  const pattern = ctx.createPattern(
+    off as unknown as CanvasImageSource,
+    'repeat',
+  )
+  STRIPE_PATTERN_CACHE.set(ctx, pattern)
+  return pattern
+}
+
+/**
+ * Emit a single overlay pass over `rects` using the cached stripe
+ * pattern. Falls back to a flat translucent white tint when the
+ * environment can't produce a pattern (jsdom tests).
+ */
+function paintStripeOverlay(
+  ctx: CanvasRenderingContext2D,
+  rects: ReadonlyArray<{x: number; y: number; w: number; h: number}>,
+): void {
+  if (rects.length === 0) return
+  const pattern = ensureStripePattern(ctx)
+  ctx.fillStyle = pattern ?? STRIPE_FALLBACK_FILL
+  for (let i = 0; i < rects.length; i++) {
+    const r = rects[i]
+    ctx.fillRect(r.x, r.y, r.w, r.h)
+  }
+}
 
 /**
  * Gridline tunables. Subtle-by-default colors so the measures stay the
@@ -229,7 +319,12 @@ export function drawFrame(args: DrawFrameArgs): void {
     const ends = slices.ends
     const depths = slices.depths
     const colors = slices.colors
+    const flags = slices.flags
     const count = slices.count
+    // Compacted-slice rects collected while we walk the visible window;
+    // emitted as a single overlay pass after the color batches paint so
+    // the stripe sits on top of the base color without altering it.
+    const stripeScratch = getScratchStripes()
 
     for (let i = first; i < count; i++) {
       const s = starts[i]
@@ -258,6 +353,10 @@ export function drawFrame(args: DrawFrameArgs): void {
       batch.y.push(y)
       batch.w.push(wCss)
       batch.h.push(rowH)
+
+      if (flags[i] & SLICE_FLAG_COMPACTED) {
+        stripeScratch.push({x: xCss, y, w: wCss, h: rowH})
+      }
 
       if (
         labelScratch &&
@@ -288,6 +387,11 @@ export function drawFrame(args: DrawFrameArgs): void {
         ctx.fillRect(batch.x[k], batch.y[k], batch.w[k], batch.h[k])
       }
     }
+
+    // Stripe overlay sits on top of the color fill; the pattern's alpha
+    // lets the underlying color show through so users still read the
+    // category at a glance.
+    paintStripeOverlay(ctx, stripeScratch)
   }
 
   // --- Marks (2px vertical ticks). --------------------------------------
@@ -415,8 +519,10 @@ export function drawHighlightFrame(args: DrawHighlightFrameArgs): void {
   const ends = slices.ends
   const depths = slices.depths
   const colors = slices.colors
+  const flags = slices.flags
   const count = slices.count
   const labelScratch = baseMeasures ? getScratchLabels() : null
+  const stripeScratch = getScratchStripes()
 
   // Match the base's color-batching z-order, exactly. Here's why: the
   // base's drawFrame groups rects by `colors[i]` and emits batches in
@@ -476,6 +582,10 @@ export function drawHighlightFrame(args: DrawHighlightFrameArgs): void {
     batch.w.push(wCss)
     batch.h.push(rowH)
 
+    if (flags[i] & SLICE_FLAG_COMPACTED) {
+      stripeScratch.push({x: xCss, y, w: wCss, h: rowH})
+    }
+
     if (
       labelScratch &&
       bucketCount === 1 &&
@@ -504,6 +614,8 @@ export function drawHighlightFrame(args: DrawHighlightFrameArgs): void {
       ctx.fillRect(batch.x[k], batch.y[k], batch.w[k], batch.h[k])
     }
   }
+
+  paintStripeOverlay(ctx, stripeScratch)
 
   if (labelScratch && labelScratch.length > 0) {
     ctx.font = LABEL_FONT
@@ -560,6 +672,19 @@ const LABEL_SCRATCH: LabelItem[] = []
 function getScratchLabels(): LabelItem[] {
   LABEL_SCRATCH.length = 0
   return LABEL_SCRATCH
+}
+
+interface StripeRect {
+  x: number
+  y: number
+  w: number
+  h: number
+}
+
+const STRIPE_SCRATCH: StripeRect[] = []
+function getScratchStripes(): StripeRect[] {
+  STRIPE_SCRATCH.length = 0
+  return STRIPE_SCRATCH
 }
 
 // `ctx.measureText` is the dominant cost of the label pass. Cache by name
@@ -621,4 +746,7 @@ export const __test__ = {
   cropText,
   measureCache,
   cropCache,
+  ensureStripePattern,
+  STRIPE_PATTERN_CACHE,
+  STRIPE_FALLBACK_FILL,
 }

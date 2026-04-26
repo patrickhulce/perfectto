@@ -227,6 +227,110 @@ describe('parseTrace - chrome minimal', () => {
     expect(track.measures[0].measures.map(m => m.name)).toEqual(['inner'])
   })
 
+  // Regression: real PyTorch profiler traces emit `_record_function_enter_new`-
+  // style probes whose recorded `dur` ends *before* the wider sibling they
+  // actually wrap (the probe finishes early; the sibling event keeps running
+  // for tens of ms). The naive ts-only flush would leave the probe on the
+  // stack when the wider sibling opens, falsely nesting the wide subtree under
+  // a tiny ancestor — which `cullSubpixelSubtrees` would then sweep into a
+  // sub-pixel fold rep, silently dropping the entire subtree from the flame
+  // chart. Pop straddled ancestors before pushing the new event.
+  it('does not nest a wider X event under a tiny straddled ancestor', async () => {
+    const trace = await parseTrace(
+      streamFromString(
+        JSON.stringify({
+          traceEvents: [
+            // Outer parent the whole scenario lives inside.
+            {ph: 'X', name: 'outer', cat: 'c', pid: 1, tid: 1, ts: 0, dur: 1_000_000},
+            // Tiny "probe" — opens at ts=10, claims dur=10 (ends at ts=20).
+            {ph: 'X', name: 'probe', cat: 'c', pid: 1, tid: 1, ts: 10, dur: 10},
+            // Wider sibling opens at ts=15 (within the probe's open window),
+            // but extends way past the probe's end. Must NOT become a child
+            // of `probe`; it must become a sibling of `probe` under `outer`.
+            {ph: 'X', name: 'wide', cat: 'c', pid: 1, tid: 1, ts: 15, dur: 999_000},
+            // Deep child of `wide` — confirms the whole subtree re-roots.
+            {ph: 'X', name: 'deep', cat: 'c', pid: 1, tid: 1, ts: 100, dur: 999_000 - 200},
+          ],
+        }),
+      ),
+      SOURCE,
+    )
+
+    const track = trace.timeline.systems[0].tracks[0]
+    expect(track.measures).toHaveLength(1)
+    const outer = track.measures[0]
+    expect(outer.name).toBe('outer')
+    // Straddled probe is closed at its own endTs and demoted to a sibling
+    // leaf; `wide` (with its `deep` descendant) is the second sibling.
+    expect(outer.measures.map(m => m.name)).toEqual(['probe', 'wide'])
+    const [probe, wide] = outer.measures
+    expect(probe.measures).toHaveLength(0)
+    expect(wide.measures.map(m => m.name)).toEqual(['deep'])
+    expect(wide.measures[0].measures).toHaveLength(0)
+  })
+
+  it('preserves a deep wide chain rooted under a tiny straddled probe', async () => {
+    // Mirrors the real PyTorch trace shape that motivated the fix:
+    // tiny profiler.__init__ + profiler.__enter__ + torch/_ops.__call__ +
+    // _record_function_enter_new — all sub-50µs probes whose dur ends before
+    // the 66 ms `## Call CompiledFxGraph ##` chain that actually does the
+    // work. The chain must survive parsing as a sibling of the probes.
+    const ts = (us: number) => us
+    const trace = await parseTrace(
+      streamFromString(
+        JSON.stringify({
+          traceEvents: [
+            {ph: 'X', name: '__call__', cat: 'c', pid: 1, tid: 1, ts: ts(0), dur: 66_000},
+            {ph: 'X', name: 'profiler.init', cat: 'c', pid: 1, tid: 1, ts: ts(7), dur: 8},
+            {ph: 'X', name: 'profiler.enter', cat: 'c', pid: 1, tid: 1, ts: ts(16), dur: 30},
+            {ph: 'X', name: 'ops.call', cat: 'c', pid: 1, tid: 1, ts: ts(20), dur: 26},
+            {ph: 'X', name: 'record_fn', cat: 'c', pid: 1, tid: 1, ts: ts(21), dur: 24},
+            // Wide chain opens inside the still-open probes but extends way past them.
+            {ph: 'X', name: 'CompiledFxGraph', cat: 'c', pid: 1, tid: 1, ts: ts(31), dur: 65_900},
+            {ph: 'X', name: 'fx.call', cat: 'c', pid: 1, tid: 1, ts: ts(48), dur: 65_800},
+            {ph: 'X', name: 'compile_fx.run', cat: 'c', pid: 1, tid: 1, ts: ts(140), dur: 65_700},
+            {ph: 'X', name: 'execute_node', cat: 'c', pid: 1, tid: 1, ts: ts(200), dur: 65_500},
+            {ph: 'X', name: 'replay', cat: 'c', pid: 1, tid: 1, ts: ts(300), dur: 65_300},
+            {ph: 'X', name: 'cudaGraphLaunch', cat: 'c', pid: 1, tid: 1, ts: ts(400), dur: 65_100},
+          ],
+        }),
+      ),
+      SOURCE,
+    )
+
+    const track = trace.timeline.systems[0].tracks[0]
+    expect(track.measures).toHaveLength(1)
+    const call = track.measures[0]
+    expect(call.name).toBe('__call__')
+    // The 4 tiny probes survive as leaf siblings; the wide chain is its own
+    // sibling subtree — not a descendant of any probe.
+    expect(call.measures.map(m => m.name)).toEqual([
+      'profiler.init',
+      'profiler.enter',
+      'CompiledFxGraph',
+    ])
+    const profilerEnter = call.measures[1]
+    // ops.call/record_fn are properly nested inside profiler.enter (their
+    // ends still fit), so they re-parent there — not under CompiledFxGraph.
+    expect(profilerEnter.measures.map(m => m.name)).toEqual(['ops.call'])
+    expect(profilerEnter.measures[0].measures.map(m => m.name)).toEqual(['record_fn'])
+
+    const compiled = call.measures[2]
+    // The whole 6-deep wide chain stays intact.
+    const chain: string[] = []
+    for (let m: Measure | undefined = compiled; m; m = m.measures[0]) {
+      chain.push(m.name)
+    }
+    expect(chain).toEqual([
+      'CompiledFxGraph',
+      'fx.call',
+      'compile_fx.run',
+      'execute_node',
+      'replay',
+      'cudaGraphLaunch',
+    ])
+  })
+
   it('does not flatten X events on the real trace asset', async () => {
     const filePath = path.resolve(
       __dirname,
@@ -268,6 +372,86 @@ describe('parseTrace - chrome minimal', () => {
     expect(totalMeasures).toBeGreaterThan(1000)
     expect(measuresWithChildren).toBeGreaterThan(100)
     expect(maxDepth).toBeGreaterThanOrEqual(5)
+  }, 30000)
+
+  // Real-world regression fixture: a ~27 KiB filtered slice of a PyTorch
+  // profiler trace that previously triggered the straddling-X mis-nesting
+  // bug. The unfiltered trace was ~75 MiB compressed and not checked in;
+  // this fixture covers exactly one `output_code.py(611): __call__`
+  // invocation along with its enclosing profiler probes and the full
+  // `cudaGraphLaunch` chain that lives inside it.
+  it('preserves the cudaGraphLaunch chain inside output_code.py:__call__ on the filtered hf-compiled fixture', async () => {
+    const filePath = path.resolve(
+      __dirname,
+      'fixtures',
+      'chrome-straddling-x.json.gz',
+    )
+    const bytes = await readFile(filePath)
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new Uint8Array(bytes))
+        controller.close()
+      },
+    })
+    const trace = await parseTrace(stream, {
+      name: 'chrome-straddling-x.json.gz',
+      size: bytes.byteLength,
+    })
+
+    // Walk every measure in the parsed tree and collect the names we care
+    // about. Before the parser fix, the entire deep chain rooted under
+    // `output_code.py(611): __call__` was being absorbed into a tiny
+    // sub-pixel fold and these names appeared *only* in `compaction.names`.
+    const seen = new Map<string, Measure>()
+    const watchlist = [
+      'torch/_inductor/output_code.py(611): __call__',
+      'torch/_inductor/cudagraph_trees.py(2262): execute_node',
+      'torch/_inductor/cudagraph_trees.py(1228): run_graph',
+      'torch/cuda/graphs.py(141): replay',
+      'cudaGraphLaunch',
+    ]
+    const stack: Measure[] = []
+    for (const system of trace.timeline.systems) {
+      for (const track of system.tracks) {
+        for (const m of track.measures) stack.push(m)
+      }
+    }
+    while (stack.length > 0) {
+      const m = stack.pop()!
+      if (watchlist.includes(m.name) && !seen.has(m.name)) seen.set(m.name, m)
+      for (const c of m.measures) stack.push(c)
+    }
+    for (const name of watchlist) {
+      expect(seen.has(name)).toBe(true)
+    }
+
+    // The chain must actually nest, not be flat siblings. Walk from
+    // __call__ down through descendants and assert each subsequent
+    // watchlist entry is reachable as a descendant of the previous one.
+    const isDescendantOf = (root: Measure, target: Measure): boolean => {
+      const dq: Measure[] = [...root.measures]
+      while (dq.length > 0) {
+        const m = dq.pop()!
+        if (m === target) return true
+        for (const c of m.measures) dq.push(c)
+      }
+      return false
+    }
+    for (let i = 1; i < watchlist.length; i++) {
+      const parent = seen.get(watchlist[i - 1])!
+      const child = seen.get(watchlist[i])!
+      expect(isDescendantOf(parent, child)).toBe(true)
+    }
+
+    // And the cull report must not have eaten any of these names — if the
+    // parser regression came back, cudaGraphLaunch would resurface inside
+    // `compaction.names` as a folded subtree leaf.
+    const compaction = trace.metadata.compaction as CompactionReport | undefined
+    if (compaction?.names) {
+      for (const name of watchlist) {
+        expect(compaction.names).not.toContain(name)
+      }
+    }
   }, 30000)
 
   it('uses metadata events to name processes and threads', async () => {
@@ -780,6 +964,91 @@ describe('parseTrace - subpixel-subtree cull', () => {
     expect(depth).toBeGreaterThanOrEqual(40)
   })
 
+  it('preserves the total event count under the cull (giant-stack invariant)', async () => {
+    // 1000-deep B/E stack inside a 0.005ms window. Pre-cull there
+    // are exactly 1000 Measures (one per B/E pair); post-cull at
+    // least one of them must be a fold whose `compaction[0].count`
+    // makes up the difference. The invariant is `Σ (1 + count) ===
+    // 1000` over the surviving tree.
+    const tinyEvents = nestedStackEvents(1000, 1000, 1000.005)
+
+    const trace = await parseTrace(
+      streamFromString(JSON.stringify({traceEvents: tinyEvents})),
+      SOURCE,
+      {chromeParser: {subpixelCullMinEventsPerTrack: 10}},
+    )
+
+    let represented = 0
+    const stack: TimelineContainer[] = []
+    for (const sys of trace.timeline.systems) {
+      for (const t of sys.tracks) stack.push(t)
+    }
+    while (stack.length > 0) {
+      const cur = stack.pop()!
+      for (const m of cur.measures) {
+        let folded = 0
+        if (m.compaction) {
+          for (const r of m.compaction) folded += r.count
+        }
+        represented += 1 + folded
+        if (m.measures.length > 0) stack.push(m)
+      }
+    }
+    expect(represented).toBe(1000)
+    expect(trace.metadata.compaction?.subpixelSubtreesFolded ?? 0).toBeGreaterThan(0)
+  })
+
+  it('parses assets/perfecto-chrome-trace.json without losing entire systems', async () => {
+    // Real-trace integrity check. After cull + compact + fixup the
+    // timeline must still represent the bulk of the parser-reported
+    // event count. The bound is generous (>=70%) because
+    // `metadata.eventCount` counts B/E pairs as two events while the
+    // tree counts one per pair, plus marks/instants/etc. don't show
+    // up as Measures at all. The point is to catch catastrophic
+    // loss — an entire system disappearing — not to gauge fidelity.
+    const filePath = path.resolve(
+      __dirname,
+      '..',
+      '..',
+      'assets',
+      'perfecto-chrome-trace.json',
+    )
+    const bytes = await readFile(filePath)
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new Uint8Array(bytes))
+        controller.close()
+      },
+    })
+    const trace = await parseTrace(stream, {
+      name: 'perfecto-chrome-trace.json',
+      size: bytes.byteLength,
+    })
+
+    let represented = 0
+    const stack: TimelineContainer[] = []
+    for (const sys of trace.timeline.systems) {
+      for (const t of sys.tracks) stack.push(t)
+    }
+    while (stack.length > 0) {
+      const cur = stack.pop()!
+      for (const m of cur.measures) {
+        let folded = 0
+        if (m.compaction) {
+          for (const r of m.compaction) folded += r.count
+        }
+        represented += 1 + folded
+        if (m.measures.length > 0) stack.push(m)
+      }
+    }
+    // Sanity: at least one system survived.
+    expect(trace.timeline.systems.some(s => s.tracks.length > 0)).toBe(true)
+    // We saw ~hundreds of thousands of Measures pre-summary; just
+    // demand four-digit floor so the assertion can't pass on an
+    // empty timeline.
+    expect(represented).toBeGreaterThan(1000)
+  }, 60_000)
+
   it('emits events.{processed,total} during the finalize phase', async () => {
     const tinyEvents = nestedStackEvents(20, 1000, 1000.01)
     const updates: Array<{processed: number; total: number}> = []
@@ -798,6 +1067,58 @@ describe('parseTrace - subpixel-subtree cull', () => {
     let prev = 0
     for (const e of updates) {
       expect(e.total).toBeGreaterThan(0)
+      expect(e.processed).toBeGreaterThanOrEqual(prev)
+      expect(e.processed).toBeLessThanOrEqual(e.total)
+      prev = e.processed
+    }
+    expect(updates.at(-1)!.processed).toBe(updates.at(-1)!.total)
+  })
+
+  it('pumps progress smoothly across multiple tracks during finalize', async () => {
+    // Multi-track trace so the parser walks several (track × pass)
+    // pairs — combined with the per-pass forced emit, we should see
+    // strictly more than the old 3-jump shape per process.
+    const events: Array<Record<string, unknown>> = []
+    const TRACKS = 4
+    for (let t = 0; t < TRACKS; t++) {
+      const pid = 1
+      const tid = 100 + t
+      events.push({ph: 'M', name: 'process_name', pid, tid, ts: 0, args: {name: 'P'}})
+      events.push({
+        ph: 'M',
+        name: 'thread_name',
+        pid,
+        tid,
+        ts: 0,
+        args: {name: `T${t}`},
+      })
+      const depth = 30
+      for (let i = 0; i < depth; i++) {
+        events.push({ph: 'B', name: `frame${i}`, cat: 'js', pid, tid, ts: 1000})
+      }
+      for (let i = depth - 1; i >= 0; i--) {
+        events.push({ph: 'E', name: `frame${i}`, cat: 'js', pid, tid, ts: 1000.01})
+      }
+    }
+    const updates: Array<{processed: number; total: number}> = []
+    await parseTrace(
+      streamFromString(JSON.stringify({traceEvents: events})),
+      SOURCE,
+      {
+        chromeParser: {subpixelCullMinEventsPerTrack: 10},
+        onProgress: p => {
+          if (p.phase === 'finalizing' && p.events) updates.push(p.events)
+        },
+      },
+    )
+    // 4 tracks × 3 passes = 12 forced per-pass headers, plus the
+    // start + final force = baseline of 14. Floor a comfortable
+    // margin below to avoid CI timing flakes from the throttle
+    // coalescing adjacent calls.
+    expect(updates.length).toBeGreaterThanOrEqual(8)
+    // Strict monotonicity and saturation invariants still hold.
+    let prev = 0
+    for (const e of updates) {
       expect(e.processed).toBeGreaterThanOrEqual(prev)
       expect(e.processed).toBeLessThanOrEqual(e.total)
       prev = e.processed

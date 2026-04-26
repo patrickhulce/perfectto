@@ -134,6 +134,22 @@ export interface CompactionReport {
    * Other origins leave this undefined.
    */
   distinctNames?: number
+  /**
+   * Optional parallel-to-`names` totals: aggregate node duration (ms)
+   * for each name in the preview. Lets a blanket-merge of multiple
+   * subpixel-subtree folds rank "most prominent inner names" by total
+   * time spent rather than by frequency. Same length as `names` when
+   * present; absent for origins that don't track this.
+   */
+  nameDurationsMs?: number[]
+  /**
+   * For blanket-merged subpixel-subtree folds: how many individual
+   * subtree folds were coalesced into this representative. `count`
+   * still tells the user "this rect stands in for N source events";
+   * `subtreesMerged` answers "...spread across how many independent
+   * subtrees". Undefined when this report represents a single fold.
+   */
+  subtreesMerged?: number
 }
 
 /**

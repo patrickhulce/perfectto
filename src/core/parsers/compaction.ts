@@ -4,6 +4,8 @@ import type {
   TimelineContainer,
 } from '../types'
 
+import {PROGRESS_TICK_MEASURES} from './cull'
+
 /**
  * Knobs for the finalize-time sibling compactor. Defaults aim for
  * "fold obvious sampler/tight-loop bursts aggressively, never touch
@@ -110,17 +112,24 @@ export function compactSiblings(
   mintId: () => string,
   counters: CompactionCounters,
   parentSpanMs?: number,
+  onProgress?: (deltaEvents: number) => void,
 ): void {
   // Recurse first: fold inside every child, then consider this container
   // for its own sibling-level fold. Bottom-up keeps us from accidentally
   // re-scanning content we just collapsed.
   for (const child of container.measures) {
     const childSpan = child.end - child.start
-    compactSiblings(child, opts, mintId, counters, childSpan)
+    compactSiblings(child, opts, mintId, counters, childSpan, onProgress)
   }
 
   const measures = container.measures
-  if (measures.length < opts.minRunLength) return
+  if (measures.length < opts.minRunLength) {
+    // Bump progress for the leaf-ish containers we won't re-scan
+    // below; the loop below handles any container that does enter
+    // the sibling-fold path.
+    if (onProgress && measures.length > 0) onProgress(measures.length)
+    return
+  }
 
   const out: Measure[] = []
   let i = 0
@@ -213,6 +222,10 @@ export function compactSiblings(
   if (out.length !== measures.length) {
     container.measures = out
   }
+  // We scanned every input Measure (folded or not). Report the
+  // pre-fold count so the parser's progress bar advances by the work
+  // we actually did, not the smaller post-fold container size.
+  if (onProgress && measures.length > 0) onProgress(measures.length)
 }
 
 /**
@@ -252,14 +265,24 @@ export function compactCpuTinyFrames(
   opts: CpuTinyCompactionOptions,
   mintId: () => string,
   counters: CompactionCounters,
+  onProgress?: (deltaEvents: number) => void,
 ): void {
   if (root.category !== 'jsFrame') return
 
+  let pending = 0
+  const flush = (): void => {
+    if (pending > 0 && onProgress) onProgress(pending)
+    pending = 0
+  }
   const walk = (m: Measure): void => {
+    const before = m.measures.length
     for (const c of m.measures) walk(c)
     foldTinyChildren(m, opts, mintId, counters)
+    pending += before
+    if (pending >= PROGRESS_TICK_MEASURES) flush()
   }
   walk(root)
+  flush()
 }
 
 function foldTinyChildren(

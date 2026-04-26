@@ -1,4 +1,4 @@
-import type {Measure, Track} from '../core'
+import type {CompactionReport, Measure, Track} from '../core'
 import {drawFrame, drawHighlightFrame, __test__} from '../components/timeline/canvas2d'
 import {
   EMPTY_MARK_BUFFERS,
@@ -357,6 +357,231 @@ describe('drawFrame', () => {
       maxDepthExclusive: Infinity,
     })
     expect(fills.length).toBeGreaterThan(0)
+  })
+})
+
+describe('drawFrame compaction stripe overlay', () => {
+  // Extended ctx mock that records `createPattern` invocations, every
+  // `fillStyle` assignment, and `fillRect` calls (with the current
+  // fillStyle). This lets us verify the stripe overlay pass:
+  //   1. asks the renderer for a CanvasPattern (or falls back to a flat
+  //      tint when `createPattern` is absent);
+  //   2. assigns the stripe fill exactly once per draw, after the color
+  //      batches paint;
+  //   3. only fillRects flagged slices.
+  interface StripeFill {
+    x: number
+    y: number
+    w: number
+    h: number
+    fillStyle: string
+  }
+  interface StripeCtxOptions {
+    /** Return null from `createPattern`, simulating jsdom. */
+    nullPattern?: boolean
+    /** Omit `createPattern` entirely. */
+    omitCreatePattern?: boolean
+  }
+  function makeStripeCtx(opts: StripeCtxOptions = {}): {
+    ctx: CanvasRenderingContext2D
+    fills: StripeFill[]
+    fillStyleAssignments: Array<string | object>
+    getCreatePatternCalls: () => number
+  } {
+    const fills: StripeFill[] = []
+    const fillStyleAssignments: Array<string | object> = []
+    let fillStyle: string | object = ''
+    let createPatternCalls = 0
+    const fakePattern = {marker: 'stripe-pattern'}
+    const base: Record<string, unknown> = {
+      get fillStyle() {
+        return fillStyle
+      },
+      set fillStyle(v: string | object) {
+        fillStyle = v
+        fillStyleAssignments.push(v)
+      },
+      clearRect: (_x: number, _y: number, _w: number, _h: number): void => {},
+      fillRect: (x: number, y: number, w: number, h: number): void => {
+        fills.push({
+          x,
+          y,
+          w,
+          h,
+          fillStyle: typeof fillStyle === 'string' ? fillStyle : '<pattern>',
+        })
+      },
+    }
+    if (!opts.omitCreatePattern) {
+      base.createPattern = (): unknown => {
+        createPatternCalls += 1
+        return opts.nullPattern ? null : fakePattern
+      }
+    }
+    const ctx = base as unknown as CanvasRenderingContext2D
+    return {
+      ctx,
+      fills,
+      fillStyleAssignments,
+      getCreatePatternCalls: () => createPatternCalls,
+    }
+  }
+
+  /**
+   * Minimal `OffscreenCanvas` stub. jsdom doesn't ship one, so the
+   * production code path that builds the stripe pattern bails to the
+   * fallback tint when we don't install this. The stub returns a
+   * `null` 2d context (the test cares about the `createPattern` call
+   * on the *outer* ctx, not the offscreen drawing).
+   */
+  class StubOffscreenCanvas {
+    public width: number
+    public height: number
+    constructor(w: number, h: number) {
+      this.width = w
+      this.height = h
+    }
+    getContext(): null {
+      return null
+    }
+  }
+
+  let originalOffscreenCanvas: unknown
+  beforeEach(() => {
+    // Pattern cache is keyed by ctx identity, but we use a fresh ctx
+    // per test anyway. Cropping caches don't matter here.
+    __test__.measureCache.clear()
+    __test__.cropCache.clear()
+    originalOffscreenCanvas = (globalThis as Record<string, unknown>).OffscreenCanvas
+    ;(globalThis as Record<string, unknown>).OffscreenCanvas = StubOffscreenCanvas
+  })
+
+  afterEach(() => {
+    ;(globalThis as Record<string, unknown>).OffscreenCanvas = originalOffscreenCanvas
+  })
+
+  function compactedTrack(): Track {
+    const compactionReport: CompactionReport = {
+      origin: 'subpixel-subtree',
+      category: 'js',
+      names: ['frame0'],
+      count: 99,
+      firstTs: 0,
+      lastTs: 100,
+      totalDurationMs: 100,
+      maxDepthFolded: 99,
+    }
+    const folded: Measure = {
+      id: 'folded',
+      name: 'folded',
+      start: 0,
+      end: 100,
+      events: [],
+      marks: [],
+      measures: [],
+      compaction: [compactionReport],
+    }
+    return {id: 't', name: 't', marks: [], measures: [folded]}
+  }
+
+  it('does not paint the stripe overlay when no slice carries the compacted flag', () => {
+    const base = buildSliceBuffers(track([m('plain', 0, 100, [], '#ff0000')]))
+    const {ctx, fills, fillStyleAssignments, getCreatePatternCalls} = makeStripeCtx()
+    drawFrame({
+      ctx,
+      slices: base,
+      marks: EMPTY_MARK_BUFFERS,
+      widthCss: 200,
+      heightCss: 20,
+      rowHeight: 20,
+      pxPerMs: 2,
+      visibleStartMs: 0,
+      visibleEndMs: 100,
+      canvasStartMs: 0,
+      maxDepthExclusive: Infinity,
+    })
+    expect(fills.length).toBe(1)
+    expect(getCreatePatternCalls()).toBe(0)
+    // Only the color batch's fillStyle should have been assigned —
+    // no pattern, no fallback tint.
+    for (const v of fillStyleAssignments) expect(typeof v).toBe('string')
+  })
+
+  it('paints exactly one stripe overlay rect per compacted slice, after the color batch', () => {
+    const base = buildSliceBuffers(compactedTrack())
+    const {ctx, fills, fillStyleAssignments} = makeStripeCtx()
+    drawFrame({
+      ctx,
+      slices: base,
+      marks: EMPTY_MARK_BUFFERS,
+      widthCss: 400,
+      heightCss: 20,
+      rowHeight: 20,
+      pxPerMs: 2,
+      visibleStartMs: 0,
+      visibleEndMs: 100,
+      canvasStartMs: 0,
+      maxDepthExclusive: Infinity,
+    })
+    // Two fillRects: first the color batch, then the stripe overlay
+    // at the same geometry. Order matters — the stripe must be on
+    // top of the color, otherwise the color would mask it.
+    expect(fills.length).toBe(2)
+    expect(fills[0].x).toBe(fills[1].x)
+    expect(fills[0].y).toBe(fills[1].y)
+    expect(fills[0].w).toBe(fills[1].w)
+    expect(fills[0].h).toBe(fills[1].h)
+    // Color batch first (rgb...), stripe second (<pattern> in our mock).
+    expect(typeof fills[0].fillStyle).toBe('string')
+    expect(fills[0].fillStyle.startsWith('rgb')).toBe(true)
+    expect(fills[1].fillStyle).toBe('<pattern>')
+    // The stripe pass should assign fillStyle to the pattern object
+    // exactly once (the batch loop does its own string assign first).
+    const patternAssignments = fillStyleAssignments.filter(v => typeof v !== 'string')
+    expect(patternAssignments.length).toBe(1)
+  })
+
+  it('falls back to a flat tint when the environment has no createPattern', () => {
+    const base = buildSliceBuffers(compactedTrack())
+    const {ctx, fills, fillStyleAssignments} = makeStripeCtx({omitCreatePattern: true})
+    drawFrame({
+      ctx,
+      slices: base,
+      marks: EMPTY_MARK_BUFFERS,
+      widthCss: 400,
+      heightCss: 20,
+      rowHeight: 20,
+      pxPerMs: 2,
+      visibleStartMs: 0,
+      visibleEndMs: 100,
+      canvasStartMs: 0,
+      maxDepthExclusive: Infinity,
+    })
+    expect(fills.length).toBe(2)
+    // Both assignments are strings (no pattern available); the second
+    // is the documented fallback tint.
+    for (const v of fillStyleAssignments) expect(typeof v).toBe('string')
+    expect(fills[1].fillStyle).toBe(__test__.STRIPE_FALLBACK_FILL)
+  })
+
+  it('falls back to a flat tint when createPattern returns null (jsdom shape)', () => {
+    const base = buildSliceBuffers(compactedTrack())
+    const {ctx, fills} = makeStripeCtx({nullPattern: true})
+    drawFrame({
+      ctx,
+      slices: base,
+      marks: EMPTY_MARK_BUFFERS,
+      widthCss: 400,
+      heightCss: 20,
+      rowHeight: 20,
+      pxPerMs: 2,
+      visibleStartMs: 0,
+      visibleEndMs: 100,
+      canvasStartMs: 0,
+      maxDepthExclusive: Infinity,
+    })
+    expect(fills.length).toBe(2)
+    expect(fills[1].fillStyle).toBe(__test__.STRIPE_FALLBACK_FILL)
   })
 })
 

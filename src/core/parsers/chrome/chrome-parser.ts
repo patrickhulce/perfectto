@@ -683,21 +683,63 @@ export class ChromeParser implements TraceParser {
         // the finalize phase behind what looked like a hung worker.
         await yieldToEventLoop()
 
+        /**
+         * Per-pass progress hook factory. Each pass owns a slice of
+         * `eventsProcessed` exactly `trackEvents` wide; we accumulate
+         * deltas from inside the helpers (4096-event chunks) into
+         * `passProcessed`, capped at `trackEvents`, and reflect that
+         * into the global `eventsProcessed` counter on every flush so
+         * `emitFinalizeProgress` reports smooth motion. After the
+         * pass returns we snap to the full pass budget so the
+         * post-condition matches the old "one bump per pass" math.
+         */
+        const makePassHook = (): {
+          onProgress: (delta: number) => void
+          finish: () => void
+        } => {
+          const passStart = eventsProcessed
+          const passCap = passStart + trackEvents
+          let passProcessed = 0
+          return {
+            onProgress: (delta: number) => {
+              if (delta <= 0) return
+              passProcessed += delta
+              if (passProcessed > trackEvents) passProcessed = trackEvents
+              const target = passStart + passProcessed
+              if (target > eventsProcessed) eventsProcessed = target
+              if (eventsProcessed > passCap) eventsProcessed = passCap
+              emitFinalizeProgress()
+            },
+            finish: () => {
+              if (eventsProcessed < passCap) eventsProcessed = passCap
+              emitFinalizeProgress()
+            },
+          }
+        }
+
         // --- Pass A: highest-point sub-pixel subtree cull -----------
+        // Force the per-pass header through the 50 ms throttle so the
+        // user always sees a "phase changed" tick even when the
+        // surrounding work is fast — otherwise small traces produce a
+        // single 0% → 100% jump.
         emitFinalizeProgress(
           `Culling ${procLabel} — ${track.name} (${trackIdx}/${trackTotal})` +
             (cullEnabled ? '' : ' [skipped: small track]'),
+          true,
         )
-        if (cullEnabled) {
-          cullSubpixelSubtrees(
-            track,
-            DEFAULT_SUBPIXEL_CULL_OPTIONS,
-            () => this._nextId(),
-            this._compactionCounters,
-          )
+        {
+          const hook = makePassHook()
+          if (cullEnabled) {
+            cullSubpixelSubtrees(
+              track,
+              DEFAULT_SUBPIXEL_CULL_OPTIONS,
+              () => this._nextId(),
+              this._compactionCounters,
+              hook.onProgress,
+            )
+          }
+          hook.finish()
         }
-        eventsProcessed += trackEvents
-        emitFinalizeProgress()
 
         // --- Pre-sort: compactSiblings/CPU-tiny expect sorted input ---
         finalizeContainer(track)
@@ -705,58 +747,70 @@ export class ChromeParser implements TraceParser {
         // --- Pass B: targeted compaction (CPU-tiny + same-name siblings) ---
         emitFinalizeProgress(
           `Compacting ${procLabel} — ${track.name} (${trackIdx}/${trackTotal})`,
+          true,
         )
-        // CPU-profile tiny-frame compaction is always safe: it only
-        // touches synthesized `jsFrame` subtrees produced from V8
-        // samples, where folding sub-pixel leaf clusters into a single
-        // density rect is the explicit goal. Skipping it would mean
-        // tens of thousands of singleton frames render as the same
-        // visual smear but cost real memory.
-        for (const root of track.measures) {
-          compactCpuTinyFrames(
-            root,
-            DEFAULT_CPU_TINY_OPTIONS,
-            () => this._nextId(),
-            this._compactionCounters,
-          )
+        {
+          const hook = makePassHook()
+          // CPU-profile tiny-frame compaction is always safe: it only
+          // touches synthesized `jsFrame` subtrees produced from V8
+          // samples, where folding sub-pixel leaf clusters into a single
+          // density rect is the explicit goal. Skipping it would mean
+          // tens of thousands of singleton frames render as the same
+          // visual smear but cost real memory.
+          for (const root of track.measures) {
+            compactCpuTinyFrames(
+              root,
+              DEFAULT_CPU_TINY_OPTIONS,
+              () => this._nextId(),
+              this._compactionCounters,
+              hook.onProgress,
+            )
+          }
+          if (siblingCompactionEnabled) {
+            // Fold runs of same-(category,name) leaf siblings across the
+            // whole subtree. Uses the track's total span as the top-level
+            // parent span so root-level folds apply the fraction predicate.
+            const trackSpan = (track.maxEnd ?? 0) - 0
+            compactSiblings(
+              track,
+              DEFAULT_SIBLING_COMPACTION_OPTIONS,
+              () => this._nextId(),
+              this._compactionCounters,
+              trackSpan,
+              hook.onProgress,
+            )
+          }
+          hook.finish()
         }
-        if (siblingCompactionEnabled) {
-          // Fold runs of same-(category,name) leaf siblings across the
-          // whole subtree. Uses the track's total span as the top-level
-          // parent span so root-level folds apply the fraction predicate.
-          const trackSpan = (track.maxEnd ?? 0) - 0
-          compactSiblings(
-            track,
-            DEFAULT_SIBLING_COMPACTION_OPTIONS,
-            () => this._nextId(),
-            this._compactionCounters,
-            trackSpan,
-          )
-        }
-        eventsProcessed += trackEvents
-        emitFinalizeProgress()
 
         // --- Pass C: fixup (re-sort) + flat-buffer build -------------
         emitFinalizeProgress(
           `Building buffers for ${procLabel} — ${track.name} (${trackIdx}/${trackTotal})`,
+          true,
         )
         await yieldToEventLoop()
-        // Compaction may have mutated `measures` arrays — rerun the
-        // sort/maxEnd pass so SliceBuffers + mipmap see a well-formed
-        // tree. finalizeContainer is idempotent on already-sorted input.
-        finalizeContainer(track)
-        // Once containers are sorted + maxEnd-tagged, flatten the whole
-        // subtree into typed arrays. This is the data the canvas renderer
-        // actually reads; the Measure[] tree sticks around as the source of
-        // truth for the Aggregator / hover panes.
-        track.buffers = buildSliceBuffers(track)
-        track.markBuffers = buildMarkBuffers(track)
-        // Phase 2 LOD: density-tinted buckets layered on top of the raw
-        // buffer. Cheap to build (O(n log n)) and zoomed-out renders read it
-        // instead of the raw flat list to stay viewport-bounded.
-        track.mipmap = buildSliceMipmap(track.buffers)
-        eventsProcessed += trackEvents
-        emitFinalizeProgress()
+        {
+          const hook = makePassHook()
+          // Compaction may have mutated `measures` arrays — rerun the
+          // sort/maxEnd pass so SliceBuffers + mipmap see a well-formed
+          // tree. finalizeContainer is idempotent on already-sorted input.
+          // We don't have a dedicated progress hook on these helpers
+          // (they're cheap relative to the cull/compact passes), but
+          // we still want the pass budget to land — the `finish()`
+          // call snaps `eventsProcessed` up to the full pass cap.
+          finalizeContainer(track)
+          // Once containers are sorted + maxEnd-tagged, flatten the whole
+          // subtree into typed arrays. This is the data the canvas renderer
+          // actually reads; the Measure[] tree sticks around as the source of
+          // truth for the Aggregator / hover panes.
+          track.buffers = buildSliceBuffers(track)
+          track.markBuffers = buildMarkBuffers(track)
+          // Phase 2 LOD: density-tinted buckets layered on top of the raw
+          // buffer. Cheap to build (O(n log n)) and zoomed-out renders read it
+          // instead of the raw flat list to stay viewport-bounded.
+          track.mipmap = buildSliceMipmap(track.buffers)
+          hook.finish()
+        }
       }
 
       systems.push({
@@ -854,12 +908,36 @@ export class ChromeParser implements TraceParser {
       if (isComplete(ph)) {
         const start = ev.ts
         const dur = typeof ev.dur === 'number' ? ev.dur : 0
+        const newEnd = start + dur
+        // Some chrome traces (notably PyTorch profiler probes like
+        // `_record_function_enter_new`) record a `dur` that ends *before*
+        // the wider event they actually wrap. The bare ts-only flush at
+        // the top of the loop only pops frames whose endTs <= ev.ts, so
+        // a tiny probe whose endTs is, say, T+25 µs stays on the stack
+        // when a 66 ms sibling opens at T+15 µs — the sibling then gets
+        // pushed as a *child* of the probe, and its entire subtree
+        // (cudagraph chain, etc.) ends up rooted under a 25 µs ancestor.
+        // The subpixel cull then folds the bogus tiny ancestor and
+        // silently absorbs all the wide content.
+        //
+        // Mirror the malformed-E branch above: pop any complete frame on
+        // top of the stack whose endTs is before this event's end —
+        // they're done, and they cannot contain us.
+        while (stack.length > 0) {
+          const top = stack[stack.length - 1]
+          if (!top.isComplete) break
+          if (top.endTs >= newEnd) break
+          stack.pop()
+          currentContainer().measures.push(
+            this._makeMeasureFromFrame(top, top.endTs, null, toMs),
+          )
+        }
         stack.push({
           event: ev,
           children: [],
           marks: [],
           isComplete: true,
-          endTs: start + dur,
+          endTs: newEnd,
         })
         continue
       }

@@ -26,6 +26,15 @@ export interface SliceBuffers {
   depths: Uint16Array
   /** Packed `0xRRGGBBAA` color per slice. */
   colors: Uint32Array
+  /**
+   * Per-slice bitfield. Bit 0 ({@link SLICE_FLAG_COMPACTED}) is set when
+   * the underlying {@link Measure} carries a non-empty `compaction[]` —
+   * the canvas renderer reads this to overlay a diagonal-stripe pattern
+   * so users can tell at a glance "this rect represents folded detail"
+   * vs. a regular leaf. New flags can claim higher bits without
+   * widening the array.
+   */
+  flags: Uint8Array
   /** Back-pointer into `measures` for future hit-test / tooltip work. */
   measures: Measure[]
   /**
@@ -69,7 +78,17 @@ export interface MarkBuffers {
 const EMPTY_F32 = new Float32Array(0)
 const EMPTY_U16 = new Uint16Array(0)
 const EMPTY_U32 = new Uint32Array(0)
+const EMPTY_U8 = new Uint8Array(0)
 const EMPTY_I32 = new Int32Array(0)
+
+/**
+ * Bit 0 of {@link SliceBuffers.flags} / {@link SliceMipmapLevel.flags}.
+ * Set when a slice's underlying Measure carries one or more
+ * {@link import('../types').CompactionReport}s — i.e. it stands in for
+ * folded detail and should render with a stripe overlay so the user
+ * doesn't mistake it for a regular leaf.
+ */
+export const SLICE_FLAG_COMPACTED = 1
 
 export const EMPTY_SLICE_BUFFERS: SliceBuffers = {
   count: 0,
@@ -77,6 +96,7 @@ export const EMPTY_SLICE_BUFFERS: SliceBuffers = {
   ends: EMPTY_F32,
   depths: EMPTY_U16,
   colors: EMPTY_U32,
+  flags: EMPTY_U8,
   measures: [],
   maxEndsPrefix: EMPTY_F32,
   parentEnds: EMPTY_F32,
@@ -105,6 +125,7 @@ export function buildSliceBuffers(root: TimelineContainer): SliceBuffers {
   const ends = new Float32Array(total)
   const depths = new Uint16Array(total)
   const colors = new Uint32Array(total)
+  const flags = new Uint8Array(total)
   const measures = new Array<Measure>(total)
   // Direct parent's end time per slice, used by the mipmap as a
   // parent-identity key. Depth-0 roots all share a single sentinel (0)
@@ -132,6 +153,7 @@ export function buildSliceBuffers(root: TimelineContainer): SliceBuffers {
       ends[i] = m.end
       depths[i] = depth > 0xffff ? 0xffff : depth
       colors[i] = packColor(m.color, DEFAULT_MEASURE_COLOR)
+      flags[i] = m.compaction && m.compaction.length > 0 ? SLICE_FLAG_COMPACTED : 0
       measures[i] = m
       parentEnds[i] = parentEnd
       parentIndex[i] = parentIdx
@@ -160,6 +182,7 @@ export function buildSliceBuffers(root: TimelineContainer): SliceBuffers {
     ends,
     depths,
     colors,
+    flags,
     measures,
     maxEndsPrefix,
     parentEnds,
@@ -354,6 +377,14 @@ export interface SliceMipmapLevel {
   depths: Uint16Array
   /** Packed `0xRRGGBBAA` of the dominant (longest) contributor per bucket. */
   colors: Uint32Array
+  /**
+   * Bitwise OR of every contributing slice's {@link SliceBuffers.flags}.
+   * Bit 0 ({@link SLICE_FLAG_COMPACTED}) is set if *any* base slice in
+   * the bucket carried compaction reports — sufficient for the renderer
+   * to overlay stripes on the bucket without losing the cue at coarse
+   * zoom levels.
+   */
+  flags: Uint8Array
   /** Non-decreasing running max of `ends[0..i]`, same semantics as SliceBuffers. */
   maxEndsPrefix: Float32Array
   /** Number of source slices aggregated into bucket `i` (1 for singletons). */
@@ -453,6 +484,7 @@ function buildMipmapLevel(
   const starts = base.starts
   const ends = base.ends
   const colors = base.colors
+  const baseFlags = base.flags
   const parentEnds = base.parentEnds
 
   // Worst case: no merges happen at this level and we emit base.count buckets.
@@ -461,6 +493,7 @@ function buildMipmapLevel(
   const tmpEnds: number[] = []
   const tmpDepths: number[] = []
   const tmpColors: number[] = []
+  const tmpFlags: number[] = []
   const tmpCounts: number[] = []
   const tmpSourceStart: number[] = []
 
@@ -473,6 +506,7 @@ function buildMipmapLevel(
     let bStart = 0
     let bEnd = 0
     let bColor = 0
+    let bFlags = 0
     let bCount = 0
     let bSourceStart = 0
     let bDominantDur = -1
@@ -488,10 +522,12 @@ function buildMipmapLevel(
       tmpEnds.push(bEnd)
       tmpDepths.push(d)
       tmpColors.push(bColor)
+      tmpFlags.push(bFlags)
       tmpCounts.push(bCount)
       tmpSourceStart.push(bSourceStart)
       bucketOpen = false
       bDominantDur = -1
+      bFlags = 0
     }
 
     for (let k = 0; k < rowLen; k++) {
@@ -509,6 +545,7 @@ function buildMipmapLevel(
         tmpEnds.push(e)
         tmpDepths.push(d)
         tmpColors.push(colors[i])
+        tmpFlags.push(baseFlags[i])
         tmpCounts.push(1)
         tmpSourceStart.push(i)
         continue
@@ -521,6 +558,7 @@ function buildMipmapLevel(
       ) {
         if (e > bEnd) bEnd = e
         bCount += 1
+        bFlags |= baseFlags[i]
         if (width > bDominantDur) {
           bDominantDur = width
           bColor = colors[i]
@@ -531,6 +569,7 @@ function buildMipmapLevel(
         bStart = s
         bEnd = e
         bColor = colors[i]
+        bFlags = baseFlags[i]
         bCount = 1
         bSourceStart = i
         bDominantDur = width
@@ -549,6 +588,7 @@ function buildMipmapLevel(
       ends: EMPTY_F32,
       depths: EMPTY_U16,
       colors: EMPTY_U32,
+      flags: EMPTY_U8,
       maxEndsPrefix: EMPTY_F32,
       counts: new Uint32Array(0),
       sourceStart: new Uint32Array(0),
@@ -573,6 +613,7 @@ function buildMipmapLevel(
   const endsOut = new Float32Array(total)
   const depthsOut = new Uint16Array(total)
   const colorsOut = new Uint32Array(total)
+  const flagsOut = new Uint8Array(total)
   const countsOut = new Uint32Array(total)
   const sourceStartOut = new Uint32Array(total)
   for (let i = 0; i < total; i++) {
@@ -581,6 +622,7 @@ function buildMipmapLevel(
     endsOut[i] = tmpEnds[src]
     depthsOut[i] = tmpDepths[src]
     colorsOut[i] = tmpColors[src]
+    flagsOut[i] = tmpFlags[src]
     countsOut[i] = tmpCounts[src]
     sourceStartOut[i] = tmpSourceStart[src]
   }
@@ -599,6 +641,7 @@ function buildMipmapLevel(
     ends: endsOut,
     depths: depthsOut,
     colors: colorsOut,
+    flags: flagsOut,
     maxEndsPrefix,
     counts: countsOut,
     sourceStart: sourceStartOut,
