@@ -37,6 +37,50 @@ export const COUNTER = 'C'
 export const SAMPLE = 'P'
 
 /**
+ * Arg-key convention used by Perfectto-specific extensions to the
+ * Chrome trace event format. All extension keys share the `_pfcto`
+ * prefix so they sort/group together in raw inspection and never
+ * collide with anything DevTools / Perfetto / Catapult emit.
+ *
+ * The exporter at `src/core/export/zipCompactedTrace.ts` writes these
+ * onto synthetic `X` events; the chrome parser lifts them back onto
+ * the produced `Measure` so a re-imported compacted trace renders the
+ * same flame chart (compaction pills, callstack panel, …) without
+ * having to retain the raw event stream.
+ */
+export const PFCTO_ARG_KEYS = {
+  /** Online-merge sentinel set by the streaming compactor (legacy key — predates the export feature). */
+  ONLINE_MERGED: '_pfctoMerged',
+  /** Carries `Measure.compaction: CompactionReport[]` across export → import. */
+  COMPACTION: '_pfctoCompaction',
+  /** Carries `Measure.color` so the export survives persona-independent overrides. */
+  COLOR: '_pfctoColor',
+  /** Carries `Measure.attribution` so callstack panels light up after re-import. */
+  ATTRIBUTION: '_pfctoAttr',
+  /** Per-track metadata: `Track.category` so async/counter/jsFrame survive re-import labelling. */
+  TRACK_CATEGORY: '_pfctoTrackCategory',
+} as const
+
+/**
+ * Top-level marker the exporter writes alongside `metadata` so a re-imported
+ * trace can be detected and (later) treated specially by the parser. Lives in
+ * `metadata._pfctoExport` for compatibility with the chrome parser's existing
+ * root-key spread into {@link import('../../types').TraceMetadata}.
+ */
+export interface PfctoExportMarker {
+  /** Schema version. Bump when a backwards-incompatible change lands. */
+  version: number
+  /** Wall-clock timestamp the export was produced. */
+  exportedAt: string
+  /** Original `TraceSource.name` so the UI can show "Exported from foo.json.gz". */
+  sourceName: string
+  /** Always `true` — exports are intentionally lossy (no per-event args, no samples). */
+  lossy: true
+}
+
+export const PFCTO_EXPORT_METADATA_KEY = '_pfctoExport'
+
+/**
  * Options accepted by {@link ChromeParser}. Defaults are chosen to match what
  * Chrome DevTools shows out of the box — callers who want the raw trace tree
  * (the "raw" persona, a debugging tool, …) can flip these off.

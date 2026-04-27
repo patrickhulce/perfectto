@@ -11,7 +11,10 @@
     "test": "jest",
     "test:e2e": "playwright test",
     "test:e2e:ui": "playwright test --ui",
-    "build:traces": "tsx scripts/format-traces.ts"
+    "build:traces": "tsx scripts/format-traces.ts",
+    "smoke:gz": "tsx scripts/smoke-gz-trace.ts",
+    "smoke:roundtrip": "tsx scripts/smoke-roundtrip.ts",
+    "smoke:roundtrip:strip": "tsx scripts/smoke-roundtrip.ts --strip"
   },
   "jest": {
     "testEnvironment": "jsdom",

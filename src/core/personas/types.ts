@@ -10,7 +10,7 @@ import type {Measure, ParsedTrace, System, Track} from '../types'
  * produces an {@link AppliedPersona} with derived views the UI consumes.
  */
 export interface Persona {
-  /** Stable machine id, e.g. `'web-dev'`, `'raw'`. */
+  /** Stable machine id, e.g. `'web'`, `'raw'`. */
   id: string
   /** Human-facing name for the persona picker. */
   name: string

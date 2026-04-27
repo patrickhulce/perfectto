@@ -3,9 +3,9 @@ import {
   BUILTIN_PERSONAS,
   detectPersona,
   findPersona,
-  ML_ENGINEER_PERSONA,
+  ML_PERSONA,
   RAW_PERSONA,
-  WEB_DEV_PERSONA,
+  WEB_PERSONA,
   type Measure,
   type ParsedTrace,
   type Persona,
@@ -53,20 +53,20 @@ function makeTrace(systems: System[], start = 0, end = 100): ParsedTrace {
 }
 
 describe('persona registry', () => {
-  it('includes raw, web-dev, and ml-engineer built-ins', () => {
+  it('includes raw, web, and ml built-ins', () => {
     expect(findPersona('raw')).toBe(RAW_PERSONA)
-    expect(findPersona('web-dev')).toBe(WEB_DEV_PERSONA)
-    expect(findPersona('ml-engineer')).toBe(ML_ENGINEER_PERSONA)
+    expect(findPersona('web')).toBe(WEB_PERSONA)
+    expect(findPersona('ml')).toBe(ML_PERSONA)
     expect(findPersona('bogus')).toBeUndefined()
     expect(BUILTIN_PERSONAS).toContain(RAW_PERSONA)
-    expect(BUILTIN_PERSONAS).toContain(WEB_DEV_PERSONA)
-    expect(BUILTIN_PERSONAS).toContain(ML_ENGINEER_PERSONA)
+    expect(BUILTIN_PERSONAS).toContain(WEB_PERSONA)
+    expect(BUILTIN_PERSONAS).toContain(ML_PERSONA)
   })
 
-  it('detects web-dev persona for Chrome-like traces', () => {
+  it('detects web persona for Chrome-like traces', () => {
     const main = makeTrack('t1', 'CrRendererMain', [m('FunctionCall', 0, 10)])
     const trace = makeTrace([makeSystem('s1', 'Renderer', [main])])
-    expect(detectPersona(trace)).toBe(WEB_DEV_PERSONA)
+    expect(detectPersona(trace)).toBe(WEB_PERSONA)
   })
 
   it('falls back to raw persona for non-Chrome traces', () => {
@@ -75,10 +75,10 @@ describe('persona registry', () => {
     expect(detectPersona(trace)).toBe(RAW_PERSONA)
   })
 
-  it('detects ml-engineer persona for Kineto-shaped traces', () => {
+  it('detects ml persona for Kineto-shaped traces', () => {
     // PyTorch Kineto: every process is named `python` with a labels
     // suffix; GPU streams come through as `stream N` tracks. This
-    // should beat both web-dev (no chrome thread names) and raw.
+    // should beat both web (no chrome thread names) and raw.
     const cpuThread = makeTrack('cpu-t1', 'thread 490 (python)', [
       m('aten::mm', 0, 10, 'cpu_op'),
     ])
@@ -89,7 +89,7 @@ describe('persona registry', () => {
       makeSystem('cpu', 'python (CPU)', [cpuThread]),
       makeSystem('gpu0', 'python (GPU 0)', [gpuStream]),
     ])
-    expect(detectPersona(trace)).toBe(ML_ENGINEER_PERSONA)
+    expect(detectPersona(trace)).toBe(ML_PERSONA)
   })
 })
 
@@ -110,7 +110,7 @@ describe('applyPersona (raw)', () => {
   })
 })
 
-describe('applyPersona (web-dev)', () => {
+describe('applyPersona (web)', () => {
   function buildChromeTrace(): ParsedTrace {
     const rendererMain = makeTrack('tm', 'CrRendererMain', [
       m('FunctionCall', 0, 10),
@@ -127,7 +127,7 @@ describe('applyPersona (web-dev)', () => {
 
   it('pins CrRendererMain to the top and relabels it "Main"', () => {
     const trace = buildChromeTrace()
-    const applied = applyPersona(trace, WEB_DEV_PERSONA)
+    const applied = applyPersona(trace, WEB_PERSONA)
     const tracks = applied.systems[0].tracks
     expect(tracks[0].id).toBe('tm')
     expect(tracks[0].name).toBe('Main')
@@ -135,7 +135,7 @@ describe('applyPersona (web-dev)', () => {
 
   it('hides ThreadPool tracks by default', () => {
     const trace = buildChromeTrace()
-    const applied = applyPersona(trace, WEB_DEV_PERSONA)
+    const applied = applyPersona(trace, WEB_PERSONA)
     const visibleIds = applied.systems[0].tracks.map(t => t.id)
     expect(visibleIds).not.toContain('tp')
     expect(applied.hiddenTracksBySystem.s1?.map(t => t.id)).toContain('tp')
@@ -143,7 +143,7 @@ describe('applyPersona (web-dev)', () => {
 
   it('paints slices with the persona palette', () => {
     const trace = buildChromeTrace()
-    applyPersona(trace, WEB_DEV_PERSONA)
+    applyPersona(trace, WEB_PERSONA)
     const renderer = trace.timeline.systems[0].tracks.find(t => t.id === 'tm')!
     const buf = renderer.buffers!
     // Uint32Array stores unsigned; `packColor` can return signed for
@@ -157,7 +157,7 @@ describe('applyPersona (web-dev)', () => {
 
   it('sets default expand state for the renderer main thread and its system', () => {
     const trace = buildChromeTrace()
-    const applied = applyPersona(trace, WEB_DEV_PERSONA)
+    const applied = applyPersona(trace, WEB_PERSONA)
     expect(applied.defaultTrackExpanded.tm).toBe(true)
     expect(applied.defaultTrackExpanded.tc).toBe(false)
     expect(applied.defaultSystemExpanded.s1).toBe(true)
@@ -170,7 +170,7 @@ describe('applyPersona (web-dev)', () => {
     // see just that one track — NOT the full visible list, which
     // would drag the Compositor's work into the silhouette.
     const trace = buildChromeTrace()
-    const applied = applyPersona(trace, WEB_DEV_PERSONA)
+    const applied = applyPersona(trace, WEB_PERSONA)
     const overviewTrackIds = applied.overviewSystems.flatMap(s => s.tracks.map(t => t.id))
     expect(overviewTrackIds).toEqual(['tm'])
   })
@@ -182,7 +182,7 @@ describe('applyPersona (web-dev)', () => {
       makeSystem('kernel', 'Process 0', [swapper]),
       makeSystem('renderer', 'Renderer', [rendererMain]),
     ])
-    const applied = applyPersona(trace, WEB_DEV_PERSONA)
+    const applied = applyPersona(trace, WEB_PERSONA)
     expect(applied.systems.map(s => s.id)).toEqual(['renderer'])
     expect(applied.hiddenSystems.map(s => s.name)).toEqual(['Process 0'])
   })
@@ -193,7 +193,7 @@ describe('applyPersona (web-dev)', () => {
     const trace = makeTrace([
       makeSystem('s1', 'Renderer', [rendererMain, asyncTrack]),
     ])
-    const applied = applyPersona(trace, WEB_DEV_PERSONA)
+    const applied = applyPersona(trace, WEB_PERSONA)
     const visibleIds = applied.systems[0].tracks.map(t => t.id)
     expect(visibleIds).not.toContain('ta')
     expect(applied.hiddenTracksBySystem.s1?.map(t => t.id)).toContain('ta')
@@ -203,7 +203,7 @@ describe('applyPersona (web-dev)', () => {
     const rendererMain = makeTrack('tm', 'CrRendererMain', [m('FunctionCall', 0, 10)])
     const worker = makeTrack('tw', 'SomeWorker', [m('w', 0, 10)])
     const trace = makeTrace([makeSystem('s1', 'Renderer', [rendererMain, worker])])
-    const applied = applyPersona(trace, WEB_DEV_PERSONA)
+    const applied = applyPersona(trace, WEB_PERSONA)
     // No TrackRule touches `SomeWorker`, so the persona-wide
     // `defaultTracksExpanded: false` should drive it closed.
     expect(applied.defaultTrackExpanded.tw).toBe(false)
@@ -216,14 +216,14 @@ describe('applyPersona (web-dev)', () => {
       makeSystem('renderer', 'Renderer', [rendererMain]),
       makeSystem('browser', 'Browser', [browserMain]),
     ])
-    const applied = applyPersona(trace, WEB_DEV_PERSONA)
+    const applied = applyPersona(trace, WEB_PERSONA)
     expect(applied.defaultSystemExpanded.renderer).toBe(true)
     expect(applied.defaultSystemExpanded.browser).toBe(false)
   })
 
   it('switching personas restores colors deterministically', () => {
     const trace = buildChromeTrace()
-    applyPersona(trace, WEB_DEV_PERSONA)
+    applyPersona(trace, WEB_PERSONA)
     // Back to raw: slices should reset to the default measure color.
     applyPersona(trace, RAW_PERSONA)
     const renderer = trace.timeline.systems[0].tracks.find(t => t.id === 'tm')!
@@ -233,7 +233,7 @@ describe('applyPersona (web-dev)', () => {
   })
 })
 
-describe('applyPersona (ml-engineer)', () => {
+describe('applyPersona (ml)', () => {
   // Helper: pack-and-coerce-to-unsigned for direct comparison against
   // the unsigned values stored in the SliceBuffers `colors` array.
   const packU = (color: string): number => packColor(color, DEFAULT_MEASURE_COLOR) >>> 0
@@ -270,7 +270,7 @@ describe('applyPersona (ml-engineer)', () => {
 
   it('routes each Kineto category to the right palette color', () => {
     const trace = buildKinetoTrace()
-    applyPersona(trace, ML_ENGINEER_PERSONA)
+    applyPersona(trace, ML_PERSONA)
     const cpu = trace.timeline.systems[0].tracks.find(t => t.id === 'cpu')!
     const gpu = trace.timeline.systems[1].tracks.find(t => t.id === 'gpu')!
     const cb = cpu.buffers!.colors
@@ -291,7 +291,7 @@ describe('applyPersona (ml-engineer)', () => {
 
   it('rolls every Python subcategory and the GPU subcategories into their parent bands', () => {
     const trace = buildKinetoTrace()
-    const applied = applyPersona(trace, ML_ENGINEER_PERSONA)
+    const applied = applyPersona(trace, ML_PERSONA)
     // All four python subcategories share the same overview band (root
     // `python`); the two GPU subcategories share the `gpu` band.
     expect(applied.bandForCategory.userPython).toBe('python')
@@ -308,7 +308,7 @@ describe('applyPersona (ml-engineer)', () => {
 
   it('pins python (CPU) above python (GPU N) and relabels CPU to "Python CPU"', () => {
     const trace = buildKinetoTrace()
-    const applied = applyPersona(trace, ML_ENGINEER_PERSONA)
+    const applied = applyPersona(trace, ML_PERSONA)
     expect(applied.systems.map(s => s.id)).toEqual(['cpu', 'gpu0'])
     expect(applied.systems[0].name).toBe('Python CPU')
     // GPU process keeps its disambiguating label so multi-GPU traces
@@ -320,7 +320,7 @@ describe('applyPersona (ml-engineer)', () => {
 
   it('expands the dominant python thread and kernel stream, hides compile-worker pools', () => {
     const trace = buildKinetoTrace()
-    const applied = applyPersona(trace, ML_ENGINEER_PERSONA)
+    const applied = applyPersona(trace, ML_PERSONA)
     expect(applied.defaultTrackExpanded.cpu).toBe(true)
     expect(applied.defaultTrackExpanded.gpu).toBe(true)
     // Compile workers live in hiddenTracksBySystem under their parent.
@@ -354,7 +354,7 @@ describe('applyPersona (ml-engineer)', () => {
       makeSystem('cpu', 'python (CPU)', [idle, main]),
       makeSystem('gpu0', 'python (GPU 0)', [gpuMemcpyOnly, gpuKernels]),
     ])
-    const applied = applyPersona(trace, ML_ENGINEER_PERSONA)
+    const applied = applyPersona(trace, ML_PERSONA)
 
     // Dominant python thread wins; the idle worker stays collapsed.
     expect(applied.defaultTrackExpanded['cpu-main']).toBe(true)
@@ -386,7 +386,7 @@ describe('applyPersona (ml-engineer)', () => {
       makeSystem('cpu', 'python (CPU)', [cpuThread]),
       makeSystem('gpu0', 'python (GPU 0)', [gpuStream]),
     ])
-    const applied = applyPersona(trace, ML_ENGINEER_PERSONA)
+    const applied = applyPersona(trace, ML_PERSONA)
     expect(applied.defaultTrackExpanded.cpu).toBe(true)
     expect(applied.defaultTrackExpanded.gpu).toBe(true)
     expect(applied.defaultSystemExpanded.gpu0).toBe(true)
@@ -408,7 +408,7 @@ describe('applyPersona (ml-engineer)', () => {
       m('cudaLaunchKernel', 1, 2, 'cuda_runtime'),
     ])
     const trace = makeTrace([makeSystem('cpu', 'python (CPU)', [cpu])])
-    applyPersona(trace, ML_ENGINEER_PERSONA)
+    applyPersona(trace, ML_PERSONA)
     const cb = trace.timeline.systems[0].tracks[0].buffers!.colors
     expect(cb[0]).toBe(packU('#f59ab9')) // cudaGraphLaunch → gpuMemory pale pink
     expect(cb[1]).toBe(packU('#4a5568')) // cudaLaunchKernel → system gray
@@ -433,7 +433,7 @@ describe('applyPersona (ml-engineer)', () => {
       makeSystem('gpu0', 'python (GPU 0)', [busyStream]),
       makeSystem('gpu1', 'python (GPU 1)', [idleStream]),
     ])
-    const applied = applyPersona(trace, ML_ENGINEER_PERSONA)
+    const applied = applyPersona(trace, ML_PERSONA)
 
     // Busy GPU's system is forced open by featureTracks; idle GPU
     // falls through to the persona-wide `defaultSystemsExpanded:
@@ -454,9 +454,9 @@ describe('buildOverviewBands', () => {
       m('ParseHTML', 75, 100),
     ])
     const trace = makeTrace([makeSystem('s1', 'Renderer', [rendererMain])])
-    const applied = applyPersona(trace, WEB_DEV_PERSONA)
+    const applied = applyPersona(trace, WEB_PERSONA)
     const bands = buildOverviewBands(trace.timeline, applied, 32)
-    expect(bands.bands).toHaveLength(WEB_DEV_PERSONA.overviewOrder.length)
+    expect(bands.bands).toHaveLength(WEB_PERSONA.overviewOrder.length)
     for (let i = 0; i < bands.bucketCount; i++) {
       let total = 0
       for (const b of bands.bands) total += b.buckets[i]
@@ -484,7 +484,7 @@ describe('buildOverviewBands', () => {
     const trace = makeTrace([
       makeSystem('s1', 'Renderer', [rendererMain, asyncLoading]),
     ])
-    const applied = applyPersona(trace, WEB_DEV_PERSONA)
+    const applied = applyPersona(trace, WEB_PERSONA)
     const bands = buildOverviewBands(trace.timeline, applied, 32)
     const loading = bands.bands.find(b => b.id === 'loading')
     expect(loading).toBeDefined()
@@ -501,7 +501,7 @@ describe('buildOverviewBands', () => {
     // essentially zero system-band contribution (RunTask has no
     // self-time outside its children) and a saturated scripting band.
     // Matches the real chrome parser: synthesized JS frames ship with
-    // trace category `jsFrame`, which webDev routes to `userScript`.
+    // trace category `jsFrame`, which web routes to `userScript`.
     const userJs: Measure = {
       id: 'uj',
       name: 'doWork',
@@ -532,7 +532,7 @@ describe('buildOverviewBands', () => {
     }
     const tm = makeTrack('tm', 'CrRendererMain', [runTask])
     const trace = makeTrace([makeSystem('s1', 'Renderer', [tm])])
-    const applied = applyPersona(trace, WEB_DEV_PERSONA)
+    const applied = applyPersona(trace, WEB_PERSONA)
     const result = buildOverviewBands(trace.timeline, applied, 32)
     const byId = (id: string) => result.bands.find(b => b.id === id)!
     const maxOf = (arr: Float32Array): number => {
@@ -585,7 +585,7 @@ describe('buildOverviewBands', () => {
     const trace = makeTrace([
       makeSystem('s1', 'Renderer', [rendererMain, compositor]),
     ])
-    const applied = applyPersona(trace, WEB_DEV_PERSONA)
+    const applied = applyPersona(trace, WEB_PERSONA)
     // Sanity check: Compositor is in the visible list but NOT in the
     // overview list — the scoping precondition for this test.
     expect(applied.systems[0].tracks.map(t => t.id)).toEqual(

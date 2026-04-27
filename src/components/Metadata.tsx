@@ -25,6 +25,14 @@ interface MetadataProps {
    * large-trace auto-compaction fired on the current file.
    */
   compaction?: CompactionMetadata
+  /**
+   * Optional callback that exports the current trace as a gzipped
+   * Chrome trace JSON. When provided, the header shows a Download
+   * button next to the size text. The button is disabled while the
+   * promise is in flight so quick double-clicks can't queue up
+   * multiple downloads.
+   */
+  onDownload?: () => Promise<void>
 }
 
 export default function Metadata({
@@ -36,6 +44,7 @@ export default function Metadata({
   onPersonaChange,
   bindingsStore,
   compaction,
+  onDownload,
 }: MetadataProps) {
   const totalFolded =
     (compaction?.onlineEventsFolded ?? 0) +
@@ -43,6 +52,23 @@ export default function Metadata({
     (compaction?.cpuTinyEventsFolded ?? 0) +
     (compaction?.subpixelEventsFolded ?? 0)
   const [settingsOpen, setSettingsOpen] = useState(false)
+  const [downloading, setDownloading] = useState(false)
+
+  const handleDownloadClick = async (): Promise<void> => {
+    if (!onDownload || downloading) return
+    setDownloading(true)
+    try {
+      await onDownload()
+    } catch (err) {
+      // Keep the user moving rather than freezing the UI on a
+      // download failure. Surface a console error and clear state so
+      // they can retry. Real telemetry can hook in later.
+      console.error('compacted-trace download failed', err)
+    } finally {
+      setDownloading(false)
+    }
+  }
+
   return (
     <>
       <div className="flex items-center gap-4 border-b border-[#2d3748] bg-[#1a202c] px-6 py-4">
@@ -86,6 +112,23 @@ export default function Metadata({
         {bindingsStore && (
           <SettingsCog onClick={() => setSettingsOpen(v => !v)} />
         )}
+        {onDownload && (
+          <button
+            type="button"
+            onClick={handleDownloadClick}
+            disabled={downloading}
+            aria-label="Download compacted trace"
+            title={
+              downloading
+                ? 'Saving…'
+                : 'Download compacted trace (lossy roundtrip — fast to re-load for dev iteration)'
+            }
+            data-testid="metadata-download-button"
+            className="cursor-pointer rounded-lg border border-[#4a5568] bg-transparent p-1.5 text-[#a0aec0] transition-colors hover:border-[#667eea] hover:text-[#667eea] disabled:cursor-wait disabled:opacity-50"
+          >
+            {downloading ? <SpinnerIcon /> : <DownloadIcon />}
+          </button>
+        )}
       </div>
       {bindingsStore && (
         <SettingsPanel
@@ -95,5 +138,49 @@ export default function Metadata({
         />
       )}
     </>
+  )
+}
+
+function DownloadIcon() {
+  return (
+    <svg
+      width="18"
+      height="18"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+      <polyline points="7 10 12 15 17 10" />
+      <line x1="12" y1="15" x2="12" y2="3" />
+    </svg>
+  )
+}
+
+/**
+ * Small spinning ring shown while {@link MetadataProps.onDownload} is
+ * in flight. Animation is purely CSS (`animate-spin` from Tailwind) so
+ * we don't need a JS timer running for the duration of the export.
+ */
+function SpinnerIcon() {
+  return (
+    <svg
+      width="18"
+      height="18"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+      className="animate-spin"
+    >
+      <path d="M21 12a9 9 0 1 1-6.219-8.56" />
+    </svg>
   )
 }

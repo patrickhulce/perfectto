@@ -23,7 +23,7 @@ import type {AppliedPersona, CategoryDef, OverviewBand, Persona} from './types'
  *
  * The raw persona (no color rules, no track rules, no bands) is a
  * fast path: we still recompute colors from Measure.color defaults so
- * that switching away from Web Developer back to Raw restores the
+ * that switching away from Web back to Raw restores the
  * original palette.
  */
 export function applyPersona(trace: ParsedTrace, persona: Persona): AppliedPersona {

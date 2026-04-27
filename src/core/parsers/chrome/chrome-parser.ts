@@ -1,8 +1,10 @@
 import {JSONParser} from '@streamparser/json'
 
 import type {
+  CompactionReport,
   Mark,
   Measure,
+  MeasureAttribution,
   MeasureAttributionCallsite,
   ParsedTrace,
   RawEvent,
@@ -40,6 +42,7 @@ import {
   isInstantPh,
   isMetadataPh,
   isSamplePh,
+  PFCTO_ARG_KEYS,
   type ChromeEvent,
   type ChromeParserOptions,
   type CpuCallFrame,
@@ -1300,7 +1303,92 @@ export class ChromeParser implements TraceParser {
     if (begin.cat === KINETO_PYTHON_CAT) {
       measure.attribution = pythonFrameAttribution(begin.name)
     }
+    // Lift Perfectto export-format extras off `args` so a re-imported
+    // compacted trace renders the same flame chart (compaction pills,
+    // callstack panel, persona-independent colors). See
+    // `src/core/export/zipCompactedTrace.ts` for the producer side.
+    this._liftPfctoArgs(begin, measure)
     return measure
+  }
+
+  /**
+   * Pull the `_pfcto*` extras the export-side serializer stashed
+   * under `args`. Each key is validated defensively — a malformed
+   * export shouldn't crash parsing — and applied to the produced
+   * `Measure`. Compaction reports also bump the parser-level
+   * counters so `metadata.compaction` mirrors the original trace.
+   *
+   * Online-merge records (`_pfctoMerged`) are handled separately above
+   * because they predate the export feature and don't carry a full
+   * {@link CompactionReport} payload.
+   */
+  private _liftPfctoArgs(begin: ChromeEvent, measure: Measure): void {
+    const args = begin.args as Record<string, unknown> | undefined
+    if (!args) return
+
+    const compactionRaw = args[PFCTO_ARG_KEYS.COMPACTION]
+    if (Array.isArray(compactionRaw)) {
+      const reports: CompactionReport[] = []
+      for (const item of compactionRaw) {
+        const report = sanitizeCompactionReport(item)
+        if (report) reports.push(report)
+      }
+      if (reports.length > 0) {
+        // Merge with any compaction array already attached from the
+        // online-merge path. In practice the two sources never collide
+        // (online merge runs only past the streaming cap; an exported
+        // trace wouldn't have raw events to re-merge), but concat is
+        // cheap and keeps the invariant that `compaction` is the
+        // complete fold history.
+        measure.compaction = measure.compaction
+          ? [...measure.compaction, ...reports]
+          : reports
+        for (const report of reports) {
+          this._bumpCountersForImportedReport(report)
+        }
+      }
+    }
+
+    const colorRaw = args[PFCTO_ARG_KEYS.COLOR]
+    if (typeof colorRaw === 'string' && colorRaw.length > 0) {
+      measure.color = colorRaw
+    }
+
+    const attrRaw = args[PFCTO_ARG_KEYS.ATTRIBUTION]
+    const attribution = sanitizeAttribution(attrRaw)
+    if (attribution) measure.attribution = attribution
+  }
+
+  /**
+   * Roll an imported {@link CompactionReport} into the parser's
+   * running counters so `TraceMetadata.compaction` totals on a
+   * re-imported trace match what the original parse produced. The
+   * counter we bump depends on the report's `origin` — the
+   * subpixel-subtree path also tracks `subpixelMaxDepthFolded`,
+   * which we honor by `Math.max`'ing across imports.
+   */
+  private _bumpCountersForImportedReport(report: CompactionReport): void {
+    switch (report.origin) {
+      case 'sibling':
+        this._compactionCounters.siblingRunsFolded += 1
+        this._compactionCounters.siblingEventsFolded += report.count
+        break
+      case 'cpu-tiny-frames':
+        this._compactionCounters.cpuTinyRunsFolded += 1
+        this._compactionCounters.cpuTinyEventsFolded += report.count
+        break
+      case 'subpixel-subtree':
+        this._compactionCounters.subpixelSubtreesFolded +=
+          report.subtreesMerged ?? 1
+        this._compactionCounters.subpixelEventsFolded += report.count
+        if (
+          typeof report.maxDepthFolded === 'number' &&
+          report.maxDepthFolded > this._compactionCounters.subpixelMaxDepthFolded
+        ) {
+          this._compactionCounters.subpixelMaxDepthFolded = report.maxDepthFolded
+        }
+        break
+    }
   }
 
   private _makeAsyncMeasure(
@@ -1702,5 +1790,96 @@ function stableSortByTs(events: ChromeEvent[]): ChromeEvent[] {
     return a.i - b.i
   })
   return indexed.map(x => x.ev)
+}
+
+const COMPACTION_ORIGINS = new Set<CompactionReport['origin']>([
+  'sibling',
+  'cpu-tiny-frames',
+  'subpixel-subtree',
+])
+
+/**
+ * Defensively re-shape a `_pfctoCompaction` entry off `args` into a
+ * {@link CompactionReport}. Returns `null` for any input that fails
+ * the type guards — we'd rather drop a malformed report than poison
+ * downstream rendering with a partial object.
+ */
+function sanitizeCompactionReport(value: unknown): CompactionReport | null {
+  if (!value || typeof value !== 'object') return null
+  const raw = value as Record<string, unknown>
+
+  if (typeof raw.origin !== 'string') return null
+  if (!COMPACTION_ORIGINS.has(raw.origin as CompactionReport['origin'])) return null
+  if (typeof raw.count !== 'number' || !Number.isFinite(raw.count)) return null
+  if (typeof raw.firstTs !== 'number' || !Number.isFinite(raw.firstTs)) return null
+  if (typeof raw.lastTs !== 'number' || !Number.isFinite(raw.lastTs)) return null
+  if (typeof raw.totalDurationMs !== 'number' || !Number.isFinite(raw.totalDurationMs)) {
+    return null
+  }
+  if (!Array.isArray(raw.names)) return null
+  const names: string[] = []
+  for (const n of raw.names) {
+    if (typeof n === 'string') names.push(n)
+  }
+
+  const out: CompactionReport = {
+    origin: raw.origin as CompactionReport['origin'],
+    names,
+    count: raw.count,
+    firstTs: raw.firstTs,
+    lastTs: raw.lastTs,
+    totalDurationMs: raw.totalDurationMs,
+  }
+  if (typeof raw.category === 'string') out.category = raw.category
+  if (typeof raw.maxDepthFolded === 'number' && Number.isFinite(raw.maxDepthFolded)) {
+    out.maxDepthFolded = raw.maxDepthFolded
+  }
+  if (typeof raw.distinctNames === 'number' && Number.isFinite(raw.distinctNames)) {
+    out.distinctNames = raw.distinctNames
+  }
+  if (Array.isArray(raw.nameDurationsMs)) {
+    const nd: number[] = []
+    for (const v of raw.nameDurationsMs) {
+      if (typeof v === 'number' && Number.isFinite(v)) nd.push(v)
+    }
+    out.nameDurationsMs = nd
+  }
+  if (typeof raw.subtreesMerged === 'number' && Number.isFinite(raw.subtreesMerged)) {
+    out.subtreesMerged = raw.subtreesMerged
+  }
+  return out
+}
+
+/**
+ * Defensively re-shape a `_pfctoAttr` entry into a
+ * {@link MeasureAttribution}. Only the `'callsite'` kind is currently
+ * defined; the function returns `null` for anything else so a future
+ * producer accidentally encoding a different shape is rejected
+ * cleanly rather than silently flowing into the UI.
+ */
+function sanitizeAttribution(value: unknown): MeasureAttribution | null {
+  if (!value || typeof value !== 'object') return null
+  const raw = value as Record<string, unknown>
+  if (raw.kind !== 'callsite') return null
+  if (typeof raw.label !== 'string' || raw.label.length === 0) return null
+
+  const out: MeasureAttribution = {
+    kind: 'callsite',
+    label: raw.label,
+  }
+  if (typeof raw.source === 'string') out.source = raw.source
+  if (raw.location && typeof raw.location === 'object') {
+    const loc = raw.location as Record<string, unknown>
+    const sanitized: NonNullable<MeasureAttribution['location']> = {}
+    if (typeof loc.url === 'string') sanitized.url = loc.url
+    if (typeof loc.lineNumber === 'number' && Number.isFinite(loc.lineNumber)) {
+      sanitized.lineNumber = loc.lineNumber
+    }
+    if (typeof loc.columnNumber === 'number' && Number.isFinite(loc.columnNumber)) {
+      sanitized.columnNumber = loc.columnNumber
+    }
+    out.location = sanitized
+  }
+  return out
 }
 

@@ -2,7 +2,7 @@ import type {ParsedTrace} from '../../types'
 import type {Persona} from '../types'
 
 /**
- * "ML Engineer" persona. Interprets PyTorch Kineto / Chrome JSON traces
+ * "ML" persona. Interprets PyTorch Kineto / Chrome JSON traces
  * (the format `torch.profiler.profile().export_chrome_trace()` writes) the
  * way an ML engineer reading them wants to see them:
  *
@@ -20,7 +20,7 @@ import type {Persona} from '../types'
  *
  * Detection: looks for `(CPU)` / `(GPU N)` process labels and Kineto's
  * `stream N` / `thread N (python)` track-name conventions. Non-PyTorch
- * Chrome traces score 0 and fall back to webDev / raw.
+ * Chrome traces score 0 and fall back to web / raw.
  */
 
 // Kineto track-name patterns. Kept in one place because three call
@@ -56,14 +56,14 @@ const CAT = {
   // CUDA runtime / driver API on the CPU side, plus profiler overhead
   // and torch.compile region markers. Neutral gray.
   system: 'system',
-  // Fallbacks (mirroring webDev).
+  // Fallbacks (mirroring web).
   idle: 'idle',
   other: 'other',
 } as const
 
-export const ML_ENGINEER_PERSONA: Persona = {
-  id: 'ml-engineer',
-  name: 'ML Engineer',
+export const ML_PERSONA: Persona = {
+  id: 'ml',
+  name: 'ML',
   description:
     'PyTorch Kineto interpretation: highlight kernels, separate user / framework / torch Python.',
 
@@ -79,7 +79,7 @@ export const ML_ENGINEER_PERSONA: Persona = {
       for (const tr of sys.tracks) {
         // Kineto thread naming: `stream N` for GPU streams, `thread N
         // (python)` for the CPU-side worker threads. Both are unique
-        // enough that webDev / generic Chrome traces never produce
+        // enough that web / generic Chrome traces never produce
         // them.
         if (RE_GPU_STREAM.test(tr.name)) score += 3
         else if (RE_PYTHON_THREAD.test(tr.name)) score += 1
@@ -88,7 +88,7 @@ export const ML_ENGINEER_PERSONA: Persona = {
     // Cap so a trace with hundreds of GPU streams doesn't overflow into
     // numerically-suspect territory (and so diff-scoring stays sane in
     // tests). Anything past 30 already wins overwhelmingly against
-    // webDev's max of ~6.
+    // web's max of ~6.
     return Math.min(score, 100)
   },
 
@@ -227,7 +227,7 @@ export const ML_ENGINEER_PERSONA: Persona = {
     {categoryId: CAT.other},
   ],
 
-  // Matches webDev: collapse everything by default, then explicit
+  // Matches web: collapse everything by default, then explicit
   // track/system rules opt the meaningful ones back open.
   defaultTracksExpanded: false,
   defaultSystemsExpanded: false,
@@ -276,7 +276,7 @@ export const ML_ENGINEER_PERSONA: Persona = {
     // Per-process `Async` virtual track collects ac2g flow events
     // (CPU→GPU launch arrows). Useful as cross-references, but as a
     // standalone track it's a wall of one-line slices that adds noise
-    // — mirror webDev and hide.
+    // — mirror web and hide.
     {trackCategory: /^async$/, hidden: true},
   ],
 

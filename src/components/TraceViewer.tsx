@@ -1,4 +1,4 @@
-import {useMemo, useState} from 'react'
+import {useCallback, useMemo, useState} from 'react'
 import {
   applyPersona,
   BUILTIN_PERSONAS,
@@ -6,9 +6,14 @@ import {
   findPersona,
   type ParsedTrace,
 } from '../core'
+import {
+  suggestExportFilename,
+  zipCompactedTrace,
+} from '../core/export/zipCompactedTrace'
 import Aggregator from './Aggregator'
 import Metadata from './Metadata'
 import Timeline from './Timeline'
+import {triggerDownload} from './downloadTrace'
 import {createSelectionStore} from './timeline/selectionStore'
 import {
   createInputBindingsStore,
@@ -79,6 +84,16 @@ export default function TraceViewer({trace, onBack}: TraceViewerProps) {
 
   const bindingsStore = getBindingsStore()
 
+  // Stream the in-memory ParsedTrace back out as a gzipped Chrome
+  // trace JSON. The zipped stream piped through a synthetic
+  // `<a download>` lets devs save the already-compacted timeline
+  // and skip re-running the (expensive) ingest + finalize pipeline
+  // on the next iteration.
+  const handleDownload = useCallback(async () => {
+    const stream = zipCompactedTrace(trace)
+    await triggerDownload(stream, suggestExportFilename(trace.source))
+  }, [trace])
+
   return (
     <div className="flex h-screen min-h-0 flex-col">
       <Metadata
@@ -90,6 +105,7 @@ export default function TraceViewer({trace, onBack}: TraceViewerProps) {
         onPersonaChange={setActivePersonaId}
         bindingsStore={bindingsStore}
         compaction={trace.metadata.compaction}
+        onDownload={handleDownload}
       />
       <Timeline
         timeline={trace.timeline}

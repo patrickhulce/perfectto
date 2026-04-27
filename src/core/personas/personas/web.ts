@@ -2,7 +2,7 @@ import type {ParsedTrace} from '../../types'
 import type {Persona} from '../types'
 
 /**
- * "Web Developer" persona. Interprets a Chrome / Chromium trace the way
+ * "Web" persona. Interprets a Chrome / Chromium trace the way
  * Chrome DevTools' Performance panel does:
  *
  *   - colorize slices by high-level activity (Loading, Scripting,
@@ -34,9 +34,9 @@ const CAT = {
   other: 'other',
 } as const
 
-export const WEB_DEV_PERSONA: Persona = {
-  id: 'web-dev',
-  name: 'Web Developer',
+export const WEB_PERSONA: Persona = {
+  id: 'web',
+  name: 'Web',
   description:
     'Chrome DevTools-style interpretation: main thread first, activity colors, hide plumbing.',
 

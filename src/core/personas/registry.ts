@@ -1,7 +1,7 @@
 import type {ParsedTrace} from '../types'
-import {ML_ENGINEER_PERSONA} from './personas/mlEngineer'
+import {ML_PERSONA} from './personas/ml'
 import {RAW_PERSONA} from './personas/raw'
-import {WEB_DEV_PERSONA} from './personas/webDev'
+import {WEB_PERSONA} from './personas/web'
 import type {Persona} from './types'
 
 /**
@@ -9,8 +9,8 @@ import type {Persona} from './types'
  * last as the always-available fallback.
  */
 export const BUILTIN_PERSONAS: readonly Persona[] = [
-  WEB_DEV_PERSONA,
-  ML_ENGINEER_PERSONA,
+  WEB_PERSONA,
+  ML_PERSONA,
   RAW_PERSONA,
 ]
 
