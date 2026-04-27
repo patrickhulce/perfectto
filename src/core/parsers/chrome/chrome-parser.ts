@@ -3,6 +3,7 @@ import {JSONParser} from '@streamparser/json'
 import type {
   Mark,
   Measure,
+  MeasureAttributionCallsite,
   ParsedTrace,
   RawEvent,
   System,
@@ -49,6 +50,23 @@ import {
 const V8_GC_INTERNAL_NAME = /^V8\.GC_/
 const JS_FRAME_CATEGORY = 'jsFrame'
 const JS_HOST_OVERSHOOT_EPSILON_MS = 0.05
+
+/**
+ * Kineto-flavored Chrome traces (PyTorch profiler) emit `python_function`
+ * X events whose `name` is a synthesized frame label of the form
+ * `path/to/file.py(123): function_name`. A handful of Python frames
+ * lack a source location entirely — `nn.Module: Gemma3Model_0`,
+ * `<built-in method ...>`, plain stdlib helpers — and just carry the
+ * descriptive label as the whole name.
+ *
+ * This regex pulls apart the location-bearing form so we can emit a
+ * proper `callsite` attribution (label + url + lineNumber) on the
+ * resulting Measure. The capture is greedy on the file path so paths
+ * containing dots or nested parentheses still resolve at the *last*
+ * `.py(line):` boundary.
+ */
+const KINETO_PYTHON_CAT = 'python_function'
+const KINETO_PYTHON_FRAME_PATTERN = /^(.+\.py)\((\d+)\):\s*(.+)$/
 
 /**
  * Names of synthetic CPU-profile nodes that should not be rendered as their
@@ -1272,6 +1290,16 @@ export class ChromeParser implements TraceParser {
       this._compactionCounters.siblingRunsFolded += 1
       this._compactionCounters.siblingEventsFolded += mergeRecord.count
     }
+    // Kineto Python frames carry a `path/file.py(line): func` label
+    // baked into `name`. Promote it to a `callsite` attribution so the
+    // Aggregator's callstack panel lights up for Python selections,
+    // mirroring the affordance V8 CPU-profile frames already get.
+    // Frames without a `.py(line):` prefix (e.g. `nn.Module: Foo`,
+    // `<built-in method ...>`) still get a label-only attribution so
+    // they're treated as real frames in the callstack chain.
+    if (begin.cat === KINETO_PYTHON_CAT) {
+      measure.attribution = pythonFrameAttribution(begin.name)
+    }
     return measure
   }
 
@@ -1324,6 +1352,39 @@ function throwIfAborted(signal: AbortSignal | undefined): void {
 
 function isChromeParserOptions(value: unknown): value is ChromeParserOptions {
   return typeof value === 'object' && value !== null
+}
+
+/**
+ * Build a `callsite` attribution from a Kineto `python_function` event
+ * name. Two shapes show up in real PyTorch profiler traces:
+ *
+ *   1. `path/to/file.py(123): func_name`  — full source location.
+ *   2. Anything else — `nn.Module: Foo`, `<built-in method ...>`,
+ *      bare stdlib helpers — keep the descriptive name as the label
+ *      and skip `location` entirely.
+ *
+ * Either way the resulting attribution makes the measure pass the
+ * Aggregator's "is this a real frame?" gate so Python selections
+ * surface a callstack the same way V8 frames do.
+ */
+function pythonFrameAttribution(name: string): MeasureAttributionCallsite {
+  const match = KINETO_PYTHON_FRAME_PATTERN.exec(name)
+  if (match) {
+    const url = match[1]
+    const lineNumber = Number.parseInt(match[2], 10)
+    const label = match[3]
+    return {
+      kind: 'callsite',
+      source: 'kineto-python',
+      label,
+      location: Number.isFinite(lineNumber) ? {url, lineNumber} : {url},
+    }
+  }
+  return {
+    kind: 'callsite',
+    source: 'kineto-python',
+    label: name,
+  }
 }
 
 /**

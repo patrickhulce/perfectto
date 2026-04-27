@@ -32,6 +32,32 @@ function jsFrame(
   }
 }
 
+function pyFrame(
+  id: string,
+  start: number,
+  end: number,
+  label: string,
+  children: Measure[] = [],
+  location?: {url: string; lineNumber?: number},
+): Measure {
+  return {
+    id,
+    name: label,
+    start,
+    end,
+    category: 'python_function',
+    events: [],
+    marks: [],
+    measures: children,
+    attribution: {
+      kind: 'callsite',
+      source: 'kineto-python',
+      label,
+      location,
+    },
+  }
+}
+
 function makeTimeline(measures: Measure[]): {timeline: Timeline; track: Track} {
   const track: Track = {
     id: 'main',
@@ -85,6 +111,43 @@ describe('Aggregator — callstack view', () => {
     // Leaf is emphasized so users can see what they clicked.
     const leafEl = list.querySelector('[data-leaf="true"]')
     expect(leafEl?.textContent).toContain('render')
+  })
+
+  it('renders a Python callstack when a kineto-python frame is selected', () => {
+    const leaf = pyFrame('leaf', 2, 5, 'compile_fx', [], {
+      url: 'torch/_inductor/compile_fx.py',
+      lineNumber: 123,
+    })
+    const root = pyFrame('root', 0, 10, '_run_module_as_main', [leaf], {
+      url: 'runpy.py',
+      lineNumber: 196,
+    })
+    const {timeline} = makeTimeline([root])
+    const store = createSelectionStore()
+
+    render(<Aggregator selectionStore={store} timeline={timeline} />)
+
+    act(() => {
+      store.setSelectedSlice({
+        trackId: 'main',
+        startMs: 2,
+        endMs: 5,
+        depth: 1,
+        measureId: 'leaf',
+      })
+    })
+
+    const list = screen.getByTestId('aggregator-callstack-list')
+    const items = Array.from(list.querySelectorAll('li'))
+    expect(items.map(li => li.textContent)).toEqual([
+      expect.stringContaining('_run_module_as_main'),
+      expect.stringContaining('compile_fx'),
+    ])
+    // Source location is surfaced under the label so users can jump to
+    // file:line for a Python frame, just like for V8.
+    const leafEl = list.querySelector('[data-leaf="true"]')
+    expect(leafEl?.textContent).toContain('compile_fx')
+    expect(leafEl?.textContent).toContain('torch/_inductor/compile_fx.py:123')
   })
 
   it('does not render the callstack when the selected slice has no callsite attribution', () => {

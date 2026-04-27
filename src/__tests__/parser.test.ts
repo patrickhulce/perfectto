@@ -332,6 +332,75 @@ describe('parseTrace - chrome minimal', () => {
     expect(inner.end - outer.end).toBeLessThan(1e-3)
   })
 
+  // Kineto `python_function` events bake the call-site into the event
+  // `name` ("path/file.py(line): func"). Promote that to a `callsite`
+  // attribution so the Aggregator's callstack panel renders for Python
+  // selections the same way it does for V8 frames.
+  it('attaches a callsite attribution to python_function frames', async () => {
+    const trace = await parseTrace(
+      streamFromString(
+        JSON.stringify({
+          traceEvents: [
+            {
+              ph: 'X',
+              name: 'torch/_inductor/compile_fx.py(123): compile_fx',
+              cat: 'python_function',
+              pid: 1,
+              tid: 1,
+              ts: 0,
+              dur: 1000,
+            },
+            {
+              ph: 'X',
+              name: 'nn.Module: Gemma3Model_0',
+              cat: 'python_function',
+              pid: 1,
+              tid: 1,
+              ts: 100,
+              dur: 500,
+            },
+          ],
+        }),
+      ),
+      SOURCE,
+    )
+
+    const track = trace.timeline.systems[0].tracks[0]
+    expect(track.measures).toHaveLength(1)
+    const outer = track.measures[0]
+    expect(outer.attribution).toEqual({
+      kind: 'callsite',
+      source: 'kineto-python',
+      label: 'compile_fx',
+      location: {url: 'torch/_inductor/compile_fx.py', lineNumber: 123},
+    })
+    // Label-only fallback for non-path-shaped names.
+    const inner = outer.measures[0]
+    expect(inner.name).toBe('nn.Module: Gemma3Model_0')
+    expect(inner.attribution).toEqual({
+      kind: 'callsite',
+      source: 'kineto-python',
+      label: 'nn.Module: Gemma3Model_0',
+    })
+  })
+
+  // Non-Python B/E/X frames stay un-attributed so the parser doesn't
+  // synthesize fake source locations for `cpu_op`, `cuda_runtime`, etc.
+  it('leaves non-python_function measures without an attribution', async () => {
+    const trace = await parseTrace(
+      streamFromString(
+        JSON.stringify({
+          traceEvents: [
+            {ph: 'X', name: 'aten::matmul', cat: 'cpu_op', pid: 1, tid: 1, ts: 0, dur: 1000},
+          ],
+        }),
+      ),
+      SOURCE,
+    )
+    const track = trace.timeline.systems[0].tracks[0]
+    expect(track.measures[0].attribution).toBeUndefined()
+  })
+
   it('preserves a deep wide chain rooted under a tiny straddled probe', async () => {
     // Mirrors the real PyTorch trace shape that motivated the fix:
     // tiny profiler.__init__ + profiler.__enter__ + torch/_ops.__call__ +

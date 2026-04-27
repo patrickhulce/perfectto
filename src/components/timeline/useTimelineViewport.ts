@@ -841,9 +841,24 @@ export function useTimelineZoom(
           return false
         }
         case 'selection.clearSelection': {
+          // Layered Esc: each press peels one layer so users can back
+          // out of complex selections in the same order they built
+          // them. Hovered slices are pointer-driven and don't
+          // participate. If nothing is selected, return false so
+          // other Esc consumers (e.g. SettingsPanel close) can run.
           const sel = selectionStoreRef.current
-          if (sel && (sel.get().committed || sel.get().inProgress)) {
-            sel.clear()
+          if (!sel) return false
+          const state = sel.get()
+          if (state.inProgress) {
+            sel.cancel()
+            return true
+          }
+          if (state.committed) {
+            sel.setCommitted(null)
+            return true
+          }
+          if (state.selectedSlice) {
+            sel.setSelectedSlice(null)
             return true
           }
           return false

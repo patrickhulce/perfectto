@@ -707,6 +707,64 @@ describe('drawHighlightFrame', () => {
     expect(fills.length).toBe(2)
   })
 
+  it('paints the union of multiple highlight regions when an array is passed', () => {
+    // Two disjoint sibling subtrees:
+    //   s1 [10,30] with child s1c [15,25]
+    //   s2 [60,90] with child s2c [70,80]
+    // Highlighting both at once (selection + hover live together
+    // when the user clicks one slice and hovers another) should
+    // paint every slice in either subtree exactly once.
+    const s1c = m('s1c', 15, 25)
+    const s2c = m('s2c', 70, 80)
+    const s1 = m('s1', 10, 30, [s1c])
+    const s2 = m('s2', 60, 90, [s2c])
+    const p = m('p', 0, 100, [s1, s2])
+    const base = buildSliceBuffers(track([p]))
+
+    const {ctx, fills} = makeOverlayCtx()
+    drawHighlightFrame({
+      ctx,
+      slices: base,
+      widthCss: 400,
+      heightCss: 80,
+      rowHeight: 20,
+      pxPerMs: 2,
+      visibleStartMs: 0,
+      visibleEndMs: 100,
+      canvasStartMs: 0,
+      maxDepthExclusive: Infinity,
+      highlight: [
+        {startMs: 10, endMs: 30, minDepth: 1},
+        {startMs: 60, endMs: 90, minDepth: 1},
+      ],
+    })
+
+    // 4 slices: s1, s1c, s2, s2c. Parent `p` is excluded by minDepth.
+    expect(fills.length).toBe(4)
+    const xs = fills.map(f => f.x).sort((a, b) => a - b)
+    expect(xs).toEqual([20, 30, 120, 140])
+  })
+
+  it('clears and returns when given an empty highlights array', () => {
+    const base = buildSliceBuffers(track([m('a', 0, 100, [], '#ff0000')]))
+    const {ctx, fills, clears} = makeOverlayCtx()
+    drawHighlightFrame({
+      ctx,
+      slices: base,
+      widthCss: 200,
+      heightCss: 20,
+      rowHeight: 20,
+      pxPerMs: 2,
+      visibleStartMs: 0,
+      visibleEndMs: 100,
+      canvasStartMs: 0,
+      maxDepthExclusive: Infinity,
+      highlight: [],
+    })
+    expect(clears.length).toBe(1)
+    expect(fills.length).toBe(0)
+  })
+
   it('emits no fillRects when the highlight span lies outside the viewport', () => {
     const base = buildSliceBuffers(track([m('a', 0, 100, [], '#ff0000')]))
     const {ctx, fills, clears} = makeOverlayCtx()

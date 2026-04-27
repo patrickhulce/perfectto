@@ -80,16 +80,21 @@ export interface DrawHighlightFrameArgs {
   maxDepthExclusive: number
   baseMeasures?: Measure[]
   /**
-   * Tree region to repaint at full opacity. Slices fully contained in
-   * `[startMs, endMs]` at `depth >= minDepth` are the pre-order
-   * descendants of the anchor (including the anchor itself).
+   * Tree region(s) to repaint at full opacity. Slices fully contained
+   * in `[startMs, endMs]` at `depth >= minDepth` are the pre-order
+   * descendants of the anchor (including the anchor itself). Pass an
+   * array to render multiple anchors simultaneously — used by the
+   * track renderer so a sticky click selection stays lit even when
+   * the user hovers a different slice.
    */
-  highlight: {
-    startMs: number
-    endMs: number
-    /** Inclusive minimum depth; the anchor's own depth. */
-    minDepth: number
-  }
+  highlight: HighlightRegion | readonly HighlightRegion[]
+}
+
+export interface HighlightRegion {
+  startMs: number
+  endMs: number
+  /** Inclusive minimum depth; the anchor's own depth. */
+  minDepth: number
 }
 
 /** Vertical padding inside a row (mirrors the old DOM renderer). */
@@ -500,9 +505,22 @@ export function drawHighlightFrame(args: DrawHighlightFrameArgs): void {
   //   - an adjacent sibling whose F64 end sits past the anchor's F64
   //     end still passes `e <= hiEnd` after F32 rounding, so a bar
   //     spanning into the parent's region gets painted.
-  const hiStart = Math.fround(highlight.startMs)
-  const hiEnd = Math.fround(highlight.endMs)
-  const hiMinDepth = highlight.minDepth
+  const regionsRaw: readonly HighlightRegion[] = Array.isArray(highlight)
+    ? highlight
+    : [highlight as HighlightRegion]
+  if (regionsRaw.length === 0) return
+  // Pre-snap each region to F32 so the per-rect containment loop is
+  // tight. Two regions is the realistic max (selection + hover) so
+  // small-array iteration is the cheapest dispatch we can write.
+  const regionStarts = new Float32Array(regionsRaw.length)
+  const regionEnds = new Float32Array(regionsRaw.length)
+  const regionMinDepths = new Int32Array(regionsRaw.length)
+  for (let r = 0; r < regionsRaw.length; r++) {
+    regionStarts[r] = Math.fround(regionsRaw[r].startMs)
+    regionEnds[r] = Math.fround(regionsRaw[r].endMs)
+    regionMinDepths[r] = regionsRaw[r].minDepth
+  }
+  const regionCount = regionsRaw.length
 
   const first = lowerBoundF32(
     slices.maxEndsPrefix,
@@ -569,7 +587,14 @@ export function drawHighlightFrame(args: DrawHighlightFrameArgs): void {
       batches.set(color, batch)
     }
 
-    if (s < hiStart || e > hiEnd || d < hiMinDepth) continue
+    let contained = false
+    for (let r = 0; r < regionCount; r++) {
+      if (s >= regionStarts[r] && e <= regionEnds[r] && d >= regionMinDepths[r]) {
+        contained = true
+        break
+      }
+    }
+    if (!contained) continue
 
     const xCss = (s - canvasStartMs) * pxPerMs
     const wCssRaw = (e - s) * pxPerMs

@@ -5,7 +5,7 @@ import {
   EMPTY_SLICE_BUFFERS,
   pickMipmapLevel,
 } from '../../core/render/sliceBuffers'
-import {drawFrame, drawHighlightFrame} from './canvas2d'
+import {drawFrame, drawHighlightFrame, type HighlightRegion} from './canvas2d'
 import type {ViewportStore} from './viewportStore'
 import type {SelectionStore} from './selectionStore'
 import {ROW_HEIGHT} from './trackLayout'
@@ -149,29 +149,54 @@ function CanvasTrackRendererBase({
     let loaded: LoadedRange | null = null
     let overlayPainted: OverlayPaint | null = null
     // Remembered so we can keep the highlight rect on the overlay canvas
-    // during the fade-out — without it, `currentHighlight()` returns
-    // `undefined` the instant the user moves off and we'd wipe the
+    // during the fade-out — without it, `currentHighlights()` returns
+    // an empty array the instant the user moves off and we'd wipe the
     // pixels before CSS had anything to fade.
-    let lastHighlight: {startMs: number; endMs: number; minDepth: number} | undefined = undefined
+    let lastHighlights: HighlightRegion[] = []
     let overlayClearTimer: number | null = null
 
     /**
-     * Resolve which (if any) slice on *this* track should drive the
-     * overlay's highlight draw. Hover wins over click-selection — if
-     * both exist at once the cursor is over the hover target, so it's
-     * the more immediate intent. Returns `undefined` when no slice on
-     * this track is active, which empties the overlay.
+     * Resolve which (if any) slices on *this* track should drive the
+     * overlay's highlight draw. Both the sticky click-selection AND
+     * the transient hover highlight are returned so a clicked slice
+     * stays lit while the user hovers a different slice — the user
+     * sees both anchor regions simultaneously instead of losing the
+     * selection the moment they move the cursor. When hover and
+     * selection point at the exact same slice we de-dupe so we don't
+     * pay for an identical second containment pass.
      */
-    const currentHighlight = (): {startMs: number; endMs: number; minDepth: number} | undefined => {
+    const currentHighlights = (): HighlightRegion[] => {
       const sel = selectionStore.get()
-      const hl = sel.hoveredSlice ?? sel.selectedSlice
-      if (!hl || hl.trackId !== track.id) return undefined
-      return {startMs: hl.startMs, endMs: hl.endMs, minDepth: hl.depth}
+      const out: HighlightRegion[] = []
+      const selSlice = sel.selectedSlice
+      if (selSlice && selSlice.trackId === track.id) {
+        out.push({startMs: selSlice.startMs, endMs: selSlice.endMs, minDepth: selSlice.depth})
+      }
+      const hov = sel.hoveredSlice
+      if (hov && hov.trackId === track.id) {
+        const dupe =
+          selSlice &&
+          selSlice.trackId === hov.trackId &&
+          selSlice.startMs === hov.startMs &&
+          selSlice.endMs === hov.endMs &&
+          selSlice.depth === hov.depth
+        if (!dupe) {
+          out.push({startMs: hov.startMs, endMs: hov.endMs, minDepth: hov.depth})
+        }
+      }
+      return out
     }
 
-    const highlightKeyOf = (
-      hl: {startMs: number; endMs: number; minDepth: number} | undefined,
-    ): string => (hl === undefined ? '' : `${hl.startMs}|${hl.endMs}|${hl.minDepth}`)
+    const highlightKeyOf = (regions: readonly HighlightRegion[]): string => {
+      if (regions.length === 0) return ''
+      let key = ''
+      for (let i = 0; i < regions.length; i++) {
+        const r = regions[i]
+        if (i > 0) key += '!'
+        key += `${r.startMs}|${r.endMs}|${r.minDepth}`
+      }
+      return key
+    }
 
     const syncBaseOpacity = (): void => {
       const sel = selectionStore.get()
@@ -197,7 +222,7 @@ function CanvasTrackRendererBase({
     const clearOverlayNow = (): void => {
       overlayCtx.clearRect(0, 0, overlay.width, overlay.height)
       overlayPainted = null
-      lastHighlight = undefined
+      lastHighlights = []
     }
 
     const cancelPendingOverlayClear = (): void => {
@@ -307,9 +332,9 @@ function CanvasTrackRendererBase({
       scrollLeftAnchor: number,
       canvasWidthCss: number,
       heightCss: number,
-      highlight: ReturnType<typeof currentHighlight>,
+      highlights: readonly HighlightRegion[],
     ): void => {
-      if (!highlight) {
+      if (highlights.length === 0) {
         overlayCtx.clearRect(0, 0, canvasWidthCss, heightCss)
         overlayPainted = null
         return
@@ -334,7 +359,7 @@ function CanvasTrackRendererBase({
         canvasStartMs: msAtCanvasLeft,
         maxDepthExclusive: expanded ? Number.POSITIVE_INFINITY : 1,
         baseMeasures,
-        highlight,
+        highlight: highlights,
       })
 
       overlayPainted = {
@@ -344,7 +369,7 @@ function CanvasTrackRendererBase({
         heightCss,
         expanded,
         trackId: track.id,
-        highlightKey: highlightKeyOf(highlight),
+        highlightKey: highlightKeyOf(highlights),
       }
     }
 
@@ -411,26 +436,32 @@ function CanvasTrackRendererBase({
       // or when expansion / track identity flips. Content-drift-only
       // scrolls (base translate, no redraw) leave the overlay
       // untouched — its drawn rects are already anchored correctly.
-      const highlight = currentHighlight()
-      // When the hover goes away we keep the last-drawn highlight on the
-      // canvas and let CSS fade opacity to 0 over OVERLAY_FADE_OUT_MS. A
-      // trailing timer clears the pixels once the transition has
-      // finished; if a new highlight arrives first the timer is cancelled
-      // and we paint the new one immediately at opacity 1.
-      if (highlight) {
+      const highlights = currentHighlights()
+      // When every highlight goes away we keep the last-drawn rects on
+      // the canvas and let CSS fade opacity to 0 over
+      // OVERLAY_FADE_OUT_MS. A trailing timer clears the pixels once
+      // the transition has finished; if a new highlight arrives first
+      // the timer is cancelled and we paint the new set immediately at
+      // opacity 1.
+      if (highlights.length > 0) {
         cancelPendingOverlayClear()
-        lastHighlight = highlight
-      } else if (lastHighlight !== undefined && overlayClearTimer === null) {
+        lastHighlights = highlights
+      } else if (lastHighlights.length > 0 && overlayClearTimer === null) {
         overlayClearTimer = window.setTimeout(() => {
           overlayClearTimer = null
           clearOverlayNow()
           schedule()
         }, OVERLAY_FADE_OUT_MS)
       }
-      syncOverlayOpacity(!!highlight)
+      syncOverlayOpacity(highlights.length > 0)
 
-      const drawHighlight = highlight ?? (overlayClearTimer !== null ? lastHighlight : undefined)
-      const highlightKey = highlightKeyOf(drawHighlight)
+      const drawHighlights =
+        highlights.length > 0
+          ? highlights
+          : overlayClearTimer !== null
+            ? lastHighlights
+            : []
+      const highlightKey = highlightKeyOf(drawHighlights)
       const overlayMustRedraw =
         overlayPainted === null ||
         overlayPainted.pxPerMs !== loaded.pxPerMs ||
@@ -446,7 +477,7 @@ function CanvasTrackRendererBase({
           loaded.scrollLeftAnchor,
           loaded.widthCss,
           loaded.heightCss,
-          drawHighlight,
+          drawHighlights,
         )
       }
     }
