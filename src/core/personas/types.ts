@@ -57,6 +57,24 @@ export interface Persona {
    * {@link Persona.defaultTracksExpanded}.
    */
   defaultSystemsExpanded?: boolean
+  /**
+   * Optional dynamic pre-pass run once by {@link applyPersona}. Returns
+   * the {@link Track.id}s to "feature": each is forced
+   * `defaultExpanded: true`, and its containing system is forced
+   * `defaultSystemExpanded: true` so the user actually sees it.
+   *
+   * The hook lets a persona pick specific tracks based on per-trace
+   * data the static {@link TrackRule} system can't see — e.g. the
+   * dominant Python thread by event count, or the GPU stream that
+   * actually carries kernel work — without baking ids into rules.
+   * Forcing `true` always wins over a static rule that would have
+   * collapsed the same track; non-featured tracks fall through to
+   * normal rule resolution unchanged.
+   *
+   * Read-only with respect to the trace (must not mutate measures /
+   * buffers). Called at most once per `applyPersona`.
+   */
+  featureTracks?(trace: ParsedTrace): readonly string[]
 }
 
 /**

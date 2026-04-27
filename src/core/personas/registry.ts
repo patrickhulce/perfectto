@@ -1,4 +1,5 @@
 import type {ParsedTrace} from '../types'
+import {ML_ENGINEER_PERSONA} from './personas/mlEngineer'
 import {RAW_PERSONA} from './personas/raw'
 import {WEB_DEV_PERSONA} from './personas/webDev'
 import type {Persona} from './types'
@@ -7,7 +8,11 @@ import type {Persona} from './types'
  * Built-in personas, ordered as they appear in the picker. `Raw` lives
  * last as the always-available fallback.
  */
-export const BUILTIN_PERSONAS: readonly Persona[] = [WEB_DEV_PERSONA, RAW_PERSONA]
+export const BUILTIN_PERSONAS: readonly Persona[] = [
+  WEB_DEV_PERSONA,
+  ML_ENGINEER_PERSONA,
+  RAW_PERSONA,
+]
 
 /**
  * Pick the highest-scoring persona for a trace. Ties break toward the

@@ -5,6 +5,7 @@ export {
   BUILTIN_PERSONAS,
   detectPersona,
   findPersona,
+  ML_ENGINEER_PERSONA,
   RAW_PERSONA,
   WEB_DEV_PERSONA,
   type AppliedPersona,

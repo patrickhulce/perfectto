@@ -269,6 +269,69 @@ describe('parseTrace - chrome minimal', () => {
     expect(wide.measures[0].measures).toHaveLength(0)
   })
 
+  // Regression: a real PyTorch Kineto trace contained a parent
+  // `_run_module_as_main` (ts=1_200_202_296_518.285, dur=25_085_119.703,
+  // end=…637.9878) and an immediate child `_run_code` (ts=…519.445,
+  // dur=…118.543, end=…637.9880) that nominally shared an end timestamp.
+  // Each end is computed as `ts + dur` in float64; at this magnitude
+  // (~1.2e12 µs) the two sums differ by exactly one ULP — the child's
+  // computed end was 0.000244 µs greater than the parent's, so the
+  // strict `top.endTs >= newEnd` containment check popped the parent
+  // and demoted the child to a sibling at depth 0. Both rendered
+  // overlapping each other in the timeline. The parser uses a
+  // magnitude-relative tolerance so ties survive as containment.
+  it('keeps a same-end-time X child nested under its parent despite float-ULP slack', async () => {
+    // Pick base timestamps in the 10^12 µs range so `ts + dur`
+    // accumulates real ULP noise; verify with raw arithmetic that the
+    // child's computed end > parent's computed end before relying on
+    // the parser's tolerance.
+    const outerTs = 1_200_202_296_518.285
+    const outerDur = 25_085_119.703
+    const innerTs = 1_200_202_296_519.445
+    const innerDur = 25_085_118.543
+    expect(innerTs + innerDur).toBeGreaterThan(outerTs + outerDur)
+
+    const trace = await parseTrace(
+      streamFromString(
+        JSON.stringify({
+          traceEvents: [
+            {
+              ph: 'X',
+              name: '_run_module_as_main',
+              cat: 'python_function',
+              pid: 1,
+              tid: 1,
+              ts: outerTs,
+              dur: outerDur,
+            },
+            {
+              ph: 'X',
+              name: '_run_code',
+              cat: 'python_function',
+              pid: 1,
+              tid: 1,
+              ts: innerTs,
+              dur: innerDur,
+            },
+          ],
+        }),
+      ),
+      SOURCE,
+    )
+
+    const track = trace.timeline.systems[0].tracks[0]
+    expect(track.measures).toHaveLength(1)
+    expect(track.measures[0].name).toBe('_run_module_as_main')
+    expect(track.measures[0].measures.map(m => m.name)).toEqual(['_run_code'])
+    // The 1-ULP overshoot survives the µs→ms divide intact, but at
+    // this magnitude it's below F32 representational precision (and
+    // far below any subpixel) so it can never paint the child poking
+    // out the right of its parent in the rendered timeline.
+    const outer = track.measures[0]
+    const inner = outer.measures[0]
+    expect(inner.end - outer.end).toBeLessThan(1e-3)
+  })
+
   it('preserves a deep wide chain rooted under a tiny straddled probe', async () => {
     // Mirrors the real PyTorch trace shape that motivated the fix:
     // tiny profiler.__init__ + profiler.__enter__ + torch/_ops.__call__ +
@@ -487,6 +550,88 @@ describe('parseTrace - chrome minimal', () => {
     expect(system).toBeDefined()
     const track = system!.tracks.find(t => t.name === 'CrRendererMain')
     expect(track).toBeDefined()
+  })
+
+  it('appends process_labels as a parenthesized suffix on the system name', async () => {
+    // PyTorch Kineto emits identical `process_name = "python"` for the
+    // CPU process and every per-GPU process, disambiguating only via
+    // `process_labels` ("CPU" / "GPU 0" / …). Without surfacing labels
+    // every process collapses into a single indistinguishable system.
+    const trace = await parseTrace(
+      streamFromString(
+        JSON.stringify({
+          traceEvents: [
+            {
+              ph: 'M',
+              name: 'process_name',
+              cat: '__metadata',
+              pid: 1,
+              tid: 0,
+              ts: 0,
+              args: {name: 'python'},
+            },
+            {
+              ph: 'M',
+              name: 'process_labels',
+              cat: '__metadata',
+              pid: 1,
+              tid: 0,
+              ts: 0,
+              args: {labels: 'GPU 0'},
+            },
+            {ph: 'X', name: 'k', cat: 'kernel', pid: 1, tid: 7, ts: 0, dur: 1},
+            {
+              ph: 'M',
+              name: 'process_name',
+              cat: '__metadata',
+              pid: 2,
+              tid: 0,
+              ts: 0,
+              args: {name: 'python'},
+            },
+            {
+              ph: 'M',
+              name: 'process_labels',
+              cat: '__metadata',
+              pid: 2,
+              tid: 0,
+              ts: 0,
+              args: {labels: 'CPU'},
+            },
+            {ph: 'X', name: 'op', cat: 'cpu_op', pid: 2, tid: 8, ts: 0, dur: 1},
+          ],
+        }),
+      ),
+      SOURCE,
+    )
+    const names = trace.timeline.systems.map(s => s.name).sort()
+    expect(names).toEqual(['python (CPU)', 'python (GPU 0)'])
+  })
+
+  it('omits the labels suffix when process_labels is absent', async () => {
+    // Regression guard: only Kineto-style traces should grow the
+    // suffix. Vanilla Chrome traces — which emit `process_name` but
+    // never `process_labels` — must keep their existing system names.
+    const trace = await parseTrace(
+      streamFromString(
+        JSON.stringify({
+          traceEvents: [
+            {
+              ph: 'M',
+              name: 'process_name',
+              cat: '__metadata',
+              pid: 1,
+              tid: 0,
+              ts: 0,
+              args: {name: 'Renderer'},
+            },
+            {ph: 'X', name: 't', cat: 'c', pid: 1, tid: 7, ts: 0, dur: 1},
+          ],
+        }),
+      ),
+      SOURCE,
+    )
+    expect(trace.timeline.systems.map(s => s.name)).toEqual(['Renderer'])
   })
 })
 

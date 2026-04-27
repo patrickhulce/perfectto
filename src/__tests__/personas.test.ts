@@ -3,6 +3,7 @@ import {
   BUILTIN_PERSONAS,
   detectPersona,
   findPersona,
+  ML_ENGINEER_PERSONA,
   RAW_PERSONA,
   WEB_DEV_PERSONA,
   type Measure,
@@ -52,12 +53,14 @@ function makeTrace(systems: System[], start = 0, end = 100): ParsedTrace {
 }
 
 describe('persona registry', () => {
-  it('includes raw and web-dev built-ins', () => {
+  it('includes raw, web-dev, and ml-engineer built-ins', () => {
     expect(findPersona('raw')).toBe(RAW_PERSONA)
     expect(findPersona('web-dev')).toBe(WEB_DEV_PERSONA)
+    expect(findPersona('ml-engineer')).toBe(ML_ENGINEER_PERSONA)
     expect(findPersona('bogus')).toBeUndefined()
     expect(BUILTIN_PERSONAS).toContain(RAW_PERSONA)
     expect(BUILTIN_PERSONAS).toContain(WEB_DEV_PERSONA)
+    expect(BUILTIN_PERSONAS).toContain(ML_ENGINEER_PERSONA)
   })
 
   it('detects web-dev persona for Chrome-like traces', () => {
@@ -70,6 +73,23 @@ describe('persona registry', () => {
     const worker = makeTrack('t1', 'WorkerThread', [m('doWork', 0, 10)])
     const trace = makeTrace([makeSystem('s1', 'App', [worker])])
     expect(detectPersona(trace)).toBe(RAW_PERSONA)
+  })
+
+  it('detects ml-engineer persona for Kineto-shaped traces', () => {
+    // PyTorch Kineto: every process is named `python` with a labels
+    // suffix; GPU streams come through as `stream N` tracks. This
+    // should beat both web-dev (no chrome thread names) and raw.
+    const cpuThread = makeTrack('cpu-t1', 'thread 490 (python)', [
+      m('aten::mm', 0, 10, 'cpu_op'),
+    ])
+    const gpuStream = makeTrack('gpu-s7', 'stream 7', [
+      m('void at::native::elementwise_kernel', 0, 5, 'kernel'),
+    ])
+    const trace = makeTrace([
+      makeSystem('cpu', 'python (CPU)', [cpuThread]),
+      makeSystem('gpu0', 'python (GPU 0)', [gpuStream]),
+    ])
+    expect(detectPersona(trace)).toBe(ML_ENGINEER_PERSONA)
   })
 })
 
@@ -210,6 +230,218 @@ describe('applyPersona (web-dev)', () => {
     for (let i = 0; i < renderer.buffers!.count; i++) {
       expect(renderer.buffers!.colors[i]).toBe(DEFAULT_MEASURE_COLOR)
     }
+  })
+})
+
+describe('applyPersona (ml-engineer)', () => {
+  // Helper: pack-and-coerce-to-unsigned for direct comparison against
+  // the unsigned values stored in the SliceBuffers `colors` array.
+  const packU = (color: string): number => packColor(color, DEFAULT_MEASURE_COLOR) >>> 0
+
+  // Single Kineto-shaped fixture exercising every color rule. One CPU
+  // thread carries the python_function frames + cpu_op + cuda_runtime
+  // + overhead; one GPU stream carries kernel + memcpy.
+  function buildKinetoTrace(): ParsedTrace {
+    const cpu = makeTrack('cpu', 'thread 490 (python)', [
+      // python_function classification — order in the array drives
+      // the assertion indices below.
+      m('nn.Module: Gemma3Model_0', 0, 1, 'python_function'), //                0 → userPython
+      m('torch/_inductor/foo.py(10): bar', 1, 2, 'python_function'), //         1 → torchPython
+      m('transformers/utils/generic.py(1): baz', 2, 3, 'python_function'), //   2 → thirdPartyPython
+      m('threading.py(973): _bootstrap', 3, 4, 'python_function'), //           3 → torchPython (stdlib)
+      m('myapp/main.py(50): run', 4, 5, 'python_function'), //                  4 → userPython
+      // ATen / CUDA API / overhead.
+      m('aten::mm', 5, 6, 'cpu_op'), //                                         5 → aten
+      m('cudaLaunchKernel', 6, 7, 'cuda_runtime'), //                           6 → system
+      m('Buffer Flush', 7, 8, 'overhead'), //                                   7 → system
+    ])
+    const gpu = makeTrack('gpu', 'stream 7', [
+      m('void at::native::elementwise_kernel', 0, 1, 'kernel'), //              0 → gpuKernel
+      m('Memcpy DtoH (Device -> Pageable)', 1, 2, 'gpu_memcpy'), //             1 → gpuMemory
+    ])
+    const compileWorker = makeTrack('cw', 'compile_worker_pool', [
+      m('codegen', 0, 1, 'python_function'),
+    ])
+    return makeTrace([
+      makeSystem('cpu', 'python (CPU)', [cpu, compileWorker]),
+      makeSystem('gpu0', 'python (GPU 0)', [gpu]),
+    ])
+  }
+
+  it('routes each Kineto category to the right palette color', () => {
+    const trace = buildKinetoTrace()
+    applyPersona(trace, ML_ENGINEER_PERSONA)
+    const cpu = trace.timeline.systems[0].tracks.find(t => t.id === 'cpu')!
+    const gpu = trace.timeline.systems[1].tracks.find(t => t.id === 'gpu')!
+    const cb = cpu.buffers!.colors
+    const gb = gpu.buffers!.colors
+
+    expect(cb[0]).toBe(packU('#8ed9c1')) // nn.Module → userPython mint
+    expect(cb[1]).toBe(packU('#ed8936')) // torch/* → torchPython amber (matches aten)
+    expect(cb[2]).toBe(packU('#4398f0')) // transformers/* → thirdPartyPython blue
+    expect(cb[3]).toBe(packU('#4398f0')) // threading.py (stdlib) → thirdPartyPython blue
+    expect(cb[4]).toBe(packU('#8ed9c1')) // myapp/main.py → userPython mint
+    expect(cb[5]).toBe(packU('#ed8936')) // aten::mm (cpu_op) → aten amber
+    expect(cb[6]).toBe(packU('#4a5568')) // cudaLaunchKernel → system gray
+    expect(cb[7]).toBe(packU('#4a5568')) // Buffer Flush (overhead) → system gray
+
+    expect(gb[0]).toBe(packU('#e8457f')) // kernel → gpuKernel pink
+    expect(gb[1]).toBe(packU('#f59ab9')) // gpu_memcpy → gpuMemory pale pink
+  })
+
+  it('rolls every Python subcategory and the GPU subcategories into their parent bands', () => {
+    const trace = buildKinetoTrace()
+    const applied = applyPersona(trace, ML_ENGINEER_PERSONA)
+    // All four python subcategories share the same overview band (root
+    // `python`); the two GPU subcategories share the `gpu` band.
+    expect(applied.bandForCategory.userPython).toBe('python')
+    expect(applied.bandForCategory.thirdPartyPython).toBe('python')
+    expect(applied.bandForCategory.torchPython).toBe('python')
+    expect(applied.bandForCategory.python).toBe('python')
+    expect(applied.bandForCategory.gpuKernel).toBe('gpu')
+    expect(applied.bandForCategory.gpuMemory).toBe('gpu')
+    expect(applied.bandForCategory.aten).toBe('aten')
+    expect(applied.bandForCategory.system).toBe('system')
+    // Bottom-to-top: system, gpu, aten, python.
+    expect(applied.bands.map(b => b.id)).toEqual(['system', 'gpu', 'aten', 'python'])
+  })
+
+  it('pins python (CPU) above python (GPU N) and relabels CPU to "Python CPU"', () => {
+    const trace = buildKinetoTrace()
+    const applied = applyPersona(trace, ML_ENGINEER_PERSONA)
+    expect(applied.systems.map(s => s.id)).toEqual(['cpu', 'gpu0'])
+    expect(applied.systems[0].name).toBe('Python CPU')
+    // GPU process keeps its disambiguating label so multi-GPU traces
+    // stay readable.
+    expect(applied.systems[1].name).toBe('python (GPU 0)')
+    expect(applied.defaultSystemExpanded.cpu).toBe(true)
+    expect(applied.defaultSystemExpanded.gpu0).toBe(true)
+  })
+
+  it('expands the dominant python thread and kernel stream, hides compile-worker pools', () => {
+    const trace = buildKinetoTrace()
+    const applied = applyPersona(trace, ML_ENGINEER_PERSONA)
+    expect(applied.defaultTrackExpanded.cpu).toBe(true)
+    expect(applied.defaultTrackExpanded.gpu).toBe(true)
+    // Compile workers live in hiddenTracksBySystem under their parent.
+    const visibleCpu = applied.systems[0].tracks.map(t => t.id)
+    expect(visibleCpu).not.toContain('cw')
+    expect(applied.hiddenTracksBySystem.cpu?.map(t => t.id)).toContain('cw')
+  })
+
+  it('features only the busiest python thread when multiple candidates exist', () => {
+    // Real Kineto traces have one dominant `thread <pid> (python)`
+    // and a long tail of short-lived workers. Static rules can't pick
+    // the dominant one — featureTracks does, by event count.
+    const main = makeTrack(
+      'cpu-main',
+      'thread 490 (python)',
+      Array.from({length: 50}, (_, i) => m(`f${i}`, i, i + 1, 'python_function')),
+    )
+    const idle = makeTrack('cpu-idle', 'thread 491 (python)', [
+      m('idle', 0, 1, 'python_function'),
+    ])
+    const gpuKernels = makeTrack('gpu-busy', 'stream 7', [
+      m('kernel a', 0, 1, 'kernel'),
+      m('kernel b', 1, 2, 'kernel'),
+      m('memcpy', 2, 3, 'gpu_memcpy'),
+    ])
+    const gpuMemcpyOnly = makeTrack('gpu-mem', 'stream 8', [
+      m('memcpy a', 0, 1, 'gpu_memcpy'),
+      m('memcpy b', 1, 2, 'gpu_memcpy'),
+    ])
+    const trace = makeTrace([
+      makeSystem('cpu', 'python (CPU)', [idle, main]),
+      makeSystem('gpu0', 'python (GPU 0)', [gpuMemcpyOnly, gpuKernels]),
+    ])
+    const applied = applyPersona(trace, ML_ENGINEER_PERSONA)
+
+    // Dominant python thread wins; the idle worker stays collapsed.
+    expect(applied.defaultTrackExpanded['cpu-main']).toBe(true)
+    expect(applied.defaultTrackExpanded['cpu-idle']).toBe(false)
+    // Stream with kernels wins; the memcpy-only stream stays
+    // collapsed even though the persona-baseline would otherwise
+    // collapse both.
+    expect(applied.defaultTrackExpanded['gpu-busy']).toBe(true)
+    expect(applied.defaultTrackExpanded['gpu-mem']).toBe(false)
+  })
+
+  it("tolerates Kineto's trailing-space track names ('stream 7 ', 'thread 490 (python) ')", () => {
+    // Real PyTorch Kineto traces emit `thread_name` metadata with a
+    // trailing space for GPU streams (literal `"stream 7 "`). A regex
+    // anchored at the digit (`\d+$`) silently misses every real
+    // trace, so the persona ends up with no featured tracks and the
+    // overview falls back to "everything visible," which on an ML
+    // workload reads as a mostly-idle CPU thread with sparse gray
+    // cuda_runtime peaks. Hardcoded the literal name here so we can't
+    // accidentally re-introduce that drop.
+    const cpuThread = makeTrack('cpu', 'thread 490 (python) ', [
+      m('aten::mm', 0, 5, 'cpu_op'),
+    ])
+    const gpuStream = makeTrack('gpu', 'stream 7 ', [
+      m('elementwise_kernel', 0, 1, 'kernel'),
+      m('elementwise_kernel', 1, 2, 'kernel'),
+    ])
+    const trace = makeTrace([
+      makeSystem('cpu', 'python (CPU)', [cpuThread]),
+      makeSystem('gpu0', 'python (GPU 0)', [gpuStream]),
+    ])
+    const applied = applyPersona(trace, ML_ENGINEER_PERSONA)
+    expect(applied.defaultTrackExpanded.cpu).toBe(true)
+    expect(applied.defaultTrackExpanded.gpu).toBe(true)
+    expect(applied.defaultSystemExpanded.gpu0).toBe(true)
+    // And the GPU stream actually makes it into the overview-scoped
+    // systems — without that, the overview chart goes dark on real
+    // Kineto traces.
+    const overviewIds = applied.overviewSystems.flatMap(s => s.tracks.map(t => t.id))
+    expect(overviewIds).toContain('gpu')
+  })
+
+  it('paints cudaGraphLaunch with the pale-pink GPU-memory color, not system gray', () => {
+    // `cudaGraphLaunch` is a CPU-side API call but represents a whole
+    // pre-recorded GPU graph being kicked off in one shot — call it
+    // out distinctly from per-kernel launches (which stay in the
+    // system bucket). Specific rule must beat the generic
+    // `cuda_runtime → system` catch-all.
+    const cpu = makeTrack('cpu', 'thread 490 (python)', [
+      m('cudaGraphLaunch', 0, 1, 'cuda_runtime'),
+      m('cudaLaunchKernel', 1, 2, 'cuda_runtime'),
+    ])
+    const trace = makeTrace([makeSystem('cpu', 'python (CPU)', [cpu])])
+    applyPersona(trace, ML_ENGINEER_PERSONA)
+    const cb = trace.timeline.systems[0].tracks[0].buffers!.colors
+    expect(cb[0]).toBe(packU('#f59ab9')) // cudaGraphLaunch → gpuMemory pale pink
+    expect(cb[1]).toBe(packU('#4a5568')) // cudaLaunchKernel → system gray
+  })
+
+  it('leaves an idle GPU system collapsed when none of its streams have kernels', () => {
+    // Multi-GPU traces ship with one busy GPU and a stack of idle
+    // siblings (just memcpy / annotation events, no compute). The
+    // idle systems should stay collapsed so the user isn't paging
+    // through empty timelines on first open.
+    const cpuThread = makeTrack('cpu', 'thread 490 (python)', [
+      m('aten::mm', 0, 1, 'cpu_op'),
+    ])
+    const busyStream = makeTrack('gpu0-s7', 'stream 7', [
+      m('kernel', 0, 1, 'kernel'),
+    ])
+    const idleStream = makeTrack('gpu1-s7', 'stream 7', [
+      m('memcpy', 0, 1, 'gpu_memcpy'),
+    ])
+    const trace = makeTrace([
+      makeSystem('cpu', 'python (CPU)', [cpuThread]),
+      makeSystem('gpu0', 'python (GPU 0)', [busyStream]),
+      makeSystem('gpu1', 'python (GPU 1)', [idleStream]),
+    ])
+    const applied = applyPersona(trace, ML_ENGINEER_PERSONA)
+
+    // Busy GPU's system is forced open by featureTracks; idle GPU
+    // falls through to the persona-wide `defaultSystemsExpanded:
+    // false` baseline.
+    expect(applied.defaultSystemExpanded.gpu0).toBe(true)
+    expect(applied.defaultSystemExpanded.gpu1).toBe(false)
+    // And that idle stream itself stays collapsed.
+    expect(applied.defaultTrackExpanded['gpu1-s7']).toBe(false)
   })
 })
 

@@ -160,6 +160,14 @@ const ROOT_METADATA_FIELDS = new Set([
 interface ProcessInfo {
   pid: number
   name?: string
+  /**
+   * Optional `process_labels` metadata value. Some producers (notably the
+   * PyTorch Kineto profiler) emit identical `process_name` for every
+   * process and disambiguate via `process_labels` (e.g. `"CPU"`,
+   * `"GPU 0"`). Surfaced as a parenthesized suffix on the system name
+   * so personas / the UI can tell them apart.
+   */
+  labels?: string
   sortIndex?: number
   threads: Map<number, ThreadInfo>
   /** Preserves first-seen order of threads for stable output when no sort_index is given. */
@@ -510,6 +518,11 @@ export class ChromeParser implements TraceParser {
       case 'process_name':
         if (typeof args.name === 'string') proc.name = args.name
         break
+      case 'process_labels':
+        if (typeof args.labels === 'string' && args.labels.length > 0) {
+          proc.labels = args.labels
+        }
+        break
       case 'process_sort_index':
         if (typeof args.sort_index === 'number') proc.sortIndex = args.sort_index
         break
@@ -624,7 +637,7 @@ export class ChromeParser implements TraceParser {
       // Yield before each process so the host event loop stays live even if we
       // end up on a trace with one monstrous process.
       await yieldToEventLoop()
-      const procLabel = proc.name ?? `Process ${proc.pid}`
+      const procLabel = formatProcessName(proc)
       emitFinalizeProgress(`Finalizing ${procLabel} (${procIdx}/${procTotal})`)
 
       const tracks: Track[] = []
@@ -815,7 +828,7 @@ export class ChromeParser implements TraceParser {
 
       systems.push({
         id: `sys-${proc.pid}`,
-        name: proc.name ?? `Process ${proc.pid}`,
+        name: formatProcessName(proc),
         tracks,
       })
     }
@@ -923,10 +936,27 @@ export class ChromeParser implements TraceParser {
         // Mirror the malformed-E branch above: pop any complete frame on
         // top of the stack whose endTs is before this event's end —
         // they're done, and they cannot contain us.
+        //
+        // Containment uses a magnitude-relative tolerance because the
+        // two endpoints we're comparing are each computed as `ts + dur`
+        // in float64, which carries up to half a ULP of rounding error
+        // per addition. PyTorch Kineto traces routinely emit
+        // call/return pairs that nominally share an end timestamp
+        // (parent function returns at the same `ts` its last child
+        // returned) but whose computed `endTs` differ by 1 ULP — at
+        // wall-clock-µs scales (~1.2e12) that's ~2.5e-4 µs of float
+        // noise. A strict `>=` check pops the parent, demoting a real
+        // call-stack child to a sibling at depth 0 and rendering it
+        // overlapping its former parent. Allowing a relative epsilon
+        // proportional to the larger endpoint preserves containment
+        // for these ties while still popping genuine micro-overshoots
+        // (the tolerance is well below the smallest meaningful event
+        // duration at any timestamp magnitude).
         while (stack.length > 0) {
           const top = stack[stack.length - 1]
           if (!top.isComplete) break
-          if (top.endTs >= newEnd) break
+          const tol = endpointTieEpsilon(top.endTs, newEnd)
+          if (top.endTs + tol >= newEnd) break
           stack.pop()
           currentContainer().measures.push(
             this._makeMeasureFromFrame(top, top.endTs, null, toMs),
@@ -1540,6 +1570,41 @@ function compareByStart(a: Measure, b: Measure): number {
 
 function compareMarkByTime(a: Mark, b: Mark): number {
   return a.time - b.time
+}
+
+/**
+ * Magnitude-relative epsilon for comparing two `ts + dur` endpoints in
+ * the chrome-trace µs domain. Both endpoints carry up to half a ULP of
+ * float64 rounding error from the addition; comparing absolute
+ * timestamps in the 10^12 µs range, that's ~10^-4 µs of noise. A factor
+ * of `8` over the spacing of the larger endpoint gives plenty of slack
+ * for repeated additions / `dur`-vs-explicit-end roundtrips while
+ * staying orders of magnitude below the smallest meaningful event
+ * duration. `Math.max(1, …)` floors the result so timestamps near zero
+ * don't collapse the tolerance to zero.
+ *
+ * `Number.EPSILON * mag` reproduces a single-ULP gap at magnitude
+ * `mag`; the `8 *` factor absorbs the half-ULP-each from two
+ * independent `ts + dur` rounds plus a couple of follow-on F32
+ * roundtrips on the way to `endTs`.
+ */
+function endpointTieEpsilon(a: number, b: number): number {
+  const mag = Math.max(Math.abs(a), Math.abs(b), 1)
+  return mag * Number.EPSILON * 8
+}
+
+/**
+ * Build the display name for a process. Combines `process_name` with
+ * `process_labels` (if present) so producers like the PyTorch Kineto
+ * profiler — which name every process the same `python` and disambiguate
+ * only via labels — render as e.g. `python (CPU)` / `python (GPU 0)`.
+ */
+function formatProcessName(proc: ProcessInfo): string {
+  const base = proc.name ?? `Process ${proc.pid}`
+  if (proc.labels && proc.labels.length > 0) {
+    return `${base} (${proc.labels})`
+  }
+  return base
 }
 
 function compareProcesses(a: ProcessInfo, b: ProcessInfo): number {

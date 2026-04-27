@@ -81,6 +81,18 @@ export function applyPersona(trace: ParsedTrace, persona: Persona): AppliedPerso
   const defaultTracksExpanded = persona.defaultTracksExpanded
   const defaultSystemsExpanded = persona.defaultSystemsExpanded
 
+  // Dynamic featuring: the persona may name specific track ids whose
+  // expand-state can't be derived from a static {@link TrackRule}
+  // (e.g. "the dominant Python thread by event count"). Each id in
+  // the set forces the track expanded and its containing system
+  // expanded, regardless of the static rule resolution below. Built
+  // once up-front so we can do an O(1) lookup per track.
+  const featuredTrackIds = new Set<string>(persona.featureTracks?.(trace) ?? [])
+  // Parent system id of each featured track id. Captured during the
+  // track loop so we can flip the system expand-state after rules
+  // have been resolved.
+  const featuredSystemIds = new Set<string>()
+
   interface SystemCandidate {
     system: System
     derivedTracks: Track[]
@@ -110,6 +122,13 @@ export function applyPersona(trace: ParsedTrace, persona: Persona): AppliedPerso
       } else if (defaultTracksExpanded === false) {
         // Persona-wide baseline: unmatched tracks collapse by default.
         defaultTrackExpanded[track.id] = false
+      }
+      // featureTracks() override: a dynamically-picked track always
+      // wins over both the static rule and the persona baseline.
+      // Recorded last so this branch is the final write.
+      if (featuredTrackIds.has(track.id)) {
+        defaultTrackExpanded[track.id] = true
+        featuredSystemIds.add(system.id)
       }
       if (effects.defaultSystemExpanded !== undefined) {
         // A TrackRule forcing its parent system open/closed (e.g.
@@ -156,6 +175,12 @@ export function applyPersona(trace: ParsedTrace, persona: Persona): AppliedPerso
     }
     if (systemExpanded === undefined && defaultSystemsExpanded === false) {
       systemExpanded = false
+    }
+    // featureTracks() override: any system that contains a featured
+    // track must be expanded so the user can actually see it. Wins
+    // over both SystemRule and the persona baseline.
+    if (featuredSystemIds.has(system.id)) {
+      systemExpanded = true
     }
     if (systemExpanded !== undefined) {
       defaultSystemExpanded[system.id] = systemExpanded
