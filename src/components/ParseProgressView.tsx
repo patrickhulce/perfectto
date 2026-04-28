@@ -64,14 +64,14 @@ export default function ParseProgressView({
       <h1 className="mb-2 bg-gradient-to-br from-[#667eea] to-[#764ba2] bg-clip-text text-4xl font-bold text-transparent">
         Perfectto
       </h1>
-      <p className="mb-12 text-base text-[#718096]">Parsing trace…</p>
+      <p className="mb-8 text-base text-[#718096]">Parsing trace…</p>
 
-      <div className="flex w-full max-w-[640px] flex-col gap-5 rounded-2xl border border-[#2d3748] bg-[rgba(102,126,234,0.04)] p-8">
+      <div className="flex w-full max-w-[640px] flex-col gap-4 rounded-2xl border border-[#2d3748] bg-[rgba(102,126,234,0.04)] p-6">
         <div className="flex items-baseline justify-between gap-4">
           <p className="truncate text-lg font-semibold text-[#e2e8f0]" title={name}>
             {name}
           </p>
-          <p className="text-sm text-[#718096]">
+          <p className="text-sm tabular-nums text-[#718096]">
             {hasTotal ? `${percent.toFixed(1)}%` : formatBytes(bytesRead)}
           </p>
         </div>
@@ -94,15 +94,19 @@ export default function ParseProgressView({
           )}
         </div>
 
-        <div className="flex items-baseline justify-between gap-4 text-sm text-[#a0aec0]">
+        <div className="flex items-baseline justify-between gap-4 text-sm tabular-nums text-[#a0aec0]">
           <span>{status}</span>
           {etaText && <span className="text-xs text-[#718096]">{etaText}</span>}
         </div>
-        {detailText && (
-          <p className="truncate text-xs text-[#718096]" title={detailText}>
-            {detailText}
-          </p>
-        )}
+        {/* Always render so the card height is stable when the parser
+            starts emitting finalize sub-status mid-parse. */}
+        <p
+          className="truncate text-xs text-[#718096]"
+          title={detailText ?? undefined}
+          aria-hidden={detailText ? undefined : true}
+        >
+          {detailText ?? '\u00a0'}
+        </p>
 
         <div className="flex justify-end">
           <button

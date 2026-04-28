@@ -16,19 +16,6 @@ describe('Splash', () => {
     expect(clickSpy).toHaveBeenCalledTimes(1)
   })
 
-  it('dropping a file calls onFileSelected with the dropped file', () => {
-    const onFileSelected = jest.fn()
-    render(<Splash onFileSelected={onFileSelected} />)
-
-    const zone = screen.getByRole('button', { name: /drop a trace file/i })
-    const file = new File(['hello trace'], 'trace.json', { type: 'application/json' })
-
-    fireEvent.drop(zone, { dataTransfer: { files: [file] } })
-
-    expect(onFileSelected).toHaveBeenCalledTimes(1)
-    expect(onFileSelected).toHaveBeenCalledWith(file)
-  })
-
   it('selecting a file through the input calls onFileSelected', () => {
     const onFileSelected = jest.fn()
     render(<Splash onFileSelected={onFileSelected} />)

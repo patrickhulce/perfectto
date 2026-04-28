@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useRef, useState, type DragEvent, type ReactNode } from 'react'
 import ParseProgressView from './components/ParseProgressView'
 import Splash from './components/Splash'
 import TraceViewer from './components/TraceViewer'
@@ -39,8 +39,21 @@ const PARSE_MAX_BYTES = 4 * 1024 * 1024 * 1024
 
 export default function App() {
   const [trace, setTrace] = useState<ParsedTrace | null>(null)
+  // Bumped on every successful trace load. Used as the React key for
+  // `TraceViewer` so a drag-drop replacement re-mounts the entire
+  // viewer subtree — which is the only way to consistently reset
+  // persona auto-detection, selection state, and the timeline
+  // viewport. Without this, `useState(detectedPersona.id)` inside
+  // `TraceViewer` would carry the previous trace's persona forward.
+  const [traceLoadId, setTraceLoadId] = useState(0)
   const [parsing, setParsing] = useState<ParsingState | null>(null)
   const [parseError, setParseError] = useState<ParseErrorState | null>(null)
+  const [isDragging, setIsDragging] = useState(false)
+  // Latest parsing controller, accessible from the drop handler without
+  // re-creating it on every state change. Lets a drop mid-parse abort
+  // the in-flight worker before kicking off the replacement parse.
+  const parsingRef = useRef<ParsingState | null>(null)
+  parsingRef.current = parsing
 
   const runParse = async (file: File): Promise<void> => {
     setParseError(null)
@@ -71,6 +84,7 @@ export default function App() {
         },
       )
       setTrace(parsed)
+      setTraceLoadId((n) => n + 1)
     } catch (err) {
       // Silence user-initiated aborts; surface every other failure mode
       // as a visible error state instead of re-throwing into React (which
@@ -130,11 +144,42 @@ export default function App() {
     })()
   }, [])
 
-  if (trace) {
-    return <TraceViewer trace={trace} onBack={() => setTrace(null)} />
+  // Page-wide drop target: the user can drop a trace anywhere to
+  // replace whatever's currently on screen (splash, in-flight parse,
+  // loaded viewer, or error view). Splash keeps its own dashed-box
+  // affordance for click-to-browse but no longer owns drop handling
+  // — that's now a single source of truth here.
+  const handleDragOver = (e: DragEvent<HTMLDivElement>) => {
+    if (!Array.from(e.dataTransfer.types).includes('Files')) return
+    e.preventDefault()
+    if (!isDragging) setIsDragging(true)
   }
+
+  const handleDragLeave = (e: DragEvent<HTMLDivElement>) => {
+    if (e.currentTarget.contains(e.relatedTarget as Node | null)) return
+    setIsDragging(false)
+  }
+
+  const handleDrop = (e: DragEvent<HTMLDivElement>) => {
+    e.preventDefault()
+    setIsDragging(false)
+    const file = e.dataTransfer.files[0]
+    if (!file) return
+    const inflight = parsingRef.current
+    if (inflight) inflight.controller.abort()
+    void runParse(file)
+  }
+
+  // Priority: an in-flight parse always wins, even if a previous
+  // trace is still in `trace`, so a drop-on-existing-trace transitions
+  // through the same Splash → Progress → Viewer flow as the initial
+  // load. Errors come next so a failed replacement surfaces instead
+  // of silently keeping the stale viewer up. Falling back to `trace`
+  // when none of those are set means dismissing an error after a
+  // failed replacement returns to the previously loaded trace.
+  let body: ReactNode
   if (parsing) {
-    return (
+    body = (
       <ParseProgressView
         name={parsing.name}
         bytesTotal={parsing.bytesTotal}
@@ -143,16 +188,47 @@ export default function App() {
         onCancel={() => parsing.controller.abort()}
       />
     )
-  }
-  if (parseError) {
-    return (
+  } else if (parseError) {
+    body = (
       <ParseErrorView
         error={parseError}
         onDismiss={() => setParseError(null)}
       />
     )
+  } else if (trace) {
+    body = (
+      <TraceViewer
+        key={traceLoadId}
+        trace={trace}
+        onBack={() => setTrace(null)}
+      />
+    )
+  } else {
+    body = <Splash onFileSelected={handleFileSelected} />
   }
-  return <Splash onFileSelected={handleFileSelected} />
+
+  return (
+    <div
+      onDragOver={handleDragOver}
+      onDragLeave={handleDragLeave}
+      onDrop={handleDrop}
+      className="relative flex min-h-screen flex-col"
+    >
+      {body}
+      {isDragging && (
+        <div
+          aria-hidden
+          className="pointer-events-none fixed inset-0 z-50 flex items-center justify-center bg-[rgba(15,17,23,0.6)] backdrop-blur-sm"
+        >
+          <div className="m-6 flex h-[calc(100%-3rem)] w-[calc(100%-3rem)] items-center justify-center rounded-2xl border-[3px] border-dashed border-[#667eea] bg-[rgba(102,126,234,0.07)]">
+            <p className="text-2xl font-semibold text-[#e2e8f0]">
+              Drop to {trace ? 'replace trace' : 'load trace'}
+            </p>
+          </div>
+        </div>
+      )}
+    </div>
+  )
 }
 
 /**

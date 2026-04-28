@@ -1,30 +1,11 @@
-import { useRef, useState, type DragEvent, type MouseEvent, type ChangeEvent } from 'react'
+import { useRef, type MouseEvent, type ChangeEvent } from 'react'
 
 interface SplashProps {
   onFileSelected: (file: File) => void
 }
 
 export default function Splash({ onFileSelected }: SplashProps) {
-  const [isDragging, setIsDragging] = useState(false)
   const inputRef = useRef<HTMLInputElement>(null)
-
-  const handleDragOver = (e: DragEvent<HTMLDivElement>) => {
-    e.preventDefault()
-    setIsDragging(true)
-  }
-
-  const handleDragLeave = (e: DragEvent<HTMLDivElement>) => {
-    if (!e.currentTarget.contains(e.relatedTarget as Node | null)) {
-      setIsDragging(false)
-    }
-  }
-
-  const handleDrop = (e: DragEvent<HTMLDivElement>) => {
-    e.preventDefault()
-    setIsDragging(false)
-    const file = e.dataTransfer.files[0]
-    if (file) onFileSelected(file)
-  }
 
   const handleZoneClick = (e: MouseEvent<HTMLDivElement>) => {
     if ((e.target as HTMLElement).closest('[data-browse-btn]')) return
@@ -47,16 +28,8 @@ export default function Splash({ onFileSelected }: SplashProps) {
       <div
         role="button"
         aria-label="Drop a trace file here or click to browse"
-        onDragOver={handleDragOver}
-        onDragLeave={handleDragLeave}
-        onDrop={handleDrop}
         onClick={handleZoneClick}
-        className={[
-          'flex min-h-[320px] w-full max-w-[640px] cursor-pointer flex-col items-center justify-center gap-5 rounded-2xl border-[3px] border-dashed p-10 text-center transition-colors',
-          isDragging
-            ? 'border-[#667eea] bg-[rgba(102,126,234,0.07)]'
-            : 'border-[#4a5568] hover:border-[#667eea] hover:bg-[rgba(102,126,234,0.07)]',
-        ].join(' ')}
+        className="flex min-h-[320px] w-full max-w-[640px] cursor-pointer flex-col items-center justify-center gap-5 rounded-2xl border-[3px] border-dashed border-[#4a5568] p-10 text-center transition-colors hover:border-[#667eea] hover:bg-[rgba(102,126,234,0.07)]"
       >
         <svg
           xmlns="http://www.w3.org/2000/svg"
@@ -66,7 +39,7 @@ export default function Splash({ onFileSelected }: SplashProps) {
           strokeWidth="1.5"
           strokeLinecap="round"
           strokeLinejoin="round"
-          className={`h-16 w-16 ${isDragging ? 'opacity-90' : 'opacity-50'}`}
+          className="h-16 w-16 opacity-50"
         >
           <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
           <polyline points="17 8 12 3 7 8" />
