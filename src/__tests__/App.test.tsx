@@ -80,7 +80,10 @@ describe('App', () => {
     await waitFor(() =>
       expect(screen.getByTestId('app-header-title')).toHaveTextContent('trace.json'),
     )
-    expect(screen.getByTestId('trace-pane-header')).toHaveTextContent('trace.json')
+    // At N=1 the per-pane TracePaneHeader is hidden — the AppHeader
+    // already shows the filename, so a second strip below it would
+    // just be a redundant title with tiny duplicate buttons.
+    expect(screen.queryByTestId('trace-pane-header')).not.toBeInTheDocument()
     expect(screen.getByRole('heading', { name: 'Aggregator' })).toBeInTheDocument()
 
     fireEvent.click(screen.getByRole('button', { name: /back/i }))
@@ -119,7 +122,7 @@ describe('App', () => {
     resolveChunk()
 
     await waitFor(() =>
-      expect(screen.getByTestId('trace-pane-header')).toHaveTextContent('big.json'),
+      expect(screen.getByTestId('app-header-title')).toHaveTextContent('big.json'),
     )
   })
 
@@ -133,7 +136,7 @@ describe('App', () => {
     fireEvent.drop(root, { dataTransfer: { files: [file], types: ['Files'] } })
 
     await waitFor(() =>
-      expect(screen.getByTestId('trace-pane-header')).toHaveTextContent('dropped.json'),
+      expect(screen.getByTestId('app-header-title')).toHaveTextContent('dropped.json'),
     )
   })
 
@@ -144,7 +147,7 @@ describe('App', () => {
     const first = new File([MINIMAL_TRACE], 'first.json', { type: 'application/json' })
     fireEvent.change(input, { target: { files: [first] } })
     await waitFor(() =>
-      expect(screen.getByTestId('trace-pane-header')).toHaveTextContent('first.json'),
+      expect(screen.getByTestId('app-header-title')).toHaveTextContent('first.json'),
     )
 
     let resolveSecond!: () => void
@@ -173,13 +176,14 @@ describe('App', () => {
       expect(screen.getByText('Parsing trace…')).toBeInTheDocument(),
     )
     expect(screen.getByText('second.json')).toBeInTheDocument()
-    // The original pane's header should be gone — replace-all wipes it.
-    expect(screen.queryByTestId('trace-pane-header')).not.toBeInTheDocument()
+    // Replace-all wipes the loaded pane: the old filename should no
+    // longer appear anywhere in the global header.
+    expect(screen.getByTestId('app-header-title')).not.toHaveTextContent('first.json')
 
     resolveSecond()
 
     await waitFor(() =>
-      expect(screen.getByTestId('trace-pane-header')).toHaveTextContent('second.json'),
+      expect(screen.getByTestId('app-header-title')).toHaveTextContent('second.json'),
     )
   })
 
@@ -189,7 +193,7 @@ describe('App', () => {
     const first = new File([MINIMAL_TRACE], 'first.json', { type: 'application/json' })
     fireEvent.change(input, { target: { files: [first] } })
     await waitFor(() =>
-      expect(screen.getByTestId('trace-pane-header')).toHaveTextContent('first.json'),
+      expect(screen.getByTestId('app-header-title')).toHaveTextContent('first.json'),
     )
 
     const second = new File([MINIMAL_TRACE], 'second.json', { type: 'application/json' })
@@ -214,7 +218,7 @@ describe('App', () => {
     const first = new File([MINIMAL_TRACE], 'first.json', { type: 'application/json' })
     fireEvent.change(input, { target: { files: [first] } })
     await waitFor(() =>
-      expect(screen.getByTestId('trace-pane-header')).toHaveTextContent('first.json'),
+      expect(screen.getByTestId('app-header-title')).toHaveTextContent('first.json'),
     )
 
     const second = new File([MINIMAL_TRACE], 'second.json', { type: 'application/json' })
@@ -239,7 +243,7 @@ describe('App', () => {
     const first = new File([MINIMAL_TRACE], 'first.json', { type: 'application/json' })
     fireEvent.change(input, { target: { files: [first] } })
     await waitFor(() =>
-      expect(screen.getByTestId('trace-pane-header')).toHaveTextContent('first.json'),
+      expect(screen.getByTestId('app-header-title')).toHaveTextContent('first.json'),
     )
     const second = new File([MINIMAL_TRACE], 'second.json', { type: 'application/json' })
     dropAt(getAppRoot(container), BOTTOM_DROP, [second])
@@ -270,7 +274,7 @@ describe('App', () => {
     const first = new File([MINIMAL_TRACE], 'first.json', { type: 'application/json' })
     fireEvent.change(input, { target: { files: [first] } })
     await waitFor(() =>
-      expect(screen.getByTestId('trace-pane-header')).toHaveTextContent('first.json'),
+      expect(screen.getByTestId('app-header-title')).toHaveTextContent('first.json'),
     )
     const second = new File([MINIMAL_TRACE], 'second.json', { type: 'application/json' })
     dropAt(getAppRoot(container), BOTTOM_DROP, [second])
@@ -300,7 +304,7 @@ describe('App', () => {
     const first = new File([MINIMAL_TRACE], 'first.json', { type: 'application/json' })
     fireEvent.change(input, { target: { files: [first] } })
     await waitFor(() =>
-      expect(screen.getByTestId('trace-pane-header')).toHaveTextContent('first.json'),
+      expect(screen.getByTestId('app-header-title')).toHaveTextContent('first.json'),
     )
 
     const second = new File([MINIMAL_TRACE], 'second.json', { type: 'application/json' })
@@ -313,11 +317,12 @@ describe('App', () => {
     dropAt(getAppRoot(container), CENTER_DROP, [third])
 
     await waitFor(() => {
-      const panes = screen.getAllByTestId('trace-pane')
-      expect(panes).toHaveLength(1)
-      expect(paneFilename(panes[0])).toBe('third.json')
+      expect(screen.getAllByTestId('trace-pane')).toHaveLength(1)
+      expect(screen.getByTestId('app-header-title')).toHaveTextContent('third.json')
     })
-    expect(screen.getByTestId('app-header-title')).toHaveTextContent('third.json')
+    // Collapsed back to N=1, so the per-pane TracePaneHeader strip is
+    // hidden — the AppHeader carries the filename / size / download.
+    expect(screen.queryByTestId('trace-pane-header')).not.toBeInTheDocument()
   })
 
   it('parsing in one pane leaves an existing loaded pane interactive', async () => {
@@ -327,7 +332,7 @@ describe('App', () => {
     const first = new File([MINIMAL_TRACE], 'first.json', { type: 'application/json' })
     fireEvent.change(input, { target: { files: [first] } })
     await waitFor(() =>
-      expect(screen.getByTestId('trace-pane-header')).toHaveTextContent('first.json'),
+      expect(screen.getByTestId('app-header-title')).toHaveTextContent('first.json'),
     )
 
     let resolveSecond!: () => void

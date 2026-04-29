@@ -72,4 +72,63 @@ describe('AppHeader', () => {
     render(<AppHeader panes={[{name: 'a.json'}]} onBack={() => {}} />)
     expect(screen.queryByLabelText(/persona/i)).toBeNull()
   })
+
+  it('renders size + download in the top bar when singlePaneMeta is provided', () => {
+    render(
+      <AppHeader
+        panes={[{name: 'a.json'}]}
+        onBack={() => {}}
+        singlePaneMeta={{
+          source: {name: 'a.json', size: 4096},
+          onDownload: async () => {},
+        }}
+      />,
+    )
+    expect(screen.getByText(/^4(\.0+)?\s*KB$/)).toBeInTheDocument()
+    expect(screen.getByTestId('metadata-download-button')).toBeInTheDocument()
+  })
+
+  it('omits the download button when singlePaneMeta is omitted (compare mode)', () => {
+    render(
+      <AppHeader
+        panes={[{name: 'a.json'}, {name: 'b.json'}]}
+        onBack={() => {}}
+      />,
+    )
+    expect(screen.queryByTestId('metadata-download-button')).toBeNull()
+  })
+
+  it('shows the compaction pill only when totalFolded > 0', () => {
+    const baseSource = {name: 'a.json', size: 4096} as const
+    const baseCompaction = {
+      siblingEventsFolded: 0,
+      cpuTinyEventsFolded: 0,
+      subpixelEventsFolded: 0,
+      onlineEventsFolded: 0,
+      subpixelMaxDepthFolded: 0,
+      onlineTriggered: false,
+    }
+    const {rerender} = render(
+      <AppHeader
+        panes={[{name: 'a.json'}]}
+        onBack={() => {}}
+        singlePaneMeta={{source: baseSource, compaction: baseCompaction}}
+      />,
+    )
+    expect(screen.queryByTestId('metadata-compaction-pill')).toBeNull()
+
+    rerender(
+      <AppHeader
+        panes={[{name: 'a.json'}]}
+        onBack={() => {}}
+        singlePaneMeta={{
+          source: baseSource,
+          compaction: {...baseCompaction, siblingEventsFolded: 7},
+        }}
+      />,
+    )
+    expect(screen.getByTestId('metadata-compaction-pill')).toHaveTextContent(
+      '7 folded',
+    )
+  })
 })

@@ -92,6 +92,16 @@ export interface TracePaneProps {
    * stacked panes don't double up on chrome.
    */
   compactOverview?: boolean
+  /**
+   * When `true`, the per-pane {@link TracePaneHeader} strip is
+   * suppressed. App turns this on at N=1 because the global
+   * {@link AppHeader} already shows the filename, size, compaction
+   * pill, and download button — rendering a second strip below it
+   * would just produce a redundant title with tiny duplicate
+   * affordances. At N≥2 the per-pane strip stays visible so each
+   * trace gets its own labels.
+   */
+  hideHeader?: boolean
 }
 
 /**
@@ -118,6 +128,7 @@ export default function TracePane({
   onDismissError,
   onClose,
   compactOverview = false,
+  hideHeader = false,
 }: TracePaneProps) {
   // Pane-scoped view onto the global selection store. Auto-tags every
   // setter call with `paneId` (so the global store can enforce
@@ -206,12 +217,14 @@ export default function TracePane({
       data-testid="trace-pane"
       data-pane-id={paneId}
     >
-      <TracePaneHeader
-        source={trace.source}
-        compaction={trace.metadata.compaction}
-        onClose={onClose}
-        onDownload={handleDownload}
-      />
+      {!hideHeader && (
+        <TracePaneHeader
+          source={trace.source}
+          compaction={trace.metadata.compaction}
+          onClose={onClose}
+          onDownload={handleDownload}
+        />
+      )}
       <Timeline
         timeline={trace.timeline}
         selectionStore={paneSelectionView}

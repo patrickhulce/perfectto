@@ -7,7 +7,7 @@ import {
   type ReactNode,
 } from 'react'
 import Aggregator, {type AggregatorPaneInfo} from './components/Aggregator'
-import AppHeader from './components/AppHeader'
+import AppHeader, {type AppHeaderTraceMeta} from './components/AppHeader'
 import Splash from './components/Splash'
 import TracePane, {type ParsingState} from './components/TracePane'
 import {type ParseErrorState} from './components/ParseErrorView'
@@ -17,6 +17,11 @@ import {
   type ParseProgress,
   type ParsedTrace,
 } from './core'
+import {
+  suggestExportFilename,
+  zipCompactedTrace,
+} from './core/export/zipCompactedTrace'
+import {triggerDownload} from './components/downloadTrace'
 import {loadFile} from './core/utils/loadFile'
 import {parseTraceInWorker} from './orchestration'
 import {createSelectionStore} from './components/timeline/selectionStore'
@@ -441,6 +446,26 @@ export default function App() {
     return pane?.trace ? detectPersona(pane.trace).id : undefined
   }, [aggregatorPanes, panes])
 
+  // Per-trace metadata exposed in the global header at N=1. At N≥2 we
+  // hide this and let each pane's TracePaneHeader carry its own
+  // size/compaction/download — there's no single "the trace" to
+  // download in compare mode. The download stream itself is wired
+  // here (instead of inside TracePane) so the AppHeader can host the
+  // button without TracePane needing a callback channel back up.
+  const singlePaneMeta = useMemo<AppHeaderTraceMeta | undefined>(() => {
+    if (panes.length !== 1) return undefined
+    const trace = panes[0].trace
+    if (!trace) return undefined
+    return {
+      source: trace.source,
+      compaction: trace.metadata.compaction,
+      onDownload: async () => {
+        const stream = zipCompactedTrace(trace)
+        await triggerDownload(stream, suggestExportFilename(trace.source))
+      },
+    }
+  }, [panes])
+
   // Closing all panes returns to the splash. Wired into AppHeader's
   // back button.
   const handleBackToSplash = (): void => {
@@ -459,6 +484,7 @@ export default function App() {
         <AppHeader
           panes={aggregatorPanes}
           onBack={handleBackToSplash}
+          singlePaneMeta={singlePaneMeta}
           personas={BUILTIN_PERSONAS}
           activePersonaId={activePersonaId ?? detectedPersonaId}
           detectedPersonaId={detectedPersonaId}
@@ -481,6 +507,7 @@ export default function App() {
             onDismissError={() => handleDismissError(pane.id)}
             onClose={() => handleClosePane(pane.id)}
             compactOverview={panes.length >= 2}
+            hideHeader={panes.length === 1}
           />
         ))}
         <Aggregator
