@@ -8,16 +8,30 @@ import {useTimelineHover, type HoverTrackLayout} from './timeline/useTimelineHov
 import {useTimelineSelection} from './timeline/useTimelineSelection'
 import {containerDepth, ROW_HEIGHT} from './timeline/trackLayout'
 import {createViewportStore} from './timeline/viewportStore'
-import {createSelectionStore, type SelectionStore, type SliceRef} from './timeline/selectionStore'
+import {
+  createSelectionStore,
+  type SelectionStore,
+  type SelectionStoreLike,
+  type SliceRef,
+} from './timeline/selectionStore'
 import type {InputBindingsStore} from './timeline/inputBindingsStore'
+import type {HoveredPaneStore} from './timeline/hoveredPaneStore'
 import TimelineAxis, {TIMELINE_AXIS_HEIGHT_PX} from './timeline/TimelineAxis'
-import TimelineOverview, {TIMELINE_OVERVIEW_HEIGHT_PX} from './timeline/TimelineOverview'
+import TimelineOverview, {
+  TIMELINE_OVERVIEW_HEIGHT_PX,
+} from './timeline/TimelineOverview'
 import SelectionOverlay from './timeline/SelectionOverlay'
 import type {InitialView} from './timeline/urlParams'
 
 interface TimelineProps {
   timeline: TimelineModel
-  selectionStore?: SelectionStore
+  /**
+   * Selection store. Either the global concrete `SelectionStore` (in
+   * single-pane mode) or a `PaneSelectionView` wrapping it (in
+   * multi-trace comparison view, where the view auto-tags writes with
+   * the owning pane id and filters reads to only this pane's state).
+   */
+  selectionStore?: SelectionStoreLike
   /**
    * Optional applied persona. When provided, systems/tracks are taken
    * from `appliedPersona.systems` (already filtered, sorted, relabeled),
@@ -47,6 +61,32 @@ interface TimelineProps {
    * from URL params by the parent against the parsed trace.
    */
   initialSelectedSlice?: SliceRef | null
+  /**
+   * Owning pane id for multi-trace comparison view. Used to wire this
+   * Timeline's scroller into the App-level `hoveredPaneStore` (so the
+   * global keydown handler knows which pane the cursor is over) and as
+   * the disambiguator the gated keydown listener in
+   * `useTimelineViewport` checks against. Cross-pane filtering of the
+   * `selectionStore` is handled by the parent passing in a
+   * `PaneSelectionView` — Timeline doesn't need the id for that.
+   * Optional for single-pane / legacy usage where the global behavior
+   * is unchanged.
+   */
+  paneId?: string
+  /**
+   * Shared hovered-pane store (App-level). Required for the keybind
+   * gating to work — the global keydown handler checks it against
+   * `paneId` and only dispatches when this pane is currently hovered.
+   */
+  hoveredPaneStore?: HoveredPaneStore
+  /**
+   * Optional height (CSS px) for the sticky overview band. Defaults
+   * to {@link TIMELINE_OVERVIEW_HEIGHT_PX}. The comparison view
+   * (N≥2) passes
+   * {@link import('./timeline/TimelineOverview').TIMELINE_OVERVIEW_HEIGHT_COMPACT_PX}
+   * so two stacked panes don't double up on chrome.
+   */
+  overviewHeightPx?: number
 }
 
 export interface PerfecttoTimelineSnapshot {
@@ -137,6 +177,9 @@ export default function Timeline({
   bindingsStore,
   initialView,
   initialSelectedSlice,
+  paneId,
+  hoveredPaneStore,
+  overviewHeightPx = TIMELINE_OVERVIEW_HEIGHT_PX,
 }: TimelineProps) {
   const scrollRef = useRef<HTMLDivElement | null>(null)
   // Single floating tooltip element shared by all tracks. Lives in the
@@ -172,7 +215,7 @@ export default function Timeline({
   if (localSelectionStoreRef.current === null && !selectionStore) {
     localSelectionStoreRef.current = createSelectionStore()
   }
-  const effectiveSelectionStore =
+  const effectiveSelectionStore: SelectionStoreLike =
     selectionStore ?? (localSelectionStoreRef.current as SelectionStore)
 
   // React-visible mirrors of a handful of store fields. Kept narrow so that
@@ -309,7 +352,30 @@ export default function Timeline({
     store,
     selectionStore: effectiveSelectionStore,
     bindingsStore,
+    hoveredPaneStore,
+    paneId,
   })
+
+  // Multi-trace hover gating: tell the App-level `hoveredPaneStore`
+  // when the cursor enters / leaves *this* pane's scroller. The global
+  // keydown handler in `useTimelineViewport` reads that store to decide
+  // whether to fire — so the cursor's pane is the one that responds to
+  // `Z`, `Esc`, `W/S/A/D`, etc. Wheel/scroll already route to the
+  // hovered scroller via the browser, so they don't need any explicit
+  // wiring here.
+  useEffect(() => {
+    const el = scrollRef.current
+    if (!el || !hoveredPaneStore || paneId === undefined) return
+    const onEnter = (): void => hoveredPaneStore.set(paneId)
+    const onLeave = (): void => hoveredPaneStore.clearIf(paneId)
+    el.addEventListener('pointerenter', onEnter)
+    el.addEventListener('pointerleave', onLeave)
+    return () => {
+      el.removeEventListener('pointerenter', onEnter)
+      el.removeEventListener('pointerleave', onLeave)
+      hoveredPaneStore.clearIf(paneId)
+    }
+  }, [hoveredPaneStore, paneId])
 
   // One-shot deep-link application. Fires exactly once per Timeline
   // mount:
@@ -377,13 +443,13 @@ export default function Timeline({
   }, [baseSystems, appliedPersona, systemHiddenVisible])
 
   // Precompute vertical layout with current expanded state. We reserve
-  // `TIMELINE_OVERVIEW_HEIGHT_PX + TIMELINE_AXIS_HEIGHT_PX` at the top
-  // for the sticky overview track and the sticky time ruler so the
-  // first TimelineSystem starts just below them (systems are absolutely
+  // `overviewHeightPx + TIMELINE_AXIS_HEIGHT_PX` at the top for the
+  // sticky overview track and the sticky time ruler so the first
+  // TimelineSystem starts just below them (systems are absolutely
   // positioned within the event surface by their `topPx`).
   const layout = useMemo(() => {
     const items: SystemLayout[] = []
-    let y = TIMELINE_OVERVIEW_HEIGHT_PX + TIMELINE_AXIS_HEIGHT_PX
+    let y = overviewHeightPx + TIMELINE_AXIS_HEIGHT_PX
     for (const system of effectiveSystems) {
       const sysDefaultExpanded = defaultSystemExpandedFromPersona[system.id] ?? true
       const expanded = systemExpanded[system.id] ?? sysDefaultExpanded
@@ -423,6 +489,7 @@ export default function Timeline({
     defaultSystemExpandedFromPersona,
     defaultTrackExpandedFromPersona,
     appliedPersona,
+    overviewHeightPx,
   ])
 
   const totalSpanMs = Math.max(timeline.end - timeline.start, MIN_SPAN_MS)
@@ -602,12 +669,13 @@ export default function Timeline({
           store={store}
           selectionStore={effectiveSelectionStore}
           labelWidthPx={LABEL_WIDTH_PX}
+          heightPx={overviewHeightPx}
           canvasRef={overviewCanvasRef}
         />
         <TimelineAxis
           store={store}
           labelWidthPx={LABEL_WIDTH_PX}
-          stickyTopPx={TIMELINE_OVERVIEW_HEIGHT_PX}
+          stickyTopPx={overviewHeightPx}
         />
         {visibleSystems.map(item => {
           const hiddenCount =

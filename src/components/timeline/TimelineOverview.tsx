@@ -1,10 +1,18 @@
 import {memo, useEffect, useRef, type MutableRefObject} from 'react'
 import type {OverviewBandsResult} from '../../core/render/overviewBands'
 import type {OverviewUtilization} from '../../core/render/overviewUtilization'
-import type {SelectionStore} from './selectionStore'
+import type {SelectionStoreLike} from './selectionStore'
 import type {ViewportStore} from './viewportStore'
 
 export const TIMELINE_OVERVIEW_HEIGHT_PX = 56
+/**
+ * Compact variant for the comparison view. Trades silhouette
+ * precision for vertical real estate so two stacked panes fit
+ * comfortably on a typical laptop screen. Picked empirically: 36 px
+ * still resolves the mountain shape and the zoom-window outline,
+ * but reclaims ~20 px per pane (40 px at N=2).
+ */
+export const TIMELINE_OVERVIEW_HEIGHT_COMPACT_PX = 36
 
 interface TimelineOverviewProps {
   overview: OverviewUtilization
@@ -15,8 +23,15 @@ interface TimelineOverviewProps {
    */
   bands?: OverviewBandsResult
   store: ViewportStore
-  selectionStore: SelectionStore
+  selectionStore: SelectionStoreLike
   labelWidthPx: number
+  /**
+   * Render height in CSS pixels. Defaults to
+   * {@link TIMELINE_OVERVIEW_HEIGHT_PX}; the comparison view passes
+   * {@link TIMELINE_OVERVIEW_HEIGHT_COMPACT_PX} so the two stacked
+   * panes don't double up on chrome.
+   */
+  heightPx?: number
   /**
    * Optional ref the parent can use to attach its own pointer listeners
    * (e.g. the selection hook). Kept as a raw ref instead of forwardRef
@@ -51,6 +66,7 @@ function TimelineOverviewBase({
   store,
   selectionStore,
   labelWidthPx,
+  heightPx = TIMELINE_OVERVIEW_HEIGHT_PX,
   canvasRef: externalCanvasRef,
 }: TimelineOverviewProps) {
   const internalCanvasRef = useRef<HTMLCanvasElement | null>(null)
@@ -82,7 +98,7 @@ function TimelineOverviewBase({
         state.viewportWidth - state.labelWidthPx,
       )
       if (contentWidthCss <= 0) return
-      const heightCss = TIMELINE_OVERVIEW_HEIGHT_PX
+      const heightCss = heightPx
 
       if (contentWidthCss !== lastWrapperWidthCss) {
         wrapper.style.width = `${contentWidthCss}px`
@@ -329,7 +345,7 @@ function TimelineOverviewBase({
         rafRef.current = null
       }
     }
-  }, [overview, bands, store, selectionStore])
+  }, [overview, bands, store, selectionStore, heightPx])
 
   return (
     <div
@@ -345,7 +361,7 @@ function TimelineOverviewBase({
         // TimelineSystem) so rows scroll *under* the overview instead of
         // painting on top of it at equal-z.
         zIndex: 4,
-        height: TIMELINE_OVERVIEW_HEIGHT_PX,
+        height: heightPx,
         width: '100%',
       }}
     >
@@ -359,7 +375,7 @@ function TimelineOverviewBase({
           zIndex: 1,
           flexShrink: 0,
           width: labelWidthPx,
-          height: TIMELINE_OVERVIEW_HEIGHT_PX,
+          height: heightPx,
         }}
       >
         Overview
@@ -372,7 +388,7 @@ function TimelineOverviewBase({
           left: labelWidthPx,
           top: 0,
           flexShrink: 0,
-          height: TIMELINE_OVERVIEW_HEIGHT_PX,
+          height: heightPx,
           width: 0,
           display: 'block',
         }}
@@ -384,7 +400,7 @@ function TimelineOverviewBase({
             position: 'absolute',
             left: 0,
             top: 0,
-            height: TIMELINE_OVERVIEW_HEIGHT_PX,
+            height: heightPx,
             display: 'block',
             // Left-drag on this canvas starts a time-range selection
             // (see useTimelineSelection). Pointer events stay enabled so

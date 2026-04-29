@@ -1,5 +1,5 @@
 import {useEffect, type RefObject} from 'react'
-import type {SelectionStore} from './selectionStore'
+import type {SelectionStoreLike} from './selectionStore'
 import type {ViewportStore} from './viewportStore'
 import type {InputBindingsStore} from './inputBindingsStore'
 import {matchGesture, modsFromEvent} from './inputBindings'
@@ -15,7 +15,7 @@ export interface UseTimelineSelectionOptions {
   /** The overview canvas, where any left-drag also selects. */
   overviewCanvasRef: RefObject<HTMLCanvasElement | null>
   store: ViewportStore
-  selectionStore: SelectionStore
+  selectionStore: SelectionStoreLike
   /**
    * Shared floating tooltip element. The hook shows a live duration
    * readout during drag by mutating `textContent` + `style.transform`,

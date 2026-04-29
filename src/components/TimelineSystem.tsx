@@ -2,7 +2,7 @@ import {memo} from 'react'
 import CanvasTrackRenderer from './timeline/CanvasTrackRenderer'
 import type {SystemLayout} from './Timeline'
 import type {ViewportStore} from './timeline/viewportStore'
-import type {SelectionStore} from './timeline/selectionStore'
+import type {SelectionStoreLike} from './timeline/selectionStore'
 
 interface TimelineSystemProps {
   layout: SystemLayout
@@ -15,7 +15,7 @@ interface TimelineSystemProps {
    * they can pick up the tree-highlight region for the hovered/selected
    * slice without re-rendering through React on every pointer move.
    */
-  selectionStore: SelectionStore
+  selectionStore: SelectionStoreLike
   /** Number of tracks the active persona hid by default for this system. */
   hiddenTrackCount?: number
   /** Whether those hidden tracks are currently revealed. */

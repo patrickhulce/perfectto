@@ -1,10 +1,10 @@
 import {memo, useEffect, useRef} from 'react'
-import type {SelectionStore} from './selectionStore'
+import type {SelectionStoreLike} from './selectionStore'
 import type {ViewportStore} from './viewportStore'
 
 interface SelectionOverlayProps {
   store: ViewportStore
-  selectionStore: SelectionStore
+  selectionStore: SelectionStoreLike
   labelWidthPx: number
   /**
    * Total height of the scroll content surface, so the overlay spans

@@ -2,7 +2,7 @@ import {useEffect, type RefObject} from 'react'
 import type {Track as TrackModel} from '../../core'
 import {hitTestTrack} from './hitTest'
 import {ROW_HEIGHT} from './trackLayout'
-import type {SelectionStore} from './selectionStore'
+import type {SelectionStoreLike} from './selectionStore'
 import type {ViewportStore} from './viewportStore'
 
 /**
@@ -45,12 +45,15 @@ export interface UseTimelineHoverOptions {
    */
   tooltipRef: RefObject<HTMLElement | null>
   /**
-   * Selection store. We publish the hovered slice into it so every
-   * track canvas can subscribe and repaint the (slice + descendants)
-   * subtree opaque while dimming everything else. Also read to suppress
-   * the tooltip during an active drag-selection.
+   * Selection store (or a pane-scoped view of the global one). We
+   * publish the hovered slice into it so every track canvas can
+   * subscribe and repaint the (slice + descendants) subtree opaque
+   * while dimming everything else. Also read to suppress the tooltip
+   * during an active drag-selection. In multi-trace comparison view
+   * the parent passes a `PaneSelectionView`, which auto-tags every
+   * write with the owning pane id.
    */
-  selectionStore: SelectionStore
+  selectionStore: SelectionStoreLike
 }
 
 /**

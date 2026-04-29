@@ -60,7 +60,7 @@ export default function ParseProgressView({
   const etaText = useEta({bytesTotal, bytesRead, phase, startedAt})
 
   return (
-    <div className="flex min-h-screen flex-col items-center justify-center p-8">
+    <div className="flex min-h-0 flex-1 flex-col items-center justify-center p-8">
       <h1 className="mb-2 bg-gradient-to-br from-[#667eea] to-[#764ba2] bg-clip-text text-4xl font-bold text-transparent">
         Perfectto
       </h1>

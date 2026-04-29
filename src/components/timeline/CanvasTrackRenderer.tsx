@@ -7,7 +7,7 @@ import {
 } from '../../core/render/sliceBuffers'
 import {drawFrame, drawHighlightFrame, type HighlightRegion} from './canvas2d'
 import type {ViewportStore} from './viewportStore'
-import type {SelectionStore} from './selectionStore'
+import type {SelectionStoreLike} from './selectionStore'
 import {ROW_HEIGHT} from './trackLayout'
 import {isSkirtEnabled} from './skirtFlag'
 import {computeAxisTicks} from './timeAxis'
@@ -23,7 +23,7 @@ interface CanvasTrackRendererProps {
    * slice; both are scoped by `trackId` so a hover/click on one track
    * doesn't cause every other track to repaint.
    */
-  selectionStore: SelectionStore
+  selectionStore: SelectionStoreLike
   onToggle?: () => void
   expanded: boolean
 }

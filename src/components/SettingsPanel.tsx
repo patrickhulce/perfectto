@@ -335,7 +335,7 @@ export default function SettingsPanel({
   )
 }
 
-/** Inline cog icon used by the trigger button in `Metadata`. */
+/** Inline cog icon used by the trigger button in `AppHeader`. */
 export function SettingsCog({
   onClick,
   title,

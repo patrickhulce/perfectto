@@ -1,12 +1,27 @@
 import {useCallback, useEffect, useMemo, useRef, useState} from 'react'
 import type {CompactionReport, Timeline} from '../core'
-import type {SelectionState, SelectionStore} from './timeline/selectionStore'
+import type {SelectionState, SelectionStoreLike} from './timeline/selectionStore'
 import {
   hasCallstackSelection,
   resolveCallstack,
   type CallstackFrame,
   type ResolvedCallstack,
 } from './timeline/callstack'
+
+/**
+ * Per-pane lookup record passed in by the App so the Aggregator can
+ * resolve the selection's owning pane in multi-trace comparison view.
+ * When the Aggregator is mounted in single-pane mode, callers can keep
+ * passing `timeline` directly and skip `panes` entirely.
+ */
+export interface AggregatorPaneInfo {
+  /** Pane id, matching the `paneId` written into the SelectionStore. */
+  id: string
+  /** Display name shown next to the readout (e.g. the trace filename). */
+  name: string
+  /** Parsed timeline, used to resolve the sticky selectedSlice. */
+  timeline: Timeline
+}
 
 interface AggregatorProps {
   /**
@@ -15,17 +30,30 @@ interface AggregatorProps {
    * the selected range + duration. When absent, falls back to the
    * original placeholder text.
    */
-  selectionStore?: SelectionStore
+  selectionStore?: SelectionStoreLike
   /**
    * Parsed trace timeline. Needed so the panel can resolve the sticky
    * `selectedSlice` back to its `Track` / `Measure` and reconstruct the
    * ancestor chain for callstack display. Optional so standalone /
    * smoke uses of the component keep working.
+   *
+   * Mutually exclusive with {@link panes}: in single-pane mode, pass
+   * `timeline`; in multi-pane mode, pass `panes` and the Aggregator
+   * resolves the active timeline by `selectionStore.paneId`.
    */
   timeline?: Timeline
+  /**
+   * Multi-pane lookup. When non-empty, the Aggregator resolves the
+   * timeline via `panes.find(p => p.id === selection.paneId)?.timeline`
+   * instead of the bare `timeline` prop, and tags the readout with
+   * `from <name>` so users can tell which trace the duration /
+   * callstack refers to.
+   */
+  panes?: readonly AggregatorPaneInfo[]
 }
 
 const INITIAL_STATE: SelectionState = {
+  paneId: null,
   committed: null,
   inProgress: null,
   selectedSlice: null,
@@ -72,7 +100,11 @@ function clampHeight(px: number): number {
  *    sampler, …) — anything a parser tags as `{kind: 'callsite'}` renders
  *    here.
  */
-export default function Aggregator({selectionStore, timeline}: AggregatorProps) {
+export default function Aggregator({
+  selectionStore,
+  timeline,
+  panes,
+}: AggregatorProps) {
   const [state, setState] = useState<SelectionState>(
     () => selectionStore?.get() ?? INITIAL_STATE,
   )
@@ -83,15 +115,25 @@ export default function Aggregator({selectionStore, timeline}: AggregatorProps) 
     return selectionStore.subscribe(next => setState(next))
   }, [selectionStore])
 
+  // In multi-pane mode, the active pane is whichever owns the current
+  // selection. Falls back to the legacy `timeline` prop when no pane
+  // lookup is provided (single-pane mode keeps working unchanged).
+  const activePane = useMemo<AggregatorPaneInfo | null>(() => {
+    if (!panes || panes.length === 0) return null
+    if (state.paneId === null) return null
+    return panes.find(p => p.id === state.paneId) ?? null
+  }, [panes, state.paneId])
+  const activeTimeline: Timeline | undefined = activePane?.timeline ?? timeline
+
   const range = state.committed
   const durationMs = range ? range.endMs - range.startMs : null
 
   const resolved: ResolvedCallstack = useMemo(() => {
-    if (!timeline) {
+    if (!activeTimeline) {
       return {track: null, frames: [], leafIndex: -1}
     }
-    return resolveCallstack(timeline, state.selectedSlice)
-  }, [timeline, state.selectedSlice])
+    return resolveCallstack(activeTimeline, state.selectedSlice)
+  }, [activeTimeline, state.selectedSlice])
 
   const showCallstack = hasCallstackSelection(resolved)
 
@@ -175,6 +217,15 @@ export default function Aggregator({selectionStore, timeline}: AggregatorProps) 
         <div className="flex items-baseline justify-between">
           <h3 className="text-sm font-semibold uppercase tracking-wide text-[#a0aec0]">
             Aggregator
+            {activePane && (
+              <span
+                className="ml-2 normal-case tracking-normal text-[10px] font-normal text-[#718096]"
+                data-testid="aggregator-active-pane"
+                title={`Selection is from ${activePane.name}`}
+              >
+                from <span className="text-[#a0aec0]">{activePane.name}</span>
+              </span>
+            )}
           </h3>
           {range && (
             <span className="text-[10px] uppercase tracking-wide text-[#718096]">

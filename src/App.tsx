@@ -1,29 +1,44 @@
-import { useEffect, useRef, useState, type DragEvent, type ReactNode } from 'react'
-import ParseProgressView from './components/ParseProgressView'
+import {
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type DragEvent,
+  type ReactNode,
+} from 'react'
+import Aggregator, {type AggregatorPaneInfo} from './components/Aggregator'
+import AppHeader from './components/AppHeader'
 import Splash from './components/Splash'
-import TraceViewer from './components/TraceViewer'
-import { type ParseProgress, type ParsedTrace } from './core'
-import { loadFile } from './core/utils/loadFile'
-import { parseTraceInWorker } from './orchestration'
+import TracePane, {type ParsingState} from './components/TracePane'
+import {type ParseErrorState} from './components/ParseErrorView'
+import {
+  BUILTIN_PERSONAS,
+  detectPersona,
+  type ParseProgress,
+  type ParsedTrace,
+} from './core'
+import {loadFile} from './core/utils/loadFile'
+import {parseTraceInWorker} from './orchestration'
+import {createSelectionStore} from './components/timeline/selectionStore'
+import {createHoveredPaneStore} from './components/timeline/hoveredPaneStore'
+import {
+  createInputBindingsStore,
+  type InputBindingsStore,
+} from './components/timeline/inputBindingsStore'
 
-interface ParsingState {
-  name: string
-  /**
-   * Denominator for the progress bar. For gzipped inputs this is the
-   * uncompressed payload size (read from the ISIZE trailer at load
-   * time); for plain files it's the file size. Lined up with the
-   * worker's decompressed-bytes counter.
-   */
-  bytesTotal: number
-  progress: ParseProgress
-  startedAt: number
-  controller: AbortController
-}
-
-interface ParseErrorState {
-  name: string
-  message: string
-  detail?: string
+/**
+ * One trace's worth of state inside the App-level panes array. Each
+ * pane independently tracks its own load lifecycle (parsing → loaded
+ * or parsing → errored) so an in-flight parse on pane B never blanks
+ * out a fully-loaded pane A. The `id` is stable across replace /
+ * reorder so React keys + the `selectionStore.paneId` ownership
+ * mechanism stay aligned.
+ */
+interface Pane {
+  id: string
+  trace: ParsedTrace | null
+  parsing: ParsingState | null
+  parseError: ParseErrorState | null
 }
 
 const DEFAULT_AUTOLOAD_NAME = 'perfecto-chrome-trace'
@@ -32,88 +47,276 @@ const DEFAULT_AUTOLOAD_NAME = 'perfecto-chrome-trace'
 // truncate. 4 GiB is well above what any reasonable Chrome / DevTools
 // trace produces (a 60-second renderer trace at peak detail is ~1.5
 // GiB uncompressed) and well below the point where a single browser
-// tab will OOM on the structured-clone payload. Drag-dropping a
-// runaway file (a 50 GiB Linux ftrace by mistake) hits this cap and
-// the user gets a partial flame chart instead of a hung tab.
+// tab will OOM on the structured-clone payload.
 const PARSE_MAX_BYTES = 4 * 1024 * 1024 * 1024
 
-export default function App() {
-  const [trace, setTrace] = useState<ParsedTrace | null>(null)
-  // Bumped on every successful trace load. Used as the React key for
-  // `TraceViewer` so a drag-drop replacement re-mounts the entire
-  // viewer subtree — which is the only way to consistently reset
-  // persona auto-detection, selection state, and the timeline
-  // viewport. Without this, `useState(detectedPersona.id)` inside
-  // `TraceViewer` would carry the previous trace's persona forward.
-  const [traceLoadId, setTraceLoadId] = useState(0)
-  const [parsing, setParsing] = useState<ParsingState | null>(null)
-  const [parseError, setParseError] = useState<ParseErrorState | null>(null)
-  const [isDragging, setIsDragging] = useState(false)
-  // Latest parsing controller, accessible from the drop handler without
-  // re-creating it on every state change. Lets a drop mid-parse abort
-  // the in-flight worker before kicking off the replacement parse.
-  const parsingRef = useRef<ParsingState | null>(null)
-  parsingRef.current = parsing
+/**
+ * Drop-zone hit-test geometry for the multi-pane comparison view.
+ * The center rectangle wraps "replace all", with the rest of the top
+ * half = prepend and the rest of the bottom half = append. Sized at
+ * 40% × 30% so the center reads as a clearly-bounded inset target
+ * without being so small that the user has to aim for it precisely.
+ *
+ * Constants live here so {@link hitTestDropZone} and the visual
+ * overlay below paint the exact same geometry — any future tuning
+ * happens in one place.
+ */
+const CENTER_WIDTH_FRACTION = 0.4
+const CENTER_HEIGHT_FRACTION = 0.3
 
-  const runParse = async (file: File): Promise<void> => {
-    setParseError(null)
-    const loaded = await loadFile(file)
+/**
+ * Drop intent resolved from cursor position.
+ *
+ *  - `'first'`: the first ever pane on this app session. Used by the
+ *    splash callback and by drag-overs while `panes.length === 0`.
+ *  - `'top'` / `'bottom'`: the user dropped in the upper or lower
+ *    half. The action `runParse` actually takes depends on
+ *    `panes.length` — see the switch below for the routing rules.
+ *  - `'center'`: the inset rectangle. Always wipes every pane and
+ *    replaces them with the new file.
+ */
+type DropTarget = 'first' | 'top' | 'bottom' | 'center'
+
+/**
+ * App-wide input-bindings store. Created lazily once and kept at
+ * module scope because a user's preferred matrix shouldn't reset
+ * when they load a new trace.
+ */
+let sharedInputBindingsStore: InputBindingsStore | null = null
+function getBindingsStore(): InputBindingsStore {
+  if (sharedInputBindingsStore === null) {
+    sharedInputBindingsStore = createInputBindingsStore()
+  }
+  return sharedInputBindingsStore
+}
+
+let nextPaneIdCounter = 0
+function makePaneId(): string {
+  // Monotonically increasing string keeps React keys + selection
+  // store ownership stable. Reset would only happen on a full page
+  // reload, which is fine.
+  nextPaneIdCounter += 1
+  return `pane-${nextPaneIdCounter}`
+}
+
+/**
+ * Resolve a drop position to its target zone. Center rectangle wins
+ * (so a drop dead-center is `'center'` even though it's also
+ * technically in the top half by the y-only test); outside the
+ * center rectangle the y midline splits top vs bottom.
+ */
+function hitTestDropZone(
+  clientX: number,
+  clientY: number,
+  viewportWidth: number,
+  viewportHeight: number,
+): 'top' | 'bottom' | 'center' {
+  const cw = viewportWidth * CENTER_WIDTH_FRACTION
+  const ch = viewportHeight * CENTER_HEIGHT_FRACTION
+  const cx0 = (viewportWidth - cw) / 2
+  const cx1 = cx0 + cw
+  const cy0 = (viewportHeight - ch) / 2
+  const cy1 = cy0 + ch
+  const inCenter =
+    clientX >= cx0 && clientX <= cx1 && clientY >= cy0 && clientY <= cy1
+  if (inCenter) return 'center'
+  return clientY < viewportHeight / 2 ? 'top' : 'bottom'
+}
+
+export default function App() {
+  const [panes, setPanes] = useState<Pane[]>([])
+  // Mirror to refs so async callbacks (parse handlers) read the
+  // latest value without re-subscribing every render.
+  const panesRef = useRef(panes)
+  panesRef.current = panes
+
+  /**
+   * Globally-active persona id. Seeded from the first pane to ever
+   * finish loading (auto-detect against that trace). Subsequent
+   * loads don't re-seed — once the user has a picked persona they
+   * own it; comparing two traces under different personas wouldn't
+   * make sense anyway, the whole point is one shared lens.
+   */
+  const [activePersonaId, setActivePersonaId] = useState<string | null>(null)
+
+  // Global stores. Created once per App mount. Each TracePane wraps
+  // `selectionStore` in a per-pane view internally.
+  const selectionStore = useMemo(() => createSelectionStore(), [])
+  const hoveredPaneStore = useMemo(() => createHoveredPaneStore(), [])
+  const bindingsStore = getBindingsStore()
+
+  // Drop-zone UI state. `dropTarget` is the zone the cursor is
+  // currently over while a drag is active; rendered as a highlighted
+  // region in the overlay so the user can see where their drop will
+  // land before they release.
+  const [isDragging, setIsDragging] = useState(false)
+  const [dropTarget, setDropTarget] = useState<DropTarget | null>(null)
+
+  /**
+   * Run a parse against a target action. Allocates a new pane id,
+   * inserts it into `panes` per the target, then walks through
+   * load → parse → trace transition for that pane only. Other panes
+   * keep their state untouched (one in-flight parse never blanks
+   * another pane's loaded trace).
+   */
+  const runParse = async (file: File, target: DropTarget): Promise<void> => {
+    const prevPanes = panesRef.current
+    // Abort any in-flight parse on the panes that are about to be
+    // displaced. Replace-all (`'center'` and the `'first'` initial
+    // load) clears every pane; `'top'`/`'bottom'` only clear their
+    // slot when we're already at the N=2 cap and replacing in
+    // place. Without this the abandoned controllers would race the
+    // new parse and could write stale state into panes that no
+    // longer exist.
+    const abortIds = new Set<string>()
+    if (target === 'center' || target === 'first') {
+      for (const p of prevPanes) abortIds.add(p.id)
+    } else if (target === 'top' && prevPanes.length === 2) {
+      abortIds.add(prevPanes[0].id)
+    } else if (target === 'bottom' && prevPanes.length === 2) {
+      abortIds.add(prevPanes[1].id)
+    }
+    for (const p of prevPanes) {
+      if (abortIds.has(p.id)) p.parsing?.controller.abort()
+    }
+
+    const newPaneId = makePaneId()
+    const newPane: Pane = {
+      id: newPaneId,
+      trace: null,
+      parsing: null,
+      parseError: null,
+    }
+    setPanes(prev => {
+      switch (target) {
+        case 'first':
+          return [newPane]
+        case 'center':
+          return [newPane]
+        case 'top':
+          // 0 panes → seed; 1 pane → prepend (becomes [new, old]);
+          // 2 panes → replace pane[0] in place, keep pane[1].
+          if (prev.length === 0) return [newPane]
+          if (prev.length === 1) return [newPane, ...prev]
+          return [newPane, prev[1]]
+        case 'bottom':
+          // 0 panes → seed; 1 pane → append (becomes [old, new]);
+          // 2 panes → replace pane[1] in place, keep pane[0].
+          if (prev.length === 0) return [newPane]
+          if (prev.length === 1) return [...prev, newPane]
+          return [prev[0], newPane]
+      }
+    })
+
+    let loaded
+    try {
+      loaded = await loadFile(file)
+    } catch (err) {
+      const asErr = err instanceof Error ? err : new Error(String(err))
+      setPanes(prev =>
+        prev.map(p =>
+          p.id === newPaneId
+            ? {
+                ...p,
+                parsing: null,
+                parseError: {
+                  name: file.name,
+                  message: asErr.message || 'Trace load failed',
+                  detail:
+                    asErr.name && asErr.name !== 'Error' ? asErr.name : undefined,
+                },
+              }
+            : p,
+        ),
+      )
+      return
+    }
+
     const controller = new AbortController()
-    const initial: ParseProgress = {
+    const initialProgress: ParseProgress = {
       streamIndex: 0,
       bytesRead: 0,
       phase: 'parsing',
     }
-    setParsing({
+    const parsing: ParsingState = {
       name: loaded.name,
       bytesTotal: loaded.uncompressedSize ?? loaded.size,
-      progress: initial,
+      progress: initialProgress,
       startedAt: Date.now(),
       controller,
-    })
+    }
+    setPanes(prev =>
+      prev.map(p => (p.id === newPaneId ? {...p, parsing} : p)),
+    )
 
     try {
       const parsed = await parseTraceInWorker(
         loaded.stream,
-        { name: loaded.name, size: loaded.size },
+        {name: loaded.name, size: loaded.size},
         {
           signal: controller.signal,
           maxBytes: PARSE_MAX_BYTES,
-          onProgress: (p) =>
-            setParsing((prev) => (prev ? { ...prev, progress: p } : prev)),
+          onProgress: progress => {
+            setPanes(prev =>
+              prev.map(p =>
+                p.id === newPaneId && p.parsing
+                  ? {...p, parsing: {...p.parsing, progress}}
+                  : p,
+              ),
+            )
+          },
         },
       )
-      setTrace(parsed)
-      setTraceLoadId((n) => n + 1)
+      setPanes(prev =>
+        prev.map(p =>
+          p.id === newPaneId
+            ? {...p, trace: parsed, parsing: null, parseError: null}
+            : p,
+        ),
+      )
+      // Persona seeding: only fire on the very first successfully
+      // loaded trace anywhere. Subsequent panes inherit whatever
+      // persona the user is on.
+      setActivePersonaId(prev =>
+        prev !== null ? prev : detectPersona(parsed).id,
+      )
     } catch (err) {
-      // Silence user-initiated aborts; surface every other failure mode
-      // as a visible error state instead of re-throwing into React (which
-      // leaves the splash mounted but invisible under the default error
-      // boundary).
-      if ((err as { name?: string } | null)?.name === 'AbortError') return
+      // User-initiated abort: drop the pane silently and let panes
+      // collapse back to splash if it was the only one. Matches the
+      // legacy single-trace "cancel mid-parse → splash" UX.
+      if ((err as {name?: string} | null)?.name === 'AbortError') {
+        setPanes(prev => prev.filter(p => p.id !== newPaneId))
+        return
+      }
       const asErr = err instanceof Error ? err : new Error(String(err))
-      setParseError({
-        name: loaded.name,
-        message: asErr.message || 'Trace parsing failed',
-        detail: asErr.name && asErr.name !== 'Error' ? asErr.name : undefined,
-      })
-    } finally {
-      setParsing(null)
+      setPanes(prev =>
+        prev.map(p =>
+          p.id === newPaneId
+            ? {
+                ...p,
+                parsing: null,
+                parseError: {
+                  name: loaded.name,
+                  message: asErr.message || 'Trace parsing failed',
+                  detail:
+                    asErr.name && asErr.name !== 'Error' ? asErr.name : undefined,
+                },
+              }
+            : p,
+        ),
+      )
     }
   }
 
-  const handleFileSelected = async (file: File) => {
-    await runParse(file)
+  // Splash → first pane. Identical effect to a top/bottom drop with
+  // no panes, but exposed as a callback for the file-input click
+  // path that can't synthesize a drag event.
+  const handleSplashFile = (file: File): void => {
+    void runParse(file, 'first')
   }
 
-  // Dev-only autoload: fetch a checked-in asset on mount so iterating
-  // on the viewer doesn't require re-picking the sample trace each
-  // reload. Gated on `process.env.NODE_ENV === 'development'` — Vite
-  // statically replaces this at build time so production bundles get a
-  // `false` branch that tree-shakes out; Jest keeps its own
-  // `NODE_ENV === 'test'` so tests also skip autoload. Override via
-  // `?autoload=<name>` (reads `/assets/<name>.json`) or disable with
-  // `?autoload=off`.
+  // Dev-only autoload (unchanged from the legacy flow). Skipped in
+  // production via `process.env.NODE_ENV` and in jest via NODE_ENV.
   const autoloadStarted = useRef(false)
   useEffect(() => {
     if (process.env.NODE_ENV !== 'development') return
@@ -136,75 +339,156 @@ export default function App() {
           return
         }
         const blob = await response.blob()
-        const file = new File([blob], fileName, { type: 'application/json' })
-        await handleFileSelected(file)
+        const file = new File([blob], fileName, {type: 'application/json'})
+        await runParse(file, 'first')
       } catch (err) {
         console.warn('[autoload] failed', err)
       }
     })()
+    // Effect runs once on mount; runParse is not in deps because we
+    // intentionally only fire the autoload when there's nothing
+    // else loaded yet.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
-  // Page-wide drop target: the user can drop a trace anywhere to
-  // replace whatever's currently on screen (splash, in-flight parse,
-  // loaded viewer, or error view). Splash keeps its own dashed-box
-  // affordance for click-to-browse but no longer owns drop handling
-  // — that's now a single source of truth here.
-  const handleDragOver = (e: DragEvent<HTMLDivElement>) => {
+  // Page-wide drop target. Pulls cursor coords off the event so the
+  // hit-test mirrors what the overlay highlight is showing.
+  const handleDragOver = (e: DragEvent<HTMLDivElement>): void => {
     if (!Array.from(e.dataTransfer.types).includes('Files')) return
     e.preventDefault()
     if (!isDragging) setIsDragging(true)
+    if (panesRef.current.length === 0) {
+      setDropTarget('first')
+      return
+    }
+    const target = hitTestDropZone(
+      e.clientX,
+      e.clientY,
+      window.innerWidth,
+      window.innerHeight,
+    )
+    setDropTarget(target)
   }
 
-  const handleDragLeave = (e: DragEvent<HTMLDivElement>) => {
+  const handleDragLeave = (e: DragEvent<HTMLDivElement>): void => {
     if (e.currentTarget.contains(e.relatedTarget as Node | null)) return
     setIsDragging(false)
+    setDropTarget(null)
   }
 
-  const handleDrop = (e: DragEvent<HTMLDivElement>) => {
+  const handleDrop = (e: DragEvent<HTMLDivElement>): void => {
     e.preventDefault()
     setIsDragging(false)
+    setDropTarget(null)
     const file = e.dataTransfer.files[0]
     if (!file) return
-    const inflight = parsingRef.current
-    if (inflight) inflight.controller.abort()
-    void runParse(file)
+    let target: DropTarget
+    if (panesRef.current.length === 0) {
+      target = 'first'
+    } else {
+      target = hitTestDropZone(
+        e.clientX,
+        e.clientY,
+        window.innerWidth,
+        window.innerHeight,
+      )
+    }
+    void runParse(file, target)
   }
 
-  // Priority: an in-flight parse always wins, even if a previous
-  // trace is still in `trace`, so a drop-on-existing-trace transitions
-  // through the same Splash → Progress → Viewer flow as the initial
-  // load. Errors come next so a failed replacement surfaces instead
-  // of silently keeping the stale viewer up. Falling back to `trace`
-  // when none of those are set means dismissing an error after a
-  // failed replacement returns to the previously loaded trace.
+  const handleClosePane = (paneId: string): void => {
+    const pane = panesRef.current.find(p => p.id === paneId)
+    pane?.parsing?.controller.abort()
+    setPanes(prev => prev.filter(p => p.id !== paneId))
+  }
+
+  const handleCancelParse = (paneId: string): void => {
+    const pane = panesRef.current.find(p => p.id === paneId)
+    pane?.parsing?.controller.abort()
+    // The runParse error handler removes the pane on AbortError, so
+    // we don't need to also set state here.
+  }
+
+  const handleDismissError = (paneId: string): void => {
+    setPanes(prev => prev.filter(p => p.id !== paneId))
+  }
+
+  // Pane lookup for the global Aggregator. Only panes with a loaded
+  // trace are eligible — one mid-parse can't be the active selection
+  // owner because there's no Timeline mounted yet to write into the
+  // store.
+  const aggregatorPanes = useMemo<AggregatorPaneInfo[]>(() => {
+    const out: AggregatorPaneInfo[] = []
+    for (const p of panes) {
+      if (p.trace) {
+        out.push({id: p.id, name: p.trace.source.name, timeline: p.trace.timeline})
+      }
+    }
+    return out
+  }, [panes])
+
+  // Detected-persona id for the global picker's `(auto)` tag. We
+  // intentionally pull from the *first loaded* pane only — the
+  // picker affordance is a single label, and rotating it on every
+  // additional drop would be more confusing than helpful when the
+  // user is comparing two traces with possibly-different best-fit
+  // personas. Matches the existing "first load seeds activePersonaId"
+  // contract.
+  const detectedPersonaId = useMemo<string | undefined>(() => {
+    const firstLoaded = aggregatorPanes[0]
+    if (!firstLoaded) return undefined
+    const pane = panes.find(p => p.id === firstLoaded.id)
+    return pane?.trace ? detectPersona(pane.trace).id : undefined
+  }, [aggregatorPanes, panes])
+
+  // Closing all panes returns to the splash. Wired into AppHeader's
+  // back button.
+  const handleBackToSplash = (): void => {
+    for (const p of panesRef.current) {
+      p.parsing?.controller.abort()
+    }
+    setPanes([])
+  }
+
   let body: ReactNode
-  if (parsing) {
-    body = (
-      <ParseProgressView
-        name={parsing.name}
-        bytesTotal={parsing.bytesTotal}
-        progress={parsing.progress}
-        startedAt={parsing.startedAt}
-        onCancel={() => parsing.controller.abort()}
-      />
-    )
-  } else if (parseError) {
-    body = (
-      <ParseErrorView
-        error={parseError}
-        onDismiss={() => setParseError(null)}
-      />
-    )
-  } else if (trace) {
-    body = (
-      <TraceViewer
-        key={traceLoadId}
-        trace={trace}
-        onBack={() => setTrace(null)}
-      />
-    )
+  if (panes.length === 0) {
+    body = <Splash onFileSelected={handleSplashFile} />
   } else {
-    body = <Splash onFileSelected={handleFileSelected} />
+    body = (
+      <>
+        <AppHeader
+          panes={aggregatorPanes}
+          onBack={handleBackToSplash}
+          personas={BUILTIN_PERSONAS}
+          activePersonaId={activePersonaId ?? detectedPersonaId}
+          detectedPersonaId={detectedPersonaId}
+          onPersonaChange={setActivePersonaId}
+          bindingsStore={bindingsStore}
+        />
+        {panes.map((pane, idx) => (
+          <TracePane
+            key={pane.id}
+            paneId={pane.id}
+            trace={pane.trace}
+            parsing={pane.parsing}
+            parseError={pane.parseError}
+            selectionStore={selectionStore}
+            bindingsStore={bindingsStore}
+            hoveredPaneStore={hoveredPaneStore}
+            activePersonaId={activePersonaId}
+            consumeUrlParams={idx === 0}
+            onCancelParse={() => handleCancelParse(pane.id)}
+            onDismissError={() => handleDismissError(pane.id)}
+            onClose={() => handleClosePane(pane.id)}
+            compactOverview={panes.length >= 2}
+          />
+        ))}
+        <Aggregator
+          selectionStore={selectionStore}
+          panes={aggregatorPanes}
+        />
+      </>
+    )
   }
 
   return (
@@ -212,80 +496,129 @@ export default function App() {
       onDragOver={handleDragOver}
       onDragLeave={handleDragLeave}
       onDrop={handleDrop}
-      className="relative flex min-h-screen flex-col"
+      className="relative flex h-screen min-h-0 flex-col"
     >
       {body}
       {isDragging && (
-        <div
-          aria-hidden
-          className="pointer-events-none fixed inset-0 z-50 flex items-center justify-center bg-[rgba(15,17,23,0.6)] backdrop-blur-sm"
-        >
-          <div className="m-6 flex h-[calc(100%-3rem)] w-[calc(100%-3rem)] items-center justify-center rounded-2xl border-[3px] border-dashed border-[#667eea] bg-[rgba(102,126,234,0.07)]">
-            <p className="text-2xl font-semibold text-[#e2e8f0]">
-              Drop to {trace ? 'replace trace' : 'load trace'}
-            </p>
-          </div>
-        </div>
+        <DropOverlay target={dropTarget} paneCount={panes.length} />
       )}
     </div>
   )
 }
 
+interface DropOverlayProps {
+  target: DropTarget | null
+  paneCount: number
+}
+
 /**
- * Rendered when `parseTraceInWorker` rejects with anything other than
- * an `AbortError`. Surfaces the worker's error message + a retry/back
- * path so an OOM, unexpected trace format, or parse bug doesn't leave
- * the user on an unrecoverable blank page.
+ * Translucent visual that shows the user where their drop will land.
+ *
+ *  - With no panes loaded: a single full-page dashed box (matches the
+ *    legacy splash drop affordance).
+ *  - With one pane loaded: top = "Add to top", bottom = "Add to
+ *    bottom", center = "Replace all".
+ *  - With two panes loaded (the cap): top = "Replace top", bottom =
+ *    "Replace bottom" (slot replacement instead of stacking past
+ *    N=2), center = "Replace all".
+ *
+ * Geometry comes from {@link CENTER_WIDTH_FRACTION} /
+ * {@link CENTER_HEIGHT_FRACTION} so what's painted matches what
+ * `hitTestDropZone` resolves on drop.
  */
-function ParseErrorView({
-  error,
-  onDismiss,
-}: {
-  error: ParseErrorState
-  onDismiss: () => void
-}) {
+function DropOverlay({target, paneCount}: DropOverlayProps) {
+  if (paneCount === 0) {
+    return (
+      <div
+        aria-hidden
+        className="pointer-events-none fixed inset-0 z-50 flex items-center justify-center bg-[rgba(15,17,23,0.6)] backdrop-blur-sm"
+      >
+        <div className="m-6 flex h-[calc(100%-3rem)] w-[calc(100%-3rem)] items-center justify-center rounded-2xl border-[3px] border-dashed border-[#667eea] bg-[rgba(102,126,234,0.07)]">
+          <p className="text-2xl font-semibold text-[#e2e8f0]">Drop to load trace</p>
+        </div>
+      </div>
+    )
+  }
+  const centerW = `${CENTER_WIDTH_FRACTION * 100}%`
+  const centerH = `${CENTER_HEIGHT_FRACTION * 100}%`
+  // At N=2 the slot already exists so a top/bottom drop replaces in
+  // place; at N=1 it adds a new slot above/below the current one.
+  const topLabel = paneCount >= 2 ? 'Replace top' : 'Add to top'
+  const bottomLabel = paneCount >= 2 ? 'Replace bottom' : 'Add to bottom'
   return (
-    <div className="flex min-h-screen flex-col items-center justify-center p-8">
-      <div className="flex w-full max-w-[640px] flex-col gap-5 rounded-2xl border border-[#fc8181]/60 bg-[rgba(252,129,129,0.06)] p-8">
-        <h1 className="text-2xl font-semibold text-[#fc8181]">
-          Couldn&apos;t parse that trace
-        </h1>
-        <div>
-          <p className="truncate text-sm text-[#a0aec0]" title={error.name}>
-            {error.name}
-          </p>
-          <p className="mt-2 text-sm text-[#e2e8f0]">{error.message}</p>
-          {error.detail && (
-            <p className="mt-2 text-xs uppercase tracking-wider text-[#718096]">
-              {error.detail}
-            </p>
-          )}
-        </div>
-        <ul className="list-disc space-y-1 pl-5 text-xs text-[#a0aec0]">
-          <li>
-            If the file is over ~2 GB, try the Chrome DevTools sample-rate knob or
-            pre-split the trace before loading.
-          </li>
-          <li>
-            Gzipped traces (`.gz`, or any file whose first two bytes are
-            `1f 8b`) are decompressed automatically; other archive
-            wrappers (`.zip`, `.tar.gz`) need to be unpacked first.
-          </li>
-          <li>
-            Browser worker OOMs surface here; closing other tabs can free the
-            headroom we need.
-          </li>
-        </ul>
-        <div className="flex justify-end gap-2">
-          <button
-            type="button"
-            onClick={onDismiss}
-            className="cursor-pointer rounded-lg border border-[#4a5568] bg-transparent px-4 py-1.5 text-sm text-[#a0aec0] transition-colors hover:border-[#667eea] hover:text-[#667eea]"
-          >
-            Try another file
-          </button>
-        </div>
+    <div
+      aria-hidden
+      data-testid="drop-overlay"
+      className="pointer-events-none fixed inset-0 z-50 bg-[rgba(15,17,23,0.4)] backdrop-blur-[2px]"
+    >
+      <div
+        data-testid="drop-zone-top"
+        data-active={target === 'top' ? 'true' : undefined}
+        className={
+          'absolute left-0 right-0 top-0 flex h-1/2 items-center justify-center border-2 border-dashed transition-colors ' +
+          (target === 'top'
+            ? 'border-[#667eea] bg-[rgba(102,126,234,0.18)]'
+            : 'border-[#2d3748] bg-transparent')
+        }
+      >
+        <p
+          className={
+            'text-lg font-semibold ' +
+            (target === 'top' ? 'text-[#e2e8f0]' : 'text-[#4a5568]')
+          }
+        >
+          {topLabel}
+        </p>
+      </div>
+      <div
+        data-testid="drop-zone-bottom"
+        data-active={target === 'bottom' ? 'true' : undefined}
+        className={
+          'absolute bottom-0 left-0 right-0 flex h-1/2 items-center justify-center border-2 border-dashed transition-colors ' +
+          (target === 'bottom'
+            ? 'border-[#667eea] bg-[rgba(102,126,234,0.18)]'
+            : 'border-[#2d3748] bg-transparent')
+        }
+      >
+        <p
+          className={
+            'text-lg font-semibold ' +
+            (target === 'bottom' ? 'text-[#e2e8f0]' : 'text-[#4a5568]')
+          }
+        >
+          {bottomLabel}
+        </p>
+      </div>
+      {/* Concentric center rectangle for "replace all". Sits above
+          the two half-strips so its highlighted edges read clearly.
+          The center rectangle's pointer events stay disabled (parent
+          set), but its highlight wins visually when hit. */}
+      <div
+        data-testid="drop-zone-center"
+        data-active={target === 'center' ? 'true' : undefined}
+        className={
+          'absolute flex items-center justify-center rounded-2xl border-[3px] border-dashed transition-colors ' +
+          (target === 'center'
+            ? 'border-[#667eea] bg-[rgba(102,126,234,0.28)]'
+            : 'border-[#4a5568] bg-[rgba(15,17,23,0.5)]')
+        }
+        style={{
+          width: centerW,
+          height: centerH,
+          left: `calc(50% - (${centerW} / 2))`,
+          top: `calc(50% - (${centerH} / 2))`,
+        }}
+      >
+        <p
+          className={
+            'text-lg font-semibold ' +
+            (target === 'center' ? 'text-[#e2e8f0]' : 'text-[#a0aec0]')
+          }
+        >
+          Replace all
+        </p>
       </div>
     </div>
   )
 }
+

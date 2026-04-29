@@ -1,7 +1,8 @@
 import {useEffect, useRef, useState, type RefObject} from 'react'
 import {ViewportStore} from './viewportStore'
-import type {SelectionStore} from './selectionStore'
+import type {SelectionStoreLike} from './selectionStore'
 import type {InputBindingsStore} from './inputBindingsStore'
+import type {HoveredPaneStore} from './hoveredPaneStore'
 import {
   matchGesture,
   modsFromEvent,
@@ -38,13 +39,27 @@ export interface UseTimelineZoomOptions {
    * for backwards compatibility with tests that don't render the
    * selection UI.
    */
-  selectionStore?: SelectionStore
+  selectionStore?: SelectionStoreLike
   /**
    * Input-binding store that drives which gesture triggers which
    * action. Optional so tests (and any future minimal usage) can fall
    * back to the historical hardcoded behavior.
    */
   bindingsStore?: InputBindingsStore
+  /**
+   * Hovered-pane store. When provided alongside a `paneId`, the
+   * window-level keydown handler only dispatches when the cursor is
+   * actually inside *this* pane's scroller. In multi-trace comparison
+   * view that's how `Z`, `Esc`, `W/S/A/D` etc. avoid firing on every
+   * pane simultaneously. When omitted, the handler runs unconditionally
+   * (legacy single-pane behavior).
+   */
+  hoveredPaneStore?: HoveredPaneStore
+  /**
+   * Owning pane id, paired with `hoveredPaneStore`. Required for the
+   * hover-gating to do anything; optional otherwise.
+   */
+  paneId?: string
 }
 
 export interface UseTimelineZoomResult {
@@ -137,6 +152,8 @@ export function useTimelineZoom(
     store,
     selectionStore,
     bindingsStore,
+    hoveredPaneStore,
+    paneId,
   } = options
 
   const totalSpan = Math.max(bounds.end - bounds.start, MIN_SPAN_MS)
@@ -178,6 +195,10 @@ export function useTimelineZoom(
   selectionStoreRef.current = selectionStore
   const bindingsStoreRef = useRef(bindingsStore)
   bindingsStoreRef.current = bindingsStore
+  const hoveredPaneStoreRef = useRef(hoveredPaneStore)
+  hoveredPaneStoreRef.current = hoveredPaneStore
+  const paneIdRef = useRef(paneId)
+  paneIdRef.current = paneId
 
   // Keep the store's pxPerMs / labelWidthPx / bounds in sync with props even
   // outside a gesture (e.g. after the window resizes and fitPxPerMs changes).
@@ -877,6 +898,18 @@ export function useTimelineZoom(
     const onKeyDown = (e: KeyboardEvent): void => {
       const bs = bindingsStoreRef.current
       if (!bs) return
+      // Multi-trace gating: every Timeline mounts its own
+      // window-level `keydown` listener, so without this check N panes
+      // would each fire `Z` / `Esc` / pan keys on the same press. When
+      // a `hoveredPaneStore` + `paneId` are both wired, this hook only
+      // runs when the cursor is inside *its* scroller. Cursor over the
+      // Aggregator (or off-page) → no pane responds, which beats
+      // dispatching to an arbitrary pane. Single-pane mode (no
+      // hoveredPaneStore) skips the gate entirely so behavior is
+      // unchanged.
+      const hps = hoveredPaneStoreRef.current
+      const myPaneId = paneIdRef.current
+      if (hps && myPaneId !== undefined && hps.get() !== myPaneId) return
       // Gate out typing in real inputs so rebinding 'w' to something
       // doesn't hijack every W keypress in the app.
       const active = document.activeElement as HTMLElement | null

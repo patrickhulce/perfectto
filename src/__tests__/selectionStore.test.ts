@@ -1,4 +1,5 @@
 import {
+  createPaneSelectionView,
   createSelectionStore,
   type SelectionState,
   type SliceRef,
@@ -84,5 +85,106 @@ describe('SelectionStore slice selection', () => {
     s.commit()
     expect(s.get().committed).toEqual({startMs: 0, endMs: 5})
     expect(s.get().selectedSlice).toEqual(slice('t1', 0, 10, 0))
+  })
+})
+
+describe('SelectionStore paneId ownership', () => {
+  it('starts with paneId null and does not change for untagged writes', () => {
+    const s = createSelectionStore()
+    expect(s.get().paneId).toBeNull()
+    s.setSelectedSlice(slice('t1', 0, 10, 0))
+    expect(s.get().paneId).toBeNull()
+  })
+
+  it('a tagged write claims ownership for the originating pane', () => {
+    const s = createSelectionStore()
+    s.setSelectedSlice(slice('t1', 0, 10, 0), 'pane-A')
+    expect(s.get().paneId).toBe('pane-A')
+    expect(s.get().selectedSlice).toEqual(slice('t1', 0, 10, 0))
+  })
+
+  it('cross-pane non-null write resets the previous owner s slots before applying', () => {
+    const s = createSelectionStore()
+    // pane-A claims selection (committed range + slice).
+    s.setCommitted({startMs: 0, endMs: 100}, 'pane-A')
+    s.setSelectedSlice(slice('t1', 0, 10, 0), 'pane-A')
+    expect(s.get().paneId).toBe('pane-A')
+
+    // pane-B starts hovering — should wipe pane-A s state since only one
+    // pane is allowed to show highlights at a time.
+    s.setHoveredSlice(slice('t2', 5, 7, 0), 'pane-B')
+    const state = s.get()
+    expect(state.paneId).toBe('pane-B')
+    expect(state.hoveredSlice).toEqual(slice('t2', 5, 7, 0))
+    expect(state.committed).toBeNull()
+    expect(state.selectedSlice).toBeNull()
+  })
+
+  it('null writes do not change ownership', () => {
+    const s = createSelectionStore()
+    s.setSelectedSlice(slice('t1', 0, 10, 0), 'pane-A')
+    s.setHoveredSlice(null, 'pane-B')
+    // Ownership stays with pane-A since the null write was just a clear.
+    expect(s.get().paneId).toBe('pane-A')
+    expect(s.get().selectedSlice).toEqual(slice('t1', 0, 10, 0))
+  })
+
+  it('ownership clears when every slot is empty again', () => {
+    const s = createSelectionStore()
+    s.setSelectedSlice(slice('t1', 0, 10, 0), 'pane-A')
+    expect(s.get().paneId).toBe('pane-A')
+    s.setSelectedSlice(null, 'pane-A')
+    expect(s.get().paneId).toBeNull()
+  })
+})
+
+describe('PaneSelectionView (per-pane wrapper)', () => {
+  it('filters reads when a different pane owns the global state', () => {
+    const global = createSelectionStore()
+    const viewA = createPaneSelectionView(global, 'pane-A')
+    const viewB = createPaneSelectionView(global, 'pane-B')
+
+    viewA.setSelectedSlice(slice('t1', 0, 10, 0))
+    expect(viewA.get().selectedSlice).toEqual(slice('t1', 0, 10, 0))
+    // From pane-B s perspective the store looks empty even though
+    // pane-A wrote into it.
+    expect(viewB.get().selectedSlice).toBeNull()
+    expect(viewB.get().paneId).toBeNull()
+  })
+
+  it('subscribers see consistent filtered state across cross-pane flips', () => {
+    const global = createSelectionStore()
+    const viewA = createPaneSelectionView(global, 'pane-A')
+    const seen: SelectionState[] = []
+    viewA.subscribe(state => seen.push(state))
+
+    viewA.setSelectedSlice(slice('t1', 0, 10, 0))
+    const viewB = createPaneSelectionView(global, 'pane-B')
+    viewB.setSelectedSlice(slice('t2', 5, 15, 0))
+
+    // pane-A first sees its own slice, then sees its filtered view
+    // collapse to empty when pane-B takes over.
+    expect(seen.length).toBeGreaterThanOrEqual(2)
+    expect(seen[0].selectedSlice).toEqual(slice('t1', 0, 10, 0))
+    const last = seen[seen.length - 1]
+    expect(last.selectedSlice).toBeNull()
+    expect(last.paneId).toBeNull()
+  })
+
+  it('cancel/commit/clear no-op when the global store is owned by a different pane', () => {
+    const global = createSelectionStore()
+    const viewA = createPaneSelectionView(global, 'pane-A')
+    const viewB = createPaneSelectionView(global, 'pane-B')
+
+    viewA.setInProgress({anchorMs: 0, startMs: 0, endMs: 5})
+    expect(global.get().inProgress).toEqual({anchorMs: 0, startMs: 0, endMs: 5})
+
+    // pane-B trying to cancel pane-A s drag must not actually clear it.
+    viewB.cancel()
+    expect(global.get().inProgress).toEqual({anchorMs: 0, startMs: 0, endMs: 5})
+
+    // pane-A s own cancel works.
+    viewA.cancel()
+    expect(global.get().inProgress).toBeNull()
   })
 })

@@ -3,7 +3,7 @@ import path from 'node:path'
 
 import {act, fireEvent, render, screen} from '@testing-library/react'
 
-import Metadata from '../components/Metadata'
+import TracePaneHeader from '../components/TracePaneHeader'
 import {parseTrace} from '../core/parser'
 import type {
   CompactionReport,
@@ -603,12 +603,12 @@ describe('zipCompactedTrace + parseTrace roundtrip', () => {
   })
 })
 
-describe('Metadata download button', () => {
+describe('TracePaneHeader download button', () => {
   it('renders nothing when onDownload is omitted', () => {
     render(
-      <Metadata
+      <TracePaneHeader
         source={{name: 'foo.json', size: 0}}
-        onBack={() => {}}
+        onClose={() => {}}
       />,
     )
     expect(screen.queryByTestId('metadata-download-button')).toBeNull()
@@ -623,9 +623,9 @@ describe('Metadata download button', () => {
         }),
     )
     render(
-      <Metadata
+      <TracePaneHeader
         source={{name: 'foo.json', size: 0}}
-        onBack={() => {}}
+        onClose={() => {}}
         onDownload={onDownload}
       />,
     )
