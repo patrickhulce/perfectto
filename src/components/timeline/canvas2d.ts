@@ -95,6 +95,8 @@ export interface HighlightRegion {
   endMs: number
   /** Inclusive minimum depth; the anchor's own depth. */
   minDepth: number
+  /** Mirrored comparison highlights get an outline so they read as passive. */
+  style?: 'normal' | 'mirrored'
 }
 
 /** Vertical padding inside a row (mirrors the old DOM renderer). */
@@ -462,6 +464,7 @@ export function drawFrame(args: DrawFrameArgs): void {
       ctx.fillText(text, item.x + LABEL_PAD_PX, item.y)
     }
   }
+
 }
 
 /**
@@ -654,6 +657,20 @@ export function drawHighlightFrame(args: DrawHighlightFrameArgs): void {
       if (text.length === 0) continue
       ctx.fillText(text, item.x + LABEL_PAD_PX, item.y)
     }
+  }
+
+  for (let r = 0; r < regionsRaw.length; r++) {
+    if (regionsRaw[r].style !== 'mirrored') continue
+    const region = regionsRaw[r]
+    const x = (region.startMs - canvasStartMs) * pxPerMs
+    const w = Math.max(1, (region.endMs - region.startMs) * pxPerMs)
+    const y = region.minDepth * rowHeight + ROW_VPAD_PX / 2
+    ctx.save()
+    ctx.strokeStyle = 'rgba(255, 255, 255, 0.9)'
+    ctx.lineWidth = 1.5
+    ctx.setLineDash([4, 3])
+    ctx.strokeRect(x + 0.75, y + 0.75, Math.max(0, w - 1.5), rowH - 1.5)
+    ctx.restore()
   }
 }
 

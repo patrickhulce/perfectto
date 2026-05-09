@@ -8,6 +8,7 @@ import {
 import {drawFrame, drawHighlightFrame, type HighlightRegion} from './canvas2d'
 import type {ViewportStore} from './viewportStore'
 import type {SelectionStoreLike} from './selectionStore'
+import type {ComparisonMatcher} from './comparisonMatcher'
 import {ROW_HEIGHT} from './trackLayout'
 import {isSkirtEnabled} from './skirtFlag'
 import {computeAxisTicks} from './timeAxis'
@@ -24,6 +25,7 @@ interface CanvasTrackRendererProps {
    * doesn't cause every other track to repaint.
    */
   selectionStore: SelectionStoreLike
+  comparisonMatcher?: ComparisonMatcher | null
   onToggle?: () => void
   expanded: boolean
 }
@@ -117,6 +119,7 @@ function CanvasTrackRendererBase({
   labelWidthPx,
   store,
   selectionStore,
+  comparisonMatcher,
   onToggle,
   expanded,
 }: CanvasTrackRendererProps) {
@@ -184,6 +187,32 @@ function CanvasTrackRendererBase({
           out.push({startMs: hov.startMs, endMs: hov.endMs, minDepth: hov.depth})
         }
       }
+      const foreign = comparisonMatcher ? selectionStore.getForeign() : null
+      if (foreign && comparisonMatcher) {
+        const pushMirrored = (slice: typeof foreign.hoveredSlice): void => {
+          if (!slice) return
+          const foreignMeasure = comparisonMatcher.resolveForeignMeasure(slice)
+          if (!foreignMeasure) return
+          const match = comparisonMatcher.matcher.findMatch(foreignMeasure, slice.trackId)
+          if (!match || match.trackId !== track.id) return
+          const dupe = out.some(
+            r =>
+              r.startMs === match.measure.start &&
+              r.endMs === match.measure.end &&
+              r.minDepth === match.depth,
+          )
+          if (!dupe) {
+            out.push({
+              startMs: match.measure.start,
+              endMs: match.measure.end,
+              minDepth: match.depth,
+              style: 'mirrored',
+            })
+          }
+        }
+        pushMirrored(foreign.selectedSlice)
+        pushMirrored(foreign.hoveredSlice)
+      }
       return out
     }
 
@@ -193,7 +222,7 @@ function CanvasTrackRendererBase({
       for (let i = 0; i < regions.length; i++) {
         const r = regions[i]
         if (i > 0) key += '!'
-        key += `${r.startMs}|${r.endMs}|${r.minDepth}`
+        key += `${r.startMs}|${r.endMs}|${r.minDepth}|${r.style ?? 'normal'}`
       }
       return key
     }
@@ -517,7 +546,7 @@ function CanvasTrackRendererBase({
         rafRef.current = null
       }
     }
-  }, [track, store, selectionStore, heightPx, expanded])
+  }, [track, store, selectionStore, comparisonMatcher, heightPx, expanded])
 
   const canToggle = !!onToggle
   // Screen-reader summary for the gutter button. The canvas is non-

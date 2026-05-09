@@ -3,6 +3,7 @@ import CanvasTrackRenderer from './timeline/CanvasTrackRenderer'
 import type {SystemLayout} from './Timeline'
 import type {ViewportStore} from './timeline/viewportStore'
 import type {SelectionStoreLike} from './timeline/selectionStore'
+import type {ComparisonMatcher} from './timeline/comparisonMatcher'
 
 interface TimelineSystemProps {
   layout: SystemLayout
@@ -16,6 +17,7 @@ interface TimelineSystemProps {
    * slice without re-rendering through React on every pointer move.
    */
   selectionStore: SelectionStoreLike
+  comparisonMatcher?: ComparisonMatcher | null
   /** Number of tracks the active persona hid by default for this system. */
   hiddenTrackCount?: number
   /** Whether those hidden tracks are currently revealed. */
@@ -32,6 +34,7 @@ function TimelineSystem({
   viewportBottomPx,
   store,
   selectionStore,
+  comparisonMatcher,
   hiddenTrackCount = 0,
   hiddenTracksShown = false,
   onToggle,
@@ -108,6 +111,7 @@ function TimelineSystem({
                 labelWidthPx={labelWidthPx}
                 store={store}
                 selectionStore={selectionStore}
+                comparisonMatcher={comparisonMatcher}
                 expanded={tl.expanded}
                 onToggle={tl.canExpand ? () => onToggleTrack(tl.track.id) : undefined}
               />

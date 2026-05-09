@@ -16,6 +16,8 @@ import {
 } from './timeline/selectionStore'
 import type {InputBindingsStore} from './timeline/inputBindingsStore'
 import type {HoveredPaneStore} from './timeline/hoveredPaneStore'
+import type {LinkedViewportStore} from './timeline/linkedViewportStore'
+import type {ComparisonMatcher} from './timeline/comparisonMatcher'
 import TimelineAxis, {TIMELINE_AXIS_HEIGHT_PX} from './timeline/TimelineAxis'
 import TimelineOverview, {
   TIMELINE_OVERVIEW_HEIGHT_PX,
@@ -79,6 +81,10 @@ interface TimelineProps {
    * `paneId` and only dispatches when this pane is currently hovered.
    */
   hoveredPaneStore?: HoveredPaneStore
+  /** Shared viewport link used only in multi-trace comparison mode. */
+  linkedViewportStore?: LinkedViewportStore | null
+  /** Derived cross-pane matcher used to paint passive comparison highlights. */
+  comparisonMatcher?: ComparisonMatcher | null
   /**
    * Optional height (CSS px) for the sticky overview band. Defaults
    * to {@link TIMELINE_OVERVIEW_HEIGHT_PX}. The comparison view
@@ -179,6 +185,8 @@ export default function Timeline({
   initialSelectedSlice,
   paneId,
   hoveredPaneStore,
+  linkedViewportStore,
+  comparisonMatcher,
   overviewHeightPx = TIMELINE_OVERVIEW_HEIGHT_PX,
 }: TimelineProps) {
   const scrollRef = useRef<HTMLDivElement | null>(null)
@@ -353,6 +361,7 @@ export default function Timeline({
     selectionStore: effectiveSelectionStore,
     bindingsStore,
     hoveredPaneStore,
+    linkedViewportStore,
     paneId,
   })
 
@@ -689,6 +698,7 @@ export default function Timeline({
               viewportBottomPx={visibleBottom}
               store={store}
               selectionStore={effectiveSelectionStore}
+              comparisonMatcher={comparisonMatcher}
               hiddenTrackCount={hiddenCount}
               hiddenTracksShown={systemHiddenVisible[item.system.id] === true}
               onToggle={() => toggleSystem(item.system.id)}

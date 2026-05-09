@@ -85,6 +85,12 @@ export interface SelectionState {
   hoveredSlice: SliceRef | null
 }
 
+export interface ForeignSelectionState {
+  paneId: string
+  selectedSlice: SliceRef | null
+  hoveredSlice: SliceRef | null
+}
+
 export type SelectionListener = (state: SelectionState) => void
 
 /**
@@ -97,6 +103,7 @@ export type SelectionListener = (state: SelectionState) => void
  */
 export interface SelectionStoreLike {
   get(): SelectionState
+  getForeign(): ForeignSelectionState | null
   subscribe(fn: SelectionListener): () => void
   setInProgress(next: InProgressSelection | null, paneId?: string | null): void
   setCommitted(next: SelectionRange | null, paneId?: string | null): void
@@ -133,6 +140,10 @@ export class SelectionStore implements SelectionStoreLike {
 
   get(): SelectionState {
     return this.state
+  }
+
+  getForeign(): ForeignSelectionState | null {
+    return null
   }
 
   setInProgress(next: InProgressSelection | null, paneId?: string | null): void {
@@ -336,16 +347,29 @@ export class PaneSelectionView implements SelectionStoreLike {
     return s
   }
 
+  getForeign(): ForeignSelectionState | null {
+    const s = this.global.get()
+    if (s.paneId === null || s.paneId === this.paneId) return null
+    return {
+      paneId: s.paneId,
+      selectedSlice: s.selectedSlice,
+      hoveredSlice: s.hoveredSlice,
+    }
+  }
+
   subscribe(fn: SelectionListener): () => void {
     let lastEmitted: SelectionState = this.get()
+    let lastForeignKey = foreignKey(this.getForeign())
     return this.global.subscribe(() => {
       const next = this.get()
+      const nextForeignKey = foreignKey(this.getForeign())
       // Suppress emission when the filtered state is identical to what
       // we last broadcast — flips between "owned by other pane" and
       // "still owned by other pane" both look like the empty state, no
       // sense waking subscribers up.
-      if (next === lastEmitted) return
+      if (next === lastEmitted && nextForeignKey === lastForeignKey) return
       lastEmitted = next
+      lastForeignKey = nextForeignKey
       fn(next)
     })
   }
@@ -418,4 +442,14 @@ function slicesEqual(
     a.depth === b.depth &&
     a.measureId === b.measureId
   )
+}
+
+function foreignKey(s: ForeignSelectionState | null): string {
+  if (!s) return ''
+  return `${s.paneId}|${sliceKey(s.selectedSlice)}|${sliceKey(s.hoveredSlice)}`
+}
+
+function sliceKey(s: SliceRef | null): string {
+  if (!s) return ''
+  return `${s.trackId}:${s.startMs}:${s.endMs}:${s.depth}:${s.measureId ?? ''}`
 }

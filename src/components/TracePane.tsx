@@ -25,6 +25,8 @@ import {
 } from './timeline/selectionStore'
 import type {InputBindingsStore} from './timeline/inputBindingsStore'
 import type {HoveredPaneStore} from './timeline/hoveredPaneStore'
+import type {LinkedViewportStore} from './timeline/linkedViewportStore'
+import type {ComparisonMatcher} from './timeline/comparisonMatcher'
 import {
   parseTimelineUrlParams,
   resolveInitialSelection,
@@ -67,6 +69,8 @@ export interface TracePaneProps {
   selectionStore: SelectionStore
   bindingsStore: InputBindingsStore
   hoveredPaneStore: HoveredPaneStore
+  linkedViewportStore: LinkedViewportStore | null
+  comparisonMatcher: ComparisonMatcher | null
   /**
    * Active persona id (global across panes). Each pane runs
    * auto-detection against its own trace and applies the persona
@@ -122,6 +126,8 @@ export default function TracePane({
   selectionStore,
   bindingsStore,
   hoveredPaneStore,
+  linkedViewportStore,
+  comparisonMatcher,
   activePersonaId,
   consumeUrlParams,
   onCancelParse,
@@ -234,6 +240,8 @@ export default function TracePane({
         initialSelectedSlice={initial.initialSelectedSlice}
         paneId={paneId}
         hoveredPaneStore={hoveredPaneStore}
+        linkedViewportStore={linkedViewportStore}
+        comparisonMatcher={comparisonMatcher}
         overviewHeightPx={
           compactOverview
             ? TIMELINE_OVERVIEW_HEIGHT_COMPACT_PX

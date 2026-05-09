@@ -16,7 +16,10 @@ import {
   detectPersona,
   type ParseProgress,
   type ParsedTrace,
+  type Measure,
+  type Timeline,
 } from './core'
+import {SearchMatcher} from './core/matcher'
 import {
   suggestExportFilename,
   zipCompactedTrace,
@@ -24,8 +27,13 @@ import {
 import {triggerDownload} from './components/downloadTrace'
 import {loadFile} from './core/utils/loadFile'
 import {parseTraceInWorker} from './orchestration'
-import {createSelectionStore} from './components/timeline/selectionStore'
+import {
+  createSelectionStore,
+  type SliceRef,
+} from './components/timeline/selectionStore'
 import {createHoveredPaneStore} from './components/timeline/hoveredPaneStore'
+import {createLinkedViewportStore} from './components/timeline/linkedViewportStore'
+import type {ComparisonMatcher} from './components/timeline/comparisonMatcher'
 import {
   createInputBindingsStore,
   type InputBindingsStore,
@@ -104,6 +112,39 @@ function makePaneId(): string {
   return `pane-${nextPaneIdCounter}`
 }
 
+function createMeasureResolver(timeline: Timeline): (slice: SliceRef) => Measure | null {
+  const byId = new Map<string, Measure>()
+  const byTrack = new Map<string, Measure[]>()
+  for (const system of timeline.systems) {
+    for (const track of system.tracks) {
+      const measures: Measure[] = []
+      byTrack.set(track.id, measures)
+      const walk = (items: readonly Measure[]): void => {
+        for (const measure of items) {
+          byId.set(measure.id, measure)
+          measures.push(measure)
+          walk(measure.measures)
+        }
+      }
+      walk(track.measures)
+    }
+  }
+  return slice => {
+    if (slice.measureId) {
+      const exact = byId.get(slice.measureId)
+      if (exact) return exact
+    }
+    const measures = byTrack.get(slice.trackId) ?? []
+    return (
+      measures.find(
+        m =>
+          Math.abs(m.start - slice.startMs) < 1e-4 &&
+          Math.abs(m.end - slice.endMs) < 1e-4,
+      ) ?? null
+    )
+  }
+}
+
 /**
  * Resolve a drop position to its target zone. Center rectangle wins
  * (so a drop dead-center is `'center'` even though it's also
@@ -148,6 +189,7 @@ export default function App() {
   // `selectionStore` in a per-pane view internally.
   const selectionStore = useMemo(() => createSelectionStore(), [])
   const hoveredPaneStore = useMemo(() => createHoveredPaneStore(), [])
+  const linkedViewportStore = useMemo(() => createLinkedViewportStore(), [])
   const bindingsStore = getBindingsStore()
 
   // Drop-zone UI state. `dropTarget` is the zone the cursor is
@@ -432,6 +474,24 @@ export default function App() {
     return out
   }, [panes])
 
+  const comparisonMatchers = useMemo<Map<string, ComparisonMatcher>>(() => {
+    const out = new Map<string, ComparisonMatcher>()
+    if (panes.length !== 2) return out
+    const [a, b] = panes
+    if (!a.trace || !b.trace) return out
+    const resolveA = createMeasureResolver(a.trace.timeline)
+    const resolveB = createMeasureResolver(b.trace.timeline)
+    out.set(a.id, {
+      matcher: new SearchMatcher(b.trace, a.trace),
+      resolveForeignMeasure: resolveB,
+    })
+    out.set(b.id, {
+      matcher: new SearchMatcher(a.trace, b.trace),
+      resolveForeignMeasure: resolveA,
+    })
+    return out
+  }, [panes])
+
   // Detected-persona id for the global picker's `(auto)` tag. We
   // intentionally pull from the *first loaded* pane only — the
   // picker affordance is a single label, and rotating it on every
@@ -501,6 +561,8 @@ export default function App() {
             selectionStore={selectionStore}
             bindingsStore={bindingsStore}
             hoveredPaneStore={hoveredPaneStore}
+            linkedViewportStore={panes.length >= 2 ? linkedViewportStore : null}
+            comparisonMatcher={comparisonMatchers.get(pane.id) ?? null}
             activePersonaId={activePersonaId}
             consumeUrlParams={idx === 0}
             onCancelParse={() => handleCancelParse(pane.id)}

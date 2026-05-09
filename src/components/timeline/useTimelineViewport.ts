@@ -3,6 +3,7 @@ import {ViewportStore} from './viewportStore'
 import type {SelectionStoreLike} from './selectionStore'
 import type {InputBindingsStore} from './inputBindingsStore'
 import type {HoveredPaneStore} from './hoveredPaneStore'
+import type {LinkedViewportStore} from './linkedViewportStore'
 import {
   matchGesture,
   modsFromEvent,
@@ -55,6 +56,8 @@ export interface UseTimelineZoomOptions {
    * (legacy single-pane behavior).
    */
   hoveredPaneStore?: HoveredPaneStore
+  /** Optional compare-mode viewport link. Middle-drag pans intentionally skip it. */
+  linkedViewportStore?: LinkedViewportStore | null
   /**
    * Owning pane id, paired with `hoveredPaneStore`. Required for the
    * hover-gating to do anything; optional otherwise.
@@ -117,6 +120,19 @@ function clampPxPerMs(
   return Math.max(lo, Math.min(hi, value))
 }
 
+function clampScrollLeft(
+  value: number,
+  scroller: HTMLElement,
+  labelWidthPx: number,
+  totalSpanMs: number,
+  pxPerMs: number,
+): number {
+  const innerWidthPx = labelWidthPx + totalSpanMs * pxPerMs
+  const maxScrollLeft = Math.max(0, innerWidthPx - scroller.clientWidth)
+  if (!Number.isFinite(value)) return 0
+  return Math.max(0, Math.min(maxScrollLeft, value))
+}
+
 /**
  * Zoom + pan controller for the canvas-based timeline.
  *
@@ -153,6 +169,7 @@ export function useTimelineZoom(
     selectionStore,
     bindingsStore,
     hoveredPaneStore,
+    linkedViewportStore,
     paneId,
   } = options
 
@@ -197,6 +214,8 @@ export function useTimelineZoom(
   bindingsStoreRef.current = bindingsStore
   const hoveredPaneStoreRef = useRef(hoveredPaneStore)
   hoveredPaneStoreRef.current = hoveredPaneStore
+  const linkedViewportStoreRef = useRef(linkedViewportStore)
+  linkedViewportStoreRef.current = linkedViewportStore
   const paneIdRef = useRef(paneId)
   paneIdRef.current = paneId
 
@@ -223,6 +242,48 @@ export function useTimelineZoom(
   const zoomToRangeRef = useRef<((startMs: number, endMs: number) => void) | null>(null)
 
   useEffect(() => {
+    const link = linkedViewportStore
+    if (!link || paneId === undefined) return
+    let lastAppliedEpoch = 0
+    return link.subscribe(next => {
+      if (next.sourcePaneId === paneId || next.epoch <= lastAppliedEpoch) return
+      const scroller = scrollerRef.current
+      if (!scroller) return
+      lastAppliedEpoch = next.epoch
+      const span = Math.max(boundsRef.current.end - boundsRef.current.start, MIN_SPAN_MS)
+      const targetPxPerMs = clampPxPerMs(
+        next.pxPerMs,
+        span,
+        fitPxPerMsRef.current,
+      )
+      const labelWidth = labelWidthRef.current
+      const targetScrollLeft = clampScrollLeft(
+        (next.startMs - boundsRef.current.start) * targetPxPerMs,
+        scroller,
+        labelWidth,
+        span,
+        targetPxPerMs,
+      )
+      const surfaceEl = eventEl
+      const nextInnerWidthPx = labelWidth + span * targetPxPerMs
+      if (
+        surfaceEl &&
+        (surfaceEl.style.width === '' ||
+          parseFloat(surfaceEl.style.width) < nextInnerWidthPx)
+      ) {
+        surfaceEl.style.width = `${nextInnerWidthPx}px`
+      }
+      pxPerMsRef.current = targetPxPerMs
+      scroller.scrollLeft = targetScrollLeft
+      setPxPerMsOverride(targetPxPerMs)
+      storeRef.current.set({
+        pxPerMs: targetPxPerMs,
+        scrollLeft: targetScrollLeft,
+      })
+    })
+  }, [linkedViewportStore, paneId, scrollerRef, eventEl])
+
+  useEffect(() => {
     const el = eventEl
     if (!el) return
 
@@ -233,6 +294,36 @@ export function useTimelineZoom(
     // `trackpadDetect.ts` for the rationale — browsers synthesise
     // `ctrlKey=true` on wheel events during a pinch gesture.
     const ctrlTracker = createCtrlTracker()
+
+    const publishLinkedViewport = (): void => {
+      const link = linkedViewportStoreRef.current
+      const myPaneId = paneIdRef.current
+      const scroller = scrollerRef.current
+      if (!link || myPaneId === undefined || !scroller) return
+      const px = pxPerMsRef.current
+      if (px <= 0) return
+      link.publish({
+        sourcePaneId: myPaneId,
+        pxPerMs: px,
+        startMs: boundsRef.current.start + storeRef.current.get().scrollLeft / px,
+      })
+    }
+
+    const publishLinkedViewportAfterNativeScroll = (): void => {
+      requestAnimationFrame(() => {
+        const scroller = scrollerRef.current
+        if (!scroller) return
+        const stored = storeRef.current.get()
+        const scrollLeft =
+          Math.abs(scroller.scrollLeft - stored.scrollLeft) < 1
+            ? stored.scrollLeft
+            : scroller.scrollLeft
+        const px = pxPerMsRef.current
+        if (px <= 0) return
+        storeRef.current.set({scrollLeft})
+        publishLinkedViewport()
+      })
+    }
 
     /**
      * Resolve the action bound to a non-key gesture with the given
@@ -263,7 +354,11 @@ export function useTimelineZoom(
      * scrollLeft, bumps React state (so the inner surface width updates),
      * and publishes the new viewport snapshot.
      */
-    const applyZoom = (deltaY: number, anchorClientX: number): void => {
+    const applyZoom = (
+      deltaY: number,
+      anchorClientX: number,
+      publishLinked = false,
+    ): void => {
       const scroller = scrollerRef.current
       if (!scroller) return
       const span = Math.max(
@@ -343,6 +438,7 @@ export function useTimelineZoom(
         pxPerMs: targetPxPerMs,
         scrollLeft: targetScrollLeft,
       })
+      if (publishLinked) publishLinkedViewport()
     }
 
     const WHEEL_NUDGE_STEP_PX = 60
@@ -358,13 +454,14 @@ export function useTimelineZoom(
       const kind = classifyWheel(e, ctrlTracker.isCtrlDown())
       if (kind === 'trackpad-pinch') {
         e.preventDefault()
-        applyZoom(e.deltaY, e.clientX)
+        applyZoom(e.deltaY, e.clientX, true)
         return
       }
       if (kind === 'trackpad-scroll') {
         // Let the native scroller handle both axes — don't
         // preventDefault. The matrix only covers `wheel`, not trackpad
         // two-finger scrolls.
+        publishLinkedViewportAfterNativeScroll()
         return
       }
 
@@ -377,12 +474,13 @@ export function useTimelineZoom(
       switch (action) {
         case 'viewport.scrollZoom':
           e.preventDefault()
-          applyZoom(dominantDelta, e.clientX)
+          applyZoom(dominantDelta, e.clientX, true)
           return
         case 'viewport.scrollHorizontal':
         case 'viewport.panHorizontal':
           e.preventDefault()
           scroller.scrollLeft += dominantDelta
+          publishLinkedViewportAfterNativeScroll()
           return
         case 'viewport.scrollVertical':
         case 'viewport.panVertical':
@@ -392,19 +490,21 @@ export function useTimelineZoom(
           return
         case 'viewport.nudgeIn':
           e.preventDefault()
-          applyZoom(-KEY_ZOOM_DELTA_Y, e.clientX)
+          applyZoom(-KEY_ZOOM_DELTA_Y, e.clientX, true)
           return
         case 'viewport.nudgeOut':
           e.preventDefault()
-          applyZoom(KEY_ZOOM_DELTA_Y, e.clientX)
+          applyZoom(KEY_ZOOM_DELTA_Y, e.clientX, true)
           return
         case 'viewport.nudgeLeft':
           e.preventDefault()
           scroller.scrollLeft -= WHEEL_NUDGE_STEP_PX
+          publishLinkedViewportAfterNativeScroll()
           return
         case 'viewport.nudgeRight':
           e.preventDefault()
           scroller.scrollLeft += WHEEL_NUDGE_STEP_PX
+          publishLinkedViewportAfterNativeScroll()
           return
         default:
           // 'none' or selection actions — nothing sensible to do with
@@ -441,7 +541,7 @@ export function useTimelineZoom(
       const deltaY = -Math.log(ratio) / 0.0015
       gestureStartScale = scale
       const anchorX = ge.clientX ?? gestureStartClientX
-      applyZoom(deltaY, anchorX)
+      applyZoom(deltaY, anchorX, true)
     }
     const onGestureEnd = (e: Event): void => {
       e.preventDefault()
@@ -522,16 +622,16 @@ export function useTimelineZoom(
       switch (action) {
         case 'viewport.scrollZoom':
         case 'viewport.nudgeIn':
-          applyZoom(-KEY_ZOOM_DELTA_Y, clientX)
+          applyZoom(-KEY_ZOOM_DELTA_Y, clientX, true)
           return
         case 'viewport.nudgeOut':
-          applyZoom(KEY_ZOOM_DELTA_Y, clientX)
+          applyZoom(KEY_ZOOM_DELTA_Y, clientX, true)
           return
         case 'selection.zoomToSelection': {
           const sel = selectionStoreRef.current
           const committed = sel?.get().committed
           if (committed && committed.endMs > committed.startMs) {
-            zoomToRange(committed.startMs, committed.endMs)
+            zoomToRange(committed.startMs, committed.endMs, true)
           }
           return
         }
@@ -753,10 +853,11 @@ export function useTimelineZoom(
       return rect.left + rect.width / 2
     }
 
-    const keyboardPan = (deltaPx: number): void => {
+    const keyboardPan = (deltaPx: number, publishLinked = false): void => {
       const scroller = scrollerRef.current
       if (!scroller) return
       scroller.scrollLeft += deltaPx
+      if (publishLinked) publishLinkedViewportAfterNativeScroll()
     }
 
     /**
@@ -766,7 +867,11 @@ export function useTimelineZoom(
      * Leaves the committed selection in place so the user can press `Z`
      * repeatedly without losing their anchor.
      */
-    const zoomToRange = (startMs: number, endMs: number): void => {
+    const zoomToRange = (
+      startMs: number,
+      endMs: number,
+      publishLinked = false,
+    ): void => {
       const scroller = scrollerRef.current
       if (!scroller) return
       const span = Math.max(endMs - startMs, MIN_SPAN_MS)
@@ -809,6 +914,7 @@ export function useTimelineZoom(
         pxPerMs: targetPxPerMs,
         scrollLeft: targetScrollLeft,
       })
+      if (publishLinked) publishLinkedViewport()
     }
 
     /**
@@ -834,29 +940,29 @@ export function useTimelineZoom(
     const dispatchKeyAction = (action: Action): boolean => {
       switch (action) {
         case 'viewport.nudgeIn':
-          applyZoom(-KEY_ZOOM_DELTA_Y * KEYBOARD_NAV_SCALE, resolveZoomAnchor())
+          applyZoom(-KEY_ZOOM_DELTA_Y * KEYBOARD_NAV_SCALE, resolveZoomAnchor(), true)
           return true
         case 'viewport.nudgeOut':
-          applyZoom(KEY_ZOOM_DELTA_Y * KEYBOARD_NAV_SCALE, resolveZoomAnchor())
+          applyZoom(KEY_ZOOM_DELTA_Y * KEYBOARD_NAV_SCALE, resolveZoomAnchor(), true)
           return true
         case 'viewport.nudgeLeft':
-          keyboardPan(-keyboardPanStep())
+          keyboardPan(-keyboardPanStep(), true)
           return true
         case 'viewport.nudgeRight':
-          keyboardPan(keyboardPanStep())
+          keyboardPan(keyboardPanStep(), true)
           return true
         case 'viewport.scrollZoom':
-          applyZoom(-KEY_ZOOM_DELTA_Y * KEYBOARD_NAV_SCALE, resolveZoomAnchor())
+          applyZoom(-KEY_ZOOM_DELTA_Y * KEYBOARD_NAV_SCALE, resolveZoomAnchor(), true)
           return true
         case 'viewport.scrollHorizontal':
         case 'viewport.panHorizontal':
-          keyboardPan(keyboardPanStep())
+          keyboardPan(keyboardPanStep(), true)
           return true
         case 'selection.zoomToSelection': {
           const sel = selectionStoreRef.current
           const committed = sel?.get().committed
           if (committed && committed.endMs > committed.startMs) {
-            zoomToRange(committed.startMs, committed.endMs)
+            zoomToRange(committed.startMs, committed.endMs, true)
             return true
           }
           return false
