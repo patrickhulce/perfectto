@@ -136,6 +136,15 @@ export default function Aggregator({
   }, [activeTimeline, state.selectedSlice])
 
   const showCallstack = hasCallstackSelection(resolved)
+  // A "details" block fires whenever the click selection resolves to a
+  // concrete measure — including generic spans like `Layout` or
+  // `aten::*` that don't carry a callsite attribution. Without this,
+  // clicking those spans leaves the panel showing the misleading
+  // "Drag on the overview…" placeholder instead of feedback about
+  // what the user just clicked.
+  const selectedLeafFrame =
+    resolved.leafIndex >= 0 ? resolved.frames[resolved.leafIndex] : null
+  const showSelectionDetails = selectedLeafFrame !== null
 
   // Drag-to-resize: the panel anchors at the bottom of its flex-col
   // container and the drag handle at its top adjusts the panel's height.
@@ -246,14 +255,83 @@ export default function Aggregator({
               ({formatTimeRange(range.startMs, range.endMs)})
             </span>
           </p>
-        ) : !showCallstack ? (
+        ) : !showCallstack && !showSelectionDetails ? (
           <p className="mt-2 text-xs text-[#718096]">
             Drag on the overview or timeline to select a range.
           </p>
         ) : null}
+        {showSelectionDetails && selectedLeafFrame ? (
+          <SelectedSliceDetails
+            frame={selectedLeafFrame}
+            track={resolved.track}
+          />
+        ) : null}
         {showCallstack ? <CallstackView resolved={resolved} /> : null}
       </div>
     </section>
+  )
+}
+
+interface SelectedSliceDetailsProps {
+  frame: CallstackFrame
+  track: ResolvedCallstack['track']
+}
+
+/**
+ * Compact details block for the currently click-selected measure. Fires
+ * for any resolved selection regardless of attribution — generic Chrome
+ * spans (`Layout`, `RunTask`, `aten::*`, …) get the same treatment as
+ * callsite-attributed frames. The full title is rendered with
+ * `break-words` so 300-char CUDA kernel signatures wrap inside the
+ * panel instead of overflowing the way they do in the hover tooltip.
+ */
+function SelectedSliceDetails({frame, track}: SelectedSliceDetailsProps) {
+  const measure = frame.measure
+  const durationMs = measure.end - measure.start
+  // Prefer the attribution label (e.g. demangled function name) when the
+  // parser provided one, falling back to the raw measure name.
+  const title = frame.attribution?.label || measure.name || '(unnamed)'
+
+  return (
+    <div
+      className="mt-3 rounded border border-[#2d3748] bg-[#0b0f17]/40 px-3 py-2"
+      data-testid="aggregator-selection-details"
+    >
+      <div className="flex items-baseline justify-between gap-2">
+        <h4 className="text-[10px] font-semibold uppercase tracking-wide text-[#a0aec0]">
+          Selected span
+        </h4>
+        <span className="font-mono text-[10px] text-[#f6e05e]">
+          {formatDuration(durationMs)}
+        </span>
+      </div>
+      <p
+        className="mt-1 wrap-break-word text-sm font-medium text-[#e2e8f0]"
+        data-testid="aggregator-selection-title"
+      >
+        {title}
+      </p>
+      <dl className="mt-2 grid grid-cols-[max-content_1fr] gap-x-3 gap-y-1 text-[11px] text-[#a0aec0]">
+        <dt className="text-[#718096]">Time</dt>
+        <dd className="font-mono text-[#cbd5e0]">
+          {formatTimeRange(measure.start, measure.end)}
+        </dd>
+        {measure.category ? (
+          <>
+            <dt className="text-[#718096]">Category</dt>
+            <dd className="text-[#cbd5e0]">{measure.category}</dd>
+          </>
+        ) : null}
+        {track ? (
+          <>
+            <dt className="text-[#718096]">Track</dt>
+            <dd className="text-[#cbd5e0]">{track.name}</dd>
+          </>
+        ) : null}
+        <dt className="text-[#718096]">Id</dt>
+        <dd className="font-mono text-[#718096]">#{measure.id}</dd>
+      </dl>
+    </div>
   )
 }
 

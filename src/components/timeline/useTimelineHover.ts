@@ -165,7 +165,23 @@ export function useTimelineHover(options: UseTimelineHoverOptions): void {
       // starts at x=0; the gutter sits inside the first labelWidthPx of
       // every row), so the formula matches what `useTimelineViewport`'s
       // applyZoom uses for anchor math.
-      const layerX = state.scrollLeft + relX - state.labelWidthPx
+      //
+      // Prefer the store's precise (sub-pixel) `scrollLeft` for normal
+      // mousemoves so zoom anchor math stays consistent. But if it has
+      // diverged from the DOM scroller by ≥ 1 px — which can happen
+      // when a write to `scroller.scrollLeft` gets clamped by the
+      // browser (e.g. linked-viewport apply before React commits the
+      // new surface width) — fall back to the actually-painted
+      // position. Otherwise the cursor ends up resolving to a measure
+      // hundreds of pixels offset from where the user sees their
+      // pointer.
+      const storeScrollLeft = state.scrollLeft
+      const domScrollLeft = scroller.scrollLeft
+      const scrollLeft =
+        Math.abs(domScrollLeft - storeScrollLeft) < 1
+          ? storeScrollLeft
+          : domScrollLeft
+      const layerX = scrollLeft + relX - state.labelWidthPx
       const timelineMs = state.timelineStart + layerX / pxPerMs
 
       // Vertical scroll has already been applied to the inner surface, so
@@ -265,11 +281,26 @@ function findRowAt(
 const MS_PER_S = 1000
 const MS_PER_US = 0.001
 
+/**
+ * Hard cap on the name portion of the tooltip. CUDA kernel signatures and
+ * mangled C++ symbols can run hundreds of characters; without this, a
+ * single hover string can blow past the tooltip's `max-w` bound and paint
+ * past the rounded border. The duration + `#<id>` suffix stays readable
+ * because it lives outside the cap. The Aggregator details pane is where
+ * the full, wrapping title lives — the tooltip is the glance affordance.
+ */
+const TOOLTIP_NAME_MAX_CHARS = 160
+
+function truncateForTooltip(name: string): string {
+  if (name.length <= TOOLTIP_NAME_MAX_CHARS) return name
+  return `${name.slice(0, TOOLTIP_NAME_MAX_CHARS - 1)}…`
+}
+
 function formatTooltip(name: string, durationMs: number, id: string): string {
   // The `#<id>` suffix is the parser-assigned short hex id. It doubles as
   // a deep-link handle (`?selection=<id>`) so users can cite the exact
   // measure in bug reports without copy-pasting three numbers.
-  return `${name} · ${formatDuration(durationMs)} · #${id}`
+  return `${truncateForTooltip(name)} · ${formatDuration(durationMs)} · #${id}`
 }
 
 /** Compact ms → human duration matching how the rest of the UI talks about time. */

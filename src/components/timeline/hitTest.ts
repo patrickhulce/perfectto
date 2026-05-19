@@ -124,7 +124,17 @@ export function hitTestTrack(
     }
   }
 
-  const bestIndex = exactIndex !== -1 ? exactIndex : nearestIndex
+  // Reject a widened fallback whose center is more than `minHitboxMs`
+  // away from the cursor. A wide slice whose far edge is barely within
+  // the hitbox band can otherwise win as "nearest", and we'd end up
+  // reporting a measure that lives hundreds of pixels left/right of the
+  // cursor — feeding a highlight box that visibly drifts off-cursor.
+  // Tiny adjacent slices (the case this fallback was designed for) all
+  // have centers within `minHitboxMs` by construction, so the
+  // intuitive tiebreak still works.
+  const acceptNearest =
+    nearestIndex !== -1 && (minHitboxMs <= 0 || nearestDist <= minHitboxMs)
+  const bestIndex = exactIndex !== -1 ? exactIndex : acceptNearest ? nearestIndex : -1
   if (bestIndex === -1) return MISS
   return {index: bestIndex, depth: targetDepth}
 }

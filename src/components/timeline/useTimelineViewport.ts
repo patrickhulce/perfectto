@@ -241,24 +241,43 @@ export function useTimelineZoom(
   // naturally no-op before the hook is ready.
   const zoomToRangeRef = useRef<((startMs: number, endMs: number) => void) | null>(null)
 
+  // Imperative handle to "publish my current viewport into the linked
+  // store right now." Populated by the main effect below; called from
+  // the resync-request subscription so the chosen pane snaps the
+  // other pane back into alignment when sync re-enables.
+  const publishLinkedRef = useRef<(() => void) | null>(null)
+
   useEffect(() => {
     const link = linkedViewportStore
     if (!link || paneId === undefined) return
+    const unsubscribeResync = link.subscribeResyncRequest(requestedId => {
+      if (requestedId !== paneId) return
+      publishLinkedRef.current?.()
+    })
     let lastAppliedEpoch = 0
-    return link.subscribe(next => {
+    const unsubscribeState = link.subscribe(next => {
+      if (!link.isEnabled()) return
       if (next.sourcePaneId === paneId || next.epoch <= lastAppliedEpoch) return
       const scroller = scrollerRef.current
       if (!scroller) return
       lastAppliedEpoch = next.epoch
       const span = Math.max(boundsRef.current.end - boundsRef.current.start, MIN_SPAN_MS)
+      const labelWidth = labelWidthRef.current
+      // Map the source's span-relative window onto our local span.
+      // `widthFraction` covers the visible content area (excludes the
+      // sticky label gutter), so it's the fraction we want
+      // `contentWidthPx / pxPerMs / span` to land on after the apply.
+      const contentWidthPx = Math.max(0, scroller.clientWidth - labelWidth)
+      const targetVisibleMs = Math.max(next.widthFraction * span, MIN_SPAN_MS)
+      const desiredPxPerMs =
+        contentWidthPx > 0 ? contentWidthPx / targetVisibleMs : fitPxPerMsRef.current
       const targetPxPerMs = clampPxPerMs(
-        next.pxPerMs,
+        desiredPxPerMs,
         span,
         fitPxPerMsRef.current,
       )
-      const labelWidth = labelWidthRef.current
       const targetScrollLeft = clampScrollLeft(
-        (next.startMs - boundsRef.current.start) * targetPxPerMs,
+        next.startFraction * span * targetPxPerMs,
         scroller,
         labelWidth,
         span,
@@ -281,6 +300,10 @@ export function useTimelineZoom(
         scrollLeft: targetScrollLeft,
       })
     })
+    return () => {
+      unsubscribeState()
+      unsubscribeResync()
+    }
   }, [linkedViewportStore, paneId, scrollerRef, eventEl])
 
   useEffect(() => {
@@ -300,12 +323,22 @@ export function useTimelineZoom(
       const myPaneId = paneIdRef.current
       const scroller = scrollerRef.current
       if (!link || myPaneId === undefined || !scroller) return
+      if (!link.isEnabled()) return
       const px = pxPerMsRef.current
       if (px <= 0) return
+      const span = Math.max(
+        boundsRef.current.end - boundsRef.current.start,
+        MIN_SPAN_MS,
+      )
+      const labelWidth = labelWidthRef.current
+      const contentWidthPx = Math.max(0, scroller.clientWidth - labelWidth)
+      const startMs =
+        boundsRef.current.start + storeRef.current.get().scrollLeft / px
+      const visibleMs = contentWidthPx > 0 ? contentWidthPx / px : 0
       link.publish({
         sourcePaneId: myPaneId,
-        pxPerMs: px,
-        startMs: boundsRef.current.start + storeRef.current.get().scrollLeft / px,
+        startFraction: (startMs - boundsRef.current.start) / span,
+        widthFraction: visibleMs / span,
       })
     }
 
@@ -1049,6 +1082,12 @@ export function useTimelineZoom(
     // has mounted and the closure above has captured stable refs for
     // scroller / store / bounds.
     zoomToRangeRef.current = zoomToRange
+    // Same pattern for the resync handle: the link-store effect needs
+    // a way to ask *this* pane to republish its current viewport, but
+    // `publishLinkedViewport` is defined here (in the main effect) so
+    // it can close over the latest scroller/bounds. Hand it out via
+    // ref the moment the surface is wired up.
+    publishLinkedRef.current = publishLinkedViewport
 
     el.addEventListener('wheel', onWheel, {passive: false})
     el.addEventListener('pointerdown', onPointerDown)
@@ -1078,6 +1117,7 @@ export function useTimelineZoom(
       window.removeEventListener('keydown', onKeyDown)
       ctrlTracker.dispose()
       zoomToRangeRef.current = null
+      publishLinkedRef.current = null
     }
   }, [eventEl, scrollerRef])
 

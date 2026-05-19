@@ -178,3 +178,103 @@ describe('Aggregator — callstack view', () => {
     expect(screen.queryByTestId('aggregator-callstack')).toBeNull()
   })
 })
+
+describe('Aggregator — selection details', () => {
+  it('renders a details block for an unattributed selected measure', () => {
+    const unattributed: Measure = {
+      id: 'layout',
+      name: 'Layout',
+      start: 0,
+      end: 10,
+      category: 'rendering',
+      events: [],
+      marks: [],
+      measures: [],
+    }
+    const {timeline} = makeTimeline([unattributed])
+    const store = createSelectionStore()
+    render(<Aggregator selectionStore={store} timeline={timeline} />)
+
+    // No selection yet → details block hidden, placeholder visible.
+    expect(screen.queryByTestId('aggregator-selection-details')).toBeNull()
+
+    act(() => {
+      store.setSelectedSlice({
+        trackId: 'main',
+        startMs: 0,
+        endMs: 10,
+        depth: 0,
+        measureId: 'layout',
+      })
+    })
+
+    const block = screen.getByTestId('aggregator-selection-details')
+    const text = block.textContent ?? ''
+    expect(screen.getByTestId('aggregator-selection-title').textContent).toBe(
+      'Layout',
+    )
+    // Duration, category, track name, and id all surface for generic spans.
+    expect(text).toContain('rendering')
+    expect(text).toContain('Main Thread')
+    expect(text).toContain('#layout')
+    // Callstack stays hidden — this measure has no callsite attribution.
+    expect(screen.queryByTestId('aggregator-callstack')).toBeNull()
+  })
+
+  it('renders details for a callsite-attributed selection alongside the callstack', () => {
+    const leaf = jsFrame('leaf', 2, 5, 'render', [], 42)
+    const root = jsFrame('root', 0, 10, '(root)', [leaf])
+    const {timeline} = makeTimeline([root])
+    const store = createSelectionStore()
+    render(<Aggregator selectionStore={store} timeline={timeline} />)
+
+    act(() => {
+      store.setSelectedSlice({
+        trackId: 'main',
+        startMs: 2,
+        endMs: 5,
+        depth: 1,
+        measureId: 'leaf',
+      })
+    })
+
+    // Both views fire — details for the leaf measure, callstack for the
+    // ancestor chain. Title prefers the attribution label.
+    expect(screen.getByTestId('aggregator-selection-title').textContent).toBe(
+      'render',
+    )
+    expect(screen.getByTestId('aggregator-callstack')).not.toBeNull()
+  })
+
+  it('renders a wrapping title for a 300-char measure name', () => {
+    const longName = 'a'.repeat(300)
+    const wide: Measure = {
+      id: 'wide',
+      name: longName,
+      start: 0,
+      end: 1,
+      events: [],
+      marks: [],
+      measures: [],
+    }
+    const {timeline} = makeTimeline([wide])
+    const store = createSelectionStore()
+    render(<Aggregator selectionStore={store} timeline={timeline} />)
+
+    act(() => {
+      store.setSelectedSlice({
+        trackId: 'main',
+        startMs: 0,
+        endMs: 1,
+        depth: 0,
+        measureId: 'wide',
+      })
+    })
+
+    const title = screen.getByTestId('aggregator-selection-title')
+    // Full title is shown verbatim (no truncation) — the wrapping style
+    // is what keeps it inside the panel.
+    expect(title.textContent).toBe(longName)
+    expect(title.className).toContain('wrap-break-word')
+  })
+})

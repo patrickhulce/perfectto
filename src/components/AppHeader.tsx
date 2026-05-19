@@ -1,9 +1,11 @@
-import {useState} from 'react'
+import {useEffect, useState} from 'react'
 import {formatBytes} from '../core/utils/formatBytes'
 import type {CompactionMetadata, Persona, TraceSource} from '../core'
 import PersonaPicker from './PersonaPicker'
 import SettingsPanel, {SettingsCog} from './SettingsPanel'
 import type {InputBindingsStore} from './timeline/inputBindingsStore'
+import type {LinkedViewportStore} from './timeline/linkedViewportStore'
+import type {HoveredPaneStore} from './timeline/hoveredPaneStore'
 
 /**
  * Minimal pane shape the header needs for the compound title. Mirrors
@@ -62,6 +64,25 @@ interface AppHeaderProps {
    * the top-right of the header and opens the flipout panel.
    */
   bindingsStore?: InputBindingsStore
+  /**
+   * Linked-viewport store, threaded so the header can render the
+   * sync-on/off toggle in compare mode. Omitted (or paneCount < 2)
+   * suppresses the affordance entirely.
+   */
+  linkedViewportStore?: LinkedViewportStore | null
+  /**
+   * Hovered-pane store. Read by the sync toggle handler so re-enabling
+   * sync snaps from whichever pane the user's cursor is currently
+   * over — falling back to the last-published pane and then to the
+   * first pane when nothing is hovered.
+   */
+  hoveredPaneStore?: HoveredPaneStore
+  /**
+   * Pane ids in render order (top-to-bottom). Used by the sync
+   * toggle as the deterministic fallback source when no pane is
+   * hovered and nothing has published yet.
+   */
+  paneIds?: readonly string[]
 }
 
 /**
@@ -85,6 +106,9 @@ export default function AppHeader({
   detectedPersonaId,
   onPersonaChange,
   bindingsStore,
+  linkedViewportStore,
+  hoveredPaneStore,
+  paneIds,
 }: AppHeaderProps) {
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [downloading, setDownloading] = useState(false)
@@ -177,6 +201,13 @@ export default function AppHeader({
             onChange={onPersonaChange}
           />
         )}
+        {linkedViewportStore && panes.length >= 2 && (
+          <LinkSyncToggle
+            linkedViewportStore={linkedViewportStore}
+            hoveredPaneStore={hoveredPaneStore}
+            paneIds={paneIds}
+          />
+        )}
         {bindingsStore && (
           <SettingsCog onClick={() => setSettingsOpen(v => !v)} />
         )}
@@ -209,6 +240,108 @@ export function compoundTitle(panes: readonly AppHeaderPaneInfo[]): string {
   if (panes.length === 0) return 'Perfectto'
   if (panes.length === 1) return panes[0].name
   return panes.map(p => p.name).join(' vs. ')
+}
+
+/**
+ * Compare-mode sync toggle. Subscribes to the linked store's
+ * enable channel so its icon flips without forcing AppHeader to
+ * re-render on every viewport publish.
+ *
+ * On OFF→ON, picks a "winning" pane (hovered → last published →
+ * first) and asks it to republish its current viewport, which
+ * snaps the other pane back into alignment. On ON→OFF, panes keep
+ * whatever viewport they have and stop pushing updates to each
+ * other until the user re-enables.
+ */
+function LinkSyncToggle({
+  linkedViewportStore,
+  hoveredPaneStore,
+  paneIds,
+}: {
+  linkedViewportStore: LinkedViewportStore
+  hoveredPaneStore?: HoveredPaneStore
+  paneIds?: readonly string[]
+}) {
+  const [enabled, setEnabled] = useState(linkedViewportStore.isEnabled())
+  useEffect(() => {
+    return linkedViewportStore.subscribeEnabled(setEnabled)
+  }, [linkedViewportStore])
+
+  const handleClick = (): void => {
+    const next = !enabled
+    linkedViewportStore.setEnabled(next)
+    if (next) {
+      const hovered = hoveredPaneStore?.get() ?? null
+      const last = linkedViewportStore.lastSourcePaneId()
+      const fallback = paneIds && paneIds.length > 0 ? paneIds[0] : null
+      const target = hovered ?? last ?? fallback
+      if (target !== null) linkedViewportStore.requestResyncFrom(target)
+    }
+  }
+
+  return (
+    <button
+      type="button"
+      onClick={handleClick}
+      aria-label={enabled ? 'Disable timeline sync' : 'Enable timeline sync'}
+      aria-pressed={enabled}
+      title={
+        enabled
+          ? 'Sync on — pan/zoom propagates to the other pane (fraction of trace)'
+          : 'Sync off — pan/zoom each pane independently'
+      }
+      data-testid="link-sync-toggle"
+      data-enabled={enabled ? 'true' : 'false'}
+      className={
+        'cursor-pointer rounded-lg border bg-transparent p-1.5 transition-colors ' +
+        (enabled
+          ? 'border-[#667eea] text-[#667eea] hover:border-[#a3bffa] hover:text-[#a3bffa]'
+          : 'border-[#4a5568] text-[#a0aec0] hover:border-[#667eea] hover:text-[#667eea]')
+      }
+    >
+      {enabled ? <ChainLinkIcon /> : <ChainBrokenIcon />}
+    </button>
+  )
+}
+
+function ChainLinkIcon() {
+  return (
+    <svg
+      width="18"
+      height="18"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71" />
+      <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71" />
+    </svg>
+  )
+}
+
+function ChainBrokenIcon() {
+  return (
+    <svg
+      width="18"
+      height="18"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      <path d="M9 17H7A5 5 0 0 1 7 7h2" />
+      <path d="M15 7h2a5 5 0 0 1 4 8" />
+      <line x1="8" y1="12" x2="12" y2="12" />
+      <line x1="2" y1="2" x2="22" y2="22" />
+    </svg>
+  )
 }
 
 function DownloadIcon() {

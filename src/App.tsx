@@ -321,12 +321,10 @@ export default function App() {
             : p,
         ),
       )
-      // Persona seeding: only fire on the very first successfully
-      // loaded trace anywhere. Subsequent panes inherit whatever
-      // persona the user is on.
-      setActivePersonaId(prev =>
-        prev !== null ? prev : detectPersona(parsed).id,
-      )
+      // No post-parse persona seed: `activePersonaId` stays null until
+      // the user makes an explicit pick. Rendering reads the effective
+      // id as `activePersonaId ?? detectedPersonaId`, so auto-detect
+      // naturally drives the viz on every load until overridden.
     } catch (err) {
       // User-initiated abort: drop the pane silently and let panes
       // collapse back to splash if it was the only one. Matches the
@@ -497,14 +495,20 @@ export default function App() {
   // picker affordance is a single label, and rotating it on every
   // additional drop would be more confusing than helpful when the
   // user is comparing two traces with possibly-different best-fit
-  // personas. Matches the existing "first load seeds activePersonaId"
-  // contract.
+  // personas.
   const detectedPersonaId = useMemo<string | undefined>(() => {
     const firstLoaded = aggregatorPanes[0]
     if (!firstLoaded) return undefined
     const pane = panes.find(p => p.id === firstLoaded.id)
     return pane?.trace ? detectPersona(pane.trace).id : undefined
   }, [aggregatorPanes, panes])
+
+  // Single source of truth for "which persona is actually driving the
+  // visualization right now". `activePersonaId` is the explicit user
+  // pick (null when untouched); detection fills in the gap. Both the
+  // header picker and every TracePane render off this so the dropdown
+  // can never disagree with what's painted.
+  const effectivePersonaId = activePersonaId ?? detectedPersonaId ?? null
 
   // Per-trace metadata exposed in the global header at N=1. At N≥2 we
   // hide this and let each pane's TracePaneHeader carry its own
@@ -527,12 +531,15 @@ export default function App() {
   }, [panes])
 
   // Closing all panes returns to the splash. Wired into AppHeader's
-  // back button.
+  // back button. Also clears any explicit persona pick so the next
+  // loaded trace auto-detects from scratch instead of inheriting the
+  // previous session's choice.
   const handleBackToSplash = (): void => {
     for (const p of panesRef.current) {
       p.parsing?.controller.abort()
     }
     setPanes([])
+    setActivePersonaId(null)
   }
 
   let body: ReactNode
@@ -546,10 +553,13 @@ export default function App() {
           onBack={handleBackToSplash}
           singlePaneMeta={singlePaneMeta}
           personas={BUILTIN_PERSONAS}
-          activePersonaId={activePersonaId ?? detectedPersonaId}
+          activePersonaId={effectivePersonaId ?? undefined}
           detectedPersonaId={detectedPersonaId}
           onPersonaChange={setActivePersonaId}
           bindingsStore={bindingsStore}
+          linkedViewportStore={linkedViewportStore}
+          hoveredPaneStore={hoveredPaneStore}
+          paneIds={panes.map(p => p.id)}
         />
         {panes.map((pane, idx) => (
           <TracePane
@@ -563,7 +573,7 @@ export default function App() {
             hoveredPaneStore={hoveredPaneStore}
             linkedViewportStore={panes.length >= 2 ? linkedViewportStore : null}
             comparisonMatcher={comparisonMatchers.get(pane.id) ?? null}
-            activePersonaId={activePersonaId}
+            activePersonaId={effectivePersonaId}
             consumeUrlParams={idx === 0}
             onCancelParse={() => handleCancelParse(pane.id)}
             onDismissError={() => handleDismissError(pane.id)}

@@ -72,9 +72,11 @@ export interface TracePaneProps {
   linkedViewportStore: LinkedViewportStore | null
   comparisonMatcher: ComparisonMatcher | null
   /**
-   * Active persona id (global across panes). Each pane runs
-   * auto-detection against its own trace and applies the persona
-   * locally. Null when no trace has loaded anywhere yet.
+   * Effective persona id (global across panes) — App resolves this as
+   * `explicitPick ?? detectedPersonaId` so the picker and viz can
+   * never disagree. Null when no trace has loaded anywhere yet (no
+   * detection has run); panes still keep a local per-trace detection
+   * fallback in case a future caller passes raw null.
    */
   activePersonaId: string | null
   /**

@@ -755,7 +755,7 @@ export default function Timeline({
         data-testid="timeline-tooltip"
         role="tooltip"
         aria-hidden="true"
-        className="pointer-events-none fixed left-0 top-0 z-50 max-w-xs whitespace-nowrap rounded border border-[#2d3748] bg-[#0b0f17]/95 px-2 py-1 text-xs text-[#e2e8f0] shadow-lg transition-opacity duration-75"
+        className="pointer-events-none fixed left-0 top-0 z-50 max-w-md overflow-hidden text-ellipsis whitespace-nowrap rounded border border-[#2d3748] bg-[#0b0f17]/95 px-2 py-1 text-xs text-[#e2e8f0] shadow-lg transition-opacity duration-75"
         style={{opacity: 0, transform: 'translate(0px, 0px)'}}
       />
     </div>

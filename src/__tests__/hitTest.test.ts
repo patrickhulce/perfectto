@@ -131,5 +131,18 @@ describe('hitTestTrack', () => {
       const hit = hitTestTrack(buffers, 500, ROW / 2, ROW, Infinity, 1)
       expect(buffers.measures[hit.index].id).toBe('wide')
     })
+
+    it('rejects a wide widened-only fallback whose center is far from the cursor', () => {
+      // Wide slice [0, 200] ends 0.3ms before the cursor at 200.3. With
+      // a 1ms hitbox the widened band [-0.5, 200.5] contains the cursor,
+      // so the historical nearest-center fallback would have resolved
+      // here — even though the slice's center (100) is ~200ms (and
+      // hundreds of pixels) left of the cursor. That's exactly the
+      // pathology that lit up the highlight box far left of where the
+      // user is pointing.
+      const buffers = buildSliceBuffers(track([m('wide', 0, 200)]))
+      const r = hitTestTrack(buffers, 200.3, ROW / 2, ROW, Infinity, 1)
+      expect(r.index).toBe(-1)
+    })
   })
 })

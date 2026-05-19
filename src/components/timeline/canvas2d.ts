@@ -662,14 +662,32 @@ export function drawHighlightFrame(args: DrawHighlightFrameArgs): void {
   for (let r = 0; r < regionsRaw.length; r++) {
     if (regionsRaw[r].style !== 'mirrored') continue
     const region = regionsRaw[r]
-    const x = (region.startMs - canvasStartMs) * pxPerMs
-    const w = Math.max(1, (region.endMs - region.startMs) * pxPerMs)
+    const xRaw = (region.startMs - canvasStartMs) * pxPerMs
+    const wRaw = Math.max(1, (region.endMs - region.startMs) * pxPerMs)
+    // Clamp the stroke rect to the visible canvas. A measure spanning
+    // far past either viewport edge would otherwise produce a stroke
+    // whose left edge sits hundreds of pixels off-canvas — once the
+    // canvas is composited via `translateX`, that off-canvas left edge
+    // can still drift onto adjacent panes / off-screen and reads as
+    // "the highlight is way to the left of the cursor". Clipping to
+    // `[0, widthCss]` keeps the visible outline near whatever the user
+    // actually has on screen, without changing which measure is
+    // selected.
+    const xClamped = Math.max(0, xRaw)
+    const rightClamped = Math.min(widthCss, xRaw + wRaw)
+    const wClamped = Math.max(1, rightClamped - xClamped)
+    if (rightClamped <= 0 || xClamped >= widthCss) continue
     const y = region.minDepth * rowHeight + ROW_VPAD_PX / 2
     ctx.save()
     ctx.strokeStyle = 'rgba(255, 255, 255, 0.9)'
     ctx.lineWidth = 1.5
     ctx.setLineDash([4, 3])
-    ctx.strokeRect(x + 0.75, y + 0.75, Math.max(0, w - 1.5), rowH - 1.5)
+    ctx.strokeRect(
+      xClamped + 0.75,
+      y + 0.75,
+      Math.max(0, wClamped - 1.5),
+      rowH - 1.5,
+    )
     ctx.restore()
   }
 }
